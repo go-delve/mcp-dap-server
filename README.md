@@ -61,6 +61,8 @@ The server listens on port 8080 by default:
 ./bin/mcp-dap-server
 ```
 
+To use stdin/stdout transport instead of SSE, run with `-transport stdio`. See Flags section below.
+
 ### Connecting via MCP
 
 Configure your MCP client to connect to the server at `http://localhost:8080` using the SSE (Server-Sent Events) transport.
@@ -87,6 +89,28 @@ This configuration should work (or serve as a starting point) for Agents such as
 
 ```
 claude mcp add --transport sse mcp-dap-server http://localhost:8080
+```
+
+### Flags
+
+The server supports the following command-line flags:
+
+- `-transport`: Transport mode for MCP. Values:
+  - `sse` (default) – serve over HTTP using Server-Sent Events on the address given by `-addr`.
+  - `stdio` – speak MCP over stdin/stdout. Use when the client spawns the process directly.
+- `-addr`: Listen address for SSE mode (default `:8080`). Ignored in `stdio` mode.
+
+Examples:
+
+```bash
+# Default (SSE on :8080)
+./bin/mcp-dap-server
+
+# SSE on custom port
+./bin/mcp-dap-server -addr :9090
+
+# STDIO mode (client spawns process)
+./bin/mcp-dap-server -transport stdio
 ```
 
 ## Available Tools
