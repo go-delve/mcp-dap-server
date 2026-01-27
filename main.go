@@ -1,8 +1,9 @@
 package main
 
 import (
+	"context"
 	"log"
-	"net/http"
+	"os"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
@@ -14,14 +15,13 @@ func main() {
 		Version: "v1.0.0",
 	}
 	server := mcp.NewServer(&implementation, nil)
-	getServer := func(request *http.Request) *mcp.Server {
-		return server
-	}
 
 	registerTools(server)
 
-	sseHandler := mcp.NewSSEHandler(getServer)
+	log.SetOutput(os.Stderr) // Logs go to stderr, not stdout
+	log.Printf("mcp-dap-server starting via stdio transport")
 
-	log.Printf("listening on port :8080")
-	http.ListenAndServe(":8080", sseHandler)
+	if err := server.Run(context.Background(), mcp.NewStdioTransport()); err != nil {
+		log.Fatalf("server error: %v", err)
+	}
 }

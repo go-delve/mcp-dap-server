@@ -22,20 +22,14 @@ The MCP DAP Server acts as a bridge between MCP clients and DAP-compatible debug
 
 ## Features
 
-### Core Debugging Operations
-- **Session Management**: Start, stop, restart, and terminate debugging sessions
-- **Breakpoint Management**: Set line and function breakpoints
-- **Execution Control**: Continue, pause, step operations (in/out/next)
-- **State Inspection**: View threads, stack traces, scopes, and variables
-- **Expression Evaluation**: Evaluate expressions in the current debugging context
-- **Variable Modification**: Change variable values during debugging
-
-### Advanced Features
-- **Process Attachment**: Attach to already running processes
-- **Module Information**: List loaded modules
-- **Source Information**: View loaded source files
-- **Disassembly**: View disassembled code
-- **Exception Handling**: Get information about exceptions
+- **Unified Debug Launch**: Single `debug` tool handles source, binary, and attach modes
+- **Automatic Context**: Execution control tools return full state (location, stack, variables)
+- **Streamlined API**: 13 tools cover all debugging operations
+- **Breakpoint Management**: Set line and function breakpoints, run-to-cursor
+- **Full State Inspection**: Stack traces, scopes, and variables in one call
+- **Expression Evaluation**: Evaluate and modify variables in context
+- **Process Attachment**: Attach to running processes
+- **Disassembly Support**: View disassembled code at memory addresses
 
 ## Installation
 
@@ -53,21 +47,13 @@ go build -o bin/mcp-dap-server
 
 ## Usage
 
-### Starting the Server
-
-The server listens on port 8080 by default:
-
-```bash
-./bin/mcp-dap-server
-```
-
 ### Connecting via MCP
 
-Configure your MCP client to connect to the server at `http://localhost:8080` using the SSE (Server-Sent Events) transport.
+The server uses stdio transport, allowing AI agents to spawn it on-demand. Configure your MCP client with the path to the binary.
 
 ### Example MCP Client Configuration
 
-This configuration should work (or serve as a starting point) for Agents such as (Gemini CLI)[https://developers.google.com/gemini-code-assist/docs/use-agentic-chat-pair-programmer#configure-mcp-servers].
+This configuration works with [Gemini CLI](https://developers.google.com/gemini-code-assist/docs/use-agentic-chat-pair-programmer#configure-mcp-servers) and similar MCP clients:
 
 ```json
 {
@@ -81,157 +67,111 @@ This configuration should work (or serve as a starting point) for Agents such as
 }
 ```
 
-### Example configuration using Claude Code
+### Claude Code Configuration
 
-[Claude Code](https://docs.anthropic.com/en/docs/claude-code/overview)
-
-```
-claude mcp add --transport sse mcp-dap-server http://localhost:8080
+```bash
+claude mcp add mcp-dap-server /path/to/mcp-dap-server
 ```
 
 ## Available Tools
 
 ### Session Management
 
-#### `start_debugger`
-Starts a new debugging session.
+#### `debug`
+Start a debugging session. Supports three modes:
+- **source**: Compile and debug Go source code
+- **binary**: Debug a pre-compiled executable
+- **attach**: Attach to a running process
+
+**Parameters**:
+- `mode` (string, required): One of 'source', 'binary', or 'attach'
+- `path` (string): Path to source file or binary (required for source/binary modes)
+- `args` (array): Arguments to pass to the program
+- `processId` (number): Process ID (required for attach mode)
+- `breakpoints` (array): Breakpoints to set before running (file:line or function name)
+- `stopOnEntry` (boolean): Stop at program entry point
+- `port` (number): DAP server port
+
+Returns full context (location, stack trace, variables) when stopped.
+
+#### `stop`
+End the debugging session. Terminates the debuggee and stops the debugger.
+
+#### `restart`
+Restart the debugging session with optional new arguments.
 - **Parameters**:
-  - `port` (number): The port number for the DAP server
-
-#### `stop_debugger`
-Stops the current debugging session.
-
-#### `restart_debugger`
-Restarts the current debugging session.
-
-#### `terminate_debugger`
-Terminates the debugger and the debuggee process.
-
-### Program Control
-
-#### `debug_program`
-Launches a program in debug mode.
-- **Parameters**:
-  - `path` (string): Path to the program to debug
-
-#### `exec_program`
-Executes a program without debugging.
-- **Parameters**:
-  - `path` (string): Path to the program to execute
-
-#### `attach_debugger`
-Attaches to a running process.
-- **Parameters**:
-  - `mode` (string): Attachment mode
-  - `processId` (number, optional): Process ID to attach to
+  - `arguments` (array, optional): New program arguments
 
 ### Breakpoints
 
-#### `set_breakpoints`
-Sets line breakpoints in a file.
-- **Parameters**:
-  - `file` (string): Source file path
-  - `lines` (array): Line numbers for breakpoints
+#### `breakpoint`
+Set a breakpoint at a file:line location or on a function.
+- **Parameters** (one of):
+  - `file` (string) + `line` (number): Source file and line number
+  - `function` (string): Function name
 
-#### `set_function_breakpoints`
-Sets function breakpoints.
+#### `clear-breakpoints`
+Remove breakpoints from a file or clear all breakpoints.
 - **Parameters**:
-  - `functions` (array): Function names
+  - `file` (string, optional): Clear breakpoints in this file
+  - `all` (boolean, optional): Clear all breakpoints
 
 ### Execution Control
 
 #### `continue`
-Continues program execution.
+Continue program execution. Optionally run to a specific location.
 - **Parameters**:
-  - `threadId` (number, optional): Thread ID to continue
+  - `to` (object, optional): Run-to-cursor target (file+line or function)
 
-#### `next`
-Steps over the current line.
-- **Parameters**:
-  - `threadId` (number): Thread ID
+Returns full context when stopped.
 
-#### `step_in`
-Steps into function calls.
+#### `step`
+Step through code execution.
 - **Parameters**:
-  - `threadId` (number): Thread ID
+  - `mode` (string, required): One of 'over', 'in', or 'out'
 
-#### `step_out`
-Steps out of the current function.
-- **Parameters**:
-  - `threadId` (number): Thread ID
+Returns full context at new location.
 
 #### `pause`
-Pauses program execution.
+Pause program execution.
 - **Parameters**:
-  - `threadId` (number): Thread ID
+  - `threadId` (number): Thread ID to pause
 
 ### State Inspection
 
-#### `threads`
-Lists all threads in the debugged process.
-
-#### `stack_trace`
-Gets the stack trace for a thread.
+#### `context`
+Get full debugging context including current location, stack trace, and all variables.
 - **Parameters**:
-  - `threadId` (number): Thread ID
-  - `startFrame` (number, optional): Starting frame index
-  - `levels` (number, optional): Number of frames to retrieve
-
-#### `scopes`
-Gets variable scopes for a stack frame and automatically fetches all variables within each scope.
-- **Parameters**:
-  - `frameId` (number): Stack frame ID
-- **Returns**: A formatted display showing:
-  - All available scopes (Locals, Arguments, Globals, etc.)
-  - Variables within each scope with their names, types, and values
-  - Variable references for compound types that can be further inspected
-
-#### `variables`
-Gets variables in a scope.
-- **Parameters**:
-  - `variablesReference` (number): Variables reference
+  - `threadId` (number, optional): Thread ID
+  - `frameId` (number, optional): Stack frame ID
 
 #### `evaluate`
-Evaluates an expression.
+Evaluate an expression in the current debugging context.
 - **Parameters**:
   - `expression` (string): Expression to evaluate
   - `frameId` (number, optional): Frame context
-  - `context` (string, optional): Evaluation context
+  - `context` (string, optional): Evaluation context ('watch', 'repl', 'hover')
 
-#### `set_variable`
-Sets a variable value.
+#### `set-variable`
+Modify a variable's value in the debugged program.
 - **Parameters**:
-  - `variablesReference` (number): Variables reference
+  - `variablesReference` (number): Variables reference from context
   - `name` (string): Variable name
   - `value` (string): New value
 
-### Additional Tools
+### Program Information
 
-#### `loaded_sources`
-Lists all loaded source files.
-
-#### `modules`
-Lists loaded modules.
+#### `info`
+Get program metadata.
+- **Parameters**:
+  - `type` (string, required): One of 'sources' or 'modules'
 
 #### `disassemble`
-Disassembles code at a memory location.
+Disassemble code at a memory address.
 - **Parameters**:
   - `memoryReference` (string): Memory address
-  - `instructionOffset` (number, optional): Instruction offset
-  - `instructionCount` (number): Number of instructions
-
-#### `exception_info`
-Gets exception information.
-- **Parameters**:
-  - `threadId` (number): Thread ID
-
-#### `disconnect`
-Disconnects from the debugger.
-- **Parameters**:
-  - `terminateDebuggee` (boolean, optional): Whether to terminate the debuggee
-
-#### `configuration_done`
-Signals that configuration is complete.
+  - `instructionOffset` (number, optional): Offset from address
+  - `instructionCount` (number): Number of instructions to disassemble
 
 ## Contributing
 
