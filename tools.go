@@ -238,7 +238,8 @@ func (ds *debuggerSession) stopDebugger(ctx context.Context, _ *mcp.ServerSessio
 // DebugProgramParams defines the parameters for starting a debug session.
 // Path is the path to the program you would like to start debugging.
 type DebugProgramParams struct {
-	Path string `json:"path" mcp:"path to the program we want to start debugging."`
+	Path string   `json:"path" mcp:"path to the program we want to start debugging."`
+	Args []string `json:"args,omitempty" mcp:"command line arguments to pass to the program"`
 }
 
 // debugProgram starts a debug session for the specified program.
@@ -247,7 +248,7 @@ type DebugProgramParams struct {
 // Returns an error if the launch fails or if the DAP server reports failure.
 func (ds *debuggerSession) debugProgram(ctx context.Context, _ *mcp.ServerSession, params *mcp.CallToolParamsFor[DebugProgramParams]) (*mcp.CallToolResultFor[any], error) {
 	path := params.Arguments.Path
-	if err := ds.client.LaunchRequest("debug", path, true); err != nil {
+	if err := ds.client.LaunchRequest("debug", path, true, params.Arguments.Args); err != nil {
 		return nil, err
 	}
 	if err := readAndValidateResponse(ds.client, "unable to launch program to debug via DAP server"); err != nil {
@@ -261,7 +262,7 @@ func (ds *debuggerSession) debugProgram(ctx context.Context, _ *mcp.ServerSessio
 
 func (ds *debuggerSession) execProgram(ctx context.Context, _ *mcp.ServerSession, params *mcp.CallToolParamsFor[DebugProgramParams]) (*mcp.CallToolResultFor[any], error) {
 	path := params.Arguments.Path
-	if err := ds.client.LaunchRequest("exec", path, true); err != nil {
+	if err := ds.client.LaunchRequest("exec", path, true, params.Arguments.Args); err != nil {
 		return nil, err
 	}
 	if err := readAndValidateResponse(ds.client, "unable to exec program to debug via DAP server"); err != nil {
@@ -863,6 +864,7 @@ func (ds *debuggerSession) restartDebugger(ctx context.Context, _ *mcp.ServerSes
 			"mode":        "exec",
 			"stopOnEntry": false,
 			"args":        params.Arguments.Args,
+			"rebuild":     false,
 		},
 	}); err != nil {
 		return nil, err

@@ -111,7 +111,7 @@ func (ts *testSetup) cleanup() {
 }
 
 // startDebuggerAndExecuteProgram starts the debugger and executes the test program
-func (ts *testSetup) startDebuggerAndExecuteProgram(t *testing.T, port string, binaryPath string) {
+func (ts *testSetup) startDebuggerAndExecuteProgram(t *testing.T, port string, binaryPath string, programArgs ...string) {
 	t.Helper()
 
 	// Start debugger
@@ -138,11 +138,15 @@ func (ts *testSetup) startDebuggerAndExecuteProgram(t *testing.T, port string, b
 	}
 
 	// Execute program
+	execArgs := map[string]any{
+		"path": binaryPath,
+	}
+	if len(programArgs) > 0 {
+		execArgs["args"] = programArgs
+	}
 	execResult, err := ts.session.CallTool(ts.ctx, &mcp.CallToolParams{
-		Name: "exec-program",
-		Arguments: map[string]any{
-			"path": binaryPath,
-		},
+		Name:      "exec-program",
+		Arguments: execArgs,
 	})
 	if err != nil {
 		t.Fatalf("Failed to execute program: %v", err)
@@ -322,8 +326,8 @@ func TestRestart(t *testing.T) {
 	binaryPath, cleanupBinary := compileTestProgram(t, ts.cwd, "restart")
 	defer cleanupBinary()
 
-	// Start debugger and execute program
-	ts.startDebuggerAndExecuteProgram(t, "9092", binaryPath)
+	// Start debugger and execute program with initial argument
+	ts.startDebuggerAndExecuteProgram(t, "9092", binaryPath, "world")
 
 	// Set breakpoint and continue
 	f := filepath.Join(ts.cwd, "testdata", "go", "restart", "main.go")

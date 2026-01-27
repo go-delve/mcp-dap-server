@@ -66,14 +66,18 @@ func (c *DAPClient) ReadMessage() (dap.Message, error) {
 }
 
 // LaunchRequest sends a 'launch' request with the specified args.
-func (c *DAPClient) LaunchRequest(mode, program string, stopOnEntry bool) error {
+func (c *DAPClient) LaunchRequest(mode, program string, stopOnEntry bool, args []string) error {
 	request := &dap.LaunchRequest{Request: *c.newRequest("launch")}
-	request.Arguments = toRawMessage(map[string]any{
+	launchArgs := map[string]any{
 		"request":     "launch",
 		"mode":        mode,
 		"program":     program,
 		"stopOnEntry": stopOnEntry,
-	})
+	}
+	if len(args) > 0 {
+		launchArgs["args"] = args
+	}
+	request.Arguments = toRawMessage(launchArgs)
 	return c.send(request)
 }
 
