@@ -110,48 +110,39 @@ func (ts *testSetup) cleanup() {
 	}
 }
 
-// startDebuggerAndExecuteProgram starts the debugger and executes the test program
-func (ts *testSetup) startDebuggerAndExecuteProgram(t *testing.T, port string, binaryPath string, programArgs ...string) {
+// startDebugSession starts a debug session with optional breakpoints and program args
+func (ts *testSetup) startDebugSession(t *testing.T, port string, binaryPath string, breakpoints []map[string]any, programArgs ...string) {
 	t.Helper()
 
-	// Start debugger
-	startResult, err := ts.session.CallTool(ts.ctx, &mcp.CallToolParams{
-		Name: "start-debugger",
-		Arguments: map[string]any{
-			"port": port,
-		},
+	args := map[string]any{
+		"mode": "binary",
+		"path": binaryPath,
+		"port": port,
+	}
+	if len(breakpoints) > 0 {
+		args["breakpoints"] = breakpoints
+	}
+	if len(programArgs) > 0 {
+		args["args"] = programArgs
+	}
+
+	result, err := ts.session.CallTool(ts.ctx, &mcp.CallToolParams{
+		Name:      "debug",
+		Arguments: args,
 	})
 	if err != nil {
-		t.Fatalf("Failed to start debugger: %v", err)
+		t.Fatalf("Failed to start debug session: %v", err)
 	}
-	t.Logf("Start debugger result: %v", startResult)
-
-	// Check if the result indicates an error
-	if startResult.IsError {
+	if result.IsError {
 		errorMsg := "Unknown error"
-		if len(startResult.Content) > 0 {
-			if textContent, ok := startResult.Content[0].(*mcp.TextContent); ok {
+		if len(result.Content) > 0 {
+			if textContent, ok := result.Content[0].(*mcp.TextContent); ok {
 				errorMsg = textContent.Text
 			}
 		}
-		t.Fatalf("Start debugger returned error: %s", errorMsg)
+		t.Fatalf("Debug session returned error: %s", errorMsg)
 	}
-
-	// Execute program
-	execArgs := map[string]any{
-		"path": binaryPath,
-	}
-	if len(programArgs) > 0 {
-		execArgs["args"] = programArgs
-	}
-	execResult, err := ts.session.CallTool(ts.ctx, &mcp.CallToolParams{
-		Name:      "exec-program",
-		Arguments: execArgs,
-	})
-	if err != nil {
-		t.Fatalf("Failed to execute program: %v", err)
-	}
-	t.Logf("Execute program result: %v", execResult)
+	t.Logf("Debug session started: %v", result)
 }
 
 // setBreakpointAndContinue sets a breakpoint and continues execution
@@ -160,10 +151,10 @@ func (ts *testSetup) setBreakpointAndContinue(t *testing.T, file string, line in
 
 	// Set breakpoint
 	setBreakpointResult, err := ts.session.CallTool(ts.ctx, &mcp.CallToolParams{
-		Name: "set-breakpoints",
+		Name: "breakpoint",
 		Arguments: map[string]any{
-			"file":  file,
-			"lines": []int{line},
+			"file": file,
+			"line": line,
 		},
 	})
 	if err != nil {
@@ -173,10 +164,8 @@ func (ts *testSetup) setBreakpointAndContinue(t *testing.T, file string, line in
 
 	// Continue execution
 	continueResult, err := ts.session.CallTool(ts.ctx, &mcp.CallToolParams{
-		Name: "continue",
-		Arguments: map[string]any{
-			"threadID": 1,
-		},
+		Name:      "continue",
+		Arguments: map[string]any{},
 	})
 	if err != nil {
 		t.Fatalf("Failed to continue execution: %v", err)
@@ -184,46 +173,44 @@ func (ts *testSetup) setBreakpointAndContinue(t *testing.T, file string, line in
 	t.Logf("Continue result: %v", continueResult)
 }
 
-// getStackTraceContent gets stacktrace and returns the content as a string
-func (ts *testSetup) getStackTraceContent(t *testing.T) string {
+// getContextContent gets debugging context and returns the content as a string
+func (ts *testSetup) getContextContent(t *testing.T) string {
 	t.Helper()
 
-	stacktraceResult, err := ts.session.CallTool(ts.ctx, &mcp.CallToolParams{
-		Name: "stack-trace",
-		Arguments: map[string]any{
-			"threadID": 1,
-		},
+	contextResult, err := ts.session.CallTool(ts.ctx, &mcp.CallToolParams{
+		Name:      "context",
+		Arguments: map[string]any{},
 	})
 	if err != nil {
-		t.Fatalf("Failed to get stacktrace: %v", err)
+		t.Fatalf("Failed to get context: %v", err)
 	}
-	t.Logf("Stacktrace result: %v", stacktraceResult)
+	t.Logf("Context result: %v", contextResult)
 
-	// Check if stacktrace returned an error
-	if stacktraceResult.IsError {
+	// Check if context returned an error
+	if contextResult.IsError {
 		errorMsg := "Unknown error"
-		if len(stacktraceResult.Content) > 0 {
-			if textContent, ok := stacktraceResult.Content[0].(*mcp.TextContent); ok {
+		if len(contextResult.Content) > 0 {
+			if textContent, ok := contextResult.Content[0].(*mcp.TextContent); ok {
 				errorMsg = textContent.Text
 			}
 		}
-		t.Fatalf("Stacktrace returned error: %s", errorMsg)
+		t.Fatalf("Context returned error: %s", errorMsg)
 	}
 
-	// Verify we got stack frames
-	if len(stacktraceResult.Content) == 0 {
-		t.Fatalf("Expected stacktrace frames, got empty content")
+	// Verify we got content
+	if len(contextResult.Content) == 0 {
+		t.Fatalf("Expected context content, got empty")
 	}
 
-	// Extract stacktrace content
-	stacktraceStr := ""
-	for _, content := range stacktraceResult.Content {
+	// Extract context content
+	contextStr := ""
+	for _, content := range contextResult.Content {
 		if textContent, ok := content.(*mcp.TextContent); ok {
-			stacktraceStr += textContent.Text
+			contextStr += textContent.Text
 		}
 	}
 
-	return stacktraceStr
+	return contextStr
 }
 
 // stopDebugger stops the debugger
@@ -231,7 +218,7 @@ func (ts *testSetup) stopDebugger(t *testing.T) {
 	t.Helper()
 
 	stopResult, err := ts.session.CallTool(ts.ctx, &mcp.CallToolParams{
-		Name:      "stop-debugger",
+		Name:      "stop",
 		Arguments: map[string]any{},
 	})
 	if err != nil {
@@ -249,23 +236,23 @@ func TestBasic(t *testing.T) {
 	binaryPath, cleanupBinary := compileTestProgram(t, ts.cwd, "helloworld")
 	defer cleanupBinary()
 
-	// Start debugger and execute program
-	ts.startDebuggerAndExecuteProgram(t, "9090", binaryPath)
+	// Start debug session (stopOnEntry since no initial breakpoints)
+	ts.startDebugSession(t, "9090", binaryPath, nil)
 
 	// Set breakpoint and continue
 	f := filepath.Join(ts.cwd, "testdata", "go", "helloworld", "main.go")
 	ts.setBreakpointAndContinue(t, f, 7)
 
-	// Get stacktrace
-	stacktraceStr := ts.getStackTraceContent(t)
+	// Get context
+	contextStr := ts.getContextContent(t)
 
-	// Verify stacktrace contains expected information
-	if !strings.Contains(stacktraceStr, "main.main") {
-		t.Errorf("Expected stacktrace to contain 'main.main', got: %s", stacktraceStr)
+	// Verify context contains expected information
+	if !strings.Contains(contextStr, "main.main") {
+		t.Errorf("Expected context to contain 'main.main', got: %s", contextStr)
 	}
 
-	if !strings.Contains(stacktraceStr, "main.go") {
-		t.Errorf("Expected stacktrace to contain 'main.go', got: %s", stacktraceStr)
+	if !strings.Contains(contextStr, "main.go") {
+		t.Errorf("Expected context to contain 'main.go', got: %s", contextStr)
 	}
 
 	// Evaluate expression
@@ -326,8 +313,8 @@ func TestRestart(t *testing.T) {
 	binaryPath, cleanupBinary := compileTestProgram(t, ts.cwd, "restart")
 	defer cleanupBinary()
 
-	// Start debugger and execute program with initial argument
-	ts.startDebuggerAndExecuteProgram(t, "9092", binaryPath, "world")
+	// Start debug session with initial argument
+	ts.startDebugSession(t, "9092", binaryPath, nil, "world")
 
 	// Set breakpoint and continue
 	f := filepath.Join(ts.cwd, "testdata", "go", "restart", "main.go")
@@ -358,20 +345,18 @@ func TestRestart(t *testing.T) {
 
 	// Continue to hit the breakpoint again
 	continueResult, err := ts.session.CallTool(ts.ctx, &mcp.CallToolParams{
-		Name: "continue",
-		Arguments: map[string]any{
-			"threadID": 1,
-		},
+		Name:      "continue",
+		Arguments: map[string]any{},
 	})
 	if err != nil {
 		t.Fatalf("Failed to continue after restart: %v", err)
 	}
 	t.Logf("Continue after restart result: %v", continueResult)
 
-	// Get stacktrace again to verify we're at the breakpoint after restart
-	stacktraceStr2 := ts.getStackTraceContent(t)
-	if !strings.Contains(stacktraceStr2, "main.go:15") {
-		t.Errorf("Expected to be at breakpoint main.go:15 after restart, got: %s", stacktraceStr2)
+	// Get context again to verify we're at the breakpoint after restart
+	contextStr := ts.getContextContent(t)
+	if !strings.Contains(contextStr, "main.go:15") {
+		t.Errorf("Expected to be at breakpoint main.go:15 after restart, got: %s", contextStr)
 	}
 
 	// Evaluate greeting variable again to ensure it's a fresh run
@@ -397,14 +382,14 @@ func TestRestart(t *testing.T) {
 	}
 
 	if !strings.Contains(resultStr, "hello me, its me again") {
-		t.Errorf("Expected evaluation after restart to contain 'hello, world', got: %s", resultStr)
+		t.Errorf("Expected evaluation after restart to contain 'hello me, its me again', got: %s", resultStr)
 	}
 
 	// Stop debugger
 	ts.stopDebugger(t)
 }
 
-func TestStacktrace(t *testing.T) {
+func TestContext(t *testing.T) {
 	// Setup test infrastructure
 	ts := setupMCPServerAndClient(t)
 	defer ts.cleanup()
@@ -413,125 +398,43 @@ func TestStacktrace(t *testing.T) {
 	binaryPath, cleanupBinary := compileTestProgram(t, ts.cwd, "helloworld")
 	defer cleanupBinary()
 
-	// Start debugger and execute program
-	ts.startDebuggerAndExecuteProgram(t, "9091", binaryPath)
+	// Start debug session
+	ts.startDebugSession(t, "9091", binaryPath, nil)
 
 	// Set breakpoint and continue
 	f := filepath.Join(ts.cwd, "testdata", "go", "helloworld", "main.go")
 	ts.setBreakpointAndContinue(t, f, 7)
 
-	// Get stacktrace
-	stacktraceStr := ts.getStackTraceContent(t)
+	// Get context
+	contextStr := ts.getContextContent(t)
 
-	t.Logf("Stacktrace output:\n%s", stacktraceStr)
+	t.Logf("Context output:\n%s", contextStr)
 
-	// Verify stacktrace contains expected information
-	if !strings.Contains(stacktraceStr, "Stack trace for thread 1:") {
-		t.Errorf("Expected stacktrace header, got: %s", stacktraceStr)
+	// Verify context contains expected information
+	// The context tool returns stack trace, local variables, and source code
+	if !strings.Contains(contextStr, "main.main") {
+		t.Errorf("Expected context to contain 'main.main', got: %s", contextStr)
 	}
 
-	if !strings.Contains(stacktraceStr, "main.main") {
-		t.Errorf("Expected stacktrace to contain 'main.main', got: %s", stacktraceStr)
+	if !strings.Contains(contextStr, "main.go:7") {
+		t.Errorf("Expected context to contain 'main.go:7' (breakpoint location), got: %s", contextStr)
 	}
 
-	if !strings.Contains(stacktraceStr, "main.go:7") {
-		t.Errorf("Expected stacktrace to contain 'main.go:7' (breakpoint location), got: %s", stacktraceStr)
+	// The context tool now includes variable information
+	// Verify we see the Locals section with the greeting variable
+	if !strings.Contains(contextStr, "Locals") {
+		t.Errorf("Expected context to contain 'Locals' section, got: %s", contextStr)
 	}
 
-	if !strings.Contains(stacktraceStr, "(runtime)") {
-		t.Errorf("Expected stacktrace to contain runtime frames marked with '(runtime)', got: %s", stacktraceStr)
-	}
-
-	if !strings.Contains(stacktraceStr, "Total frames:") {
-		t.Errorf("Expected stacktrace to contain 'Total frames:', got: %s", stacktraceStr)
+	if !strings.Contains(contextStr, "greeting") {
+		t.Errorf("Expected context to contain 'greeting' variable, got: %s", contextStr)
 	}
 
 	// Stop debugger
 	ts.stopDebugger(t)
 }
 
-func TestScopes(t *testing.T) {
-	// Setup test infrastructure
-	ts := setupMCPServerAndClient(t)
-	defer ts.cleanup()
-
-	// Compile test program
-	binaryPath, cleanupBinary := compileTestProgram(t, ts.cwd, "helloworld")
-	defer cleanupBinary()
-
-	// Start debugger and execute program
-	ts.startDebuggerAndExecuteProgram(t, "9093", binaryPath)
-
-	// Set breakpoint and continue
-	f := filepath.Join(ts.cwd, "testdata", "go", "helloworld", "main.go")
-	ts.setBreakpointAndContinue(t, f, 7)
-
-	// Get stacktrace first to ensure we have valid frame IDs
-	stacktraceResult, err := ts.session.CallTool(ts.ctx, &mcp.CallToolParams{
-		Name: "stack-trace",
-		Arguments: map[string]any{
-			"threadID": 1,
-		},
-	})
-	if err != nil {
-		t.Fatalf("Failed to get stacktrace: %v", err)
-	}
-	t.Logf("Stacktrace result: %v", stacktraceResult)
-
-	// Test getting scopes for frame ID 1000 (the topmost frame)
-	scopesResult, err := ts.session.CallTool(ts.ctx, &mcp.CallToolParams{
-		Name: "scopes",
-		Arguments: map[string]any{
-			"frameId": 1000,
-		},
-	})
-	if err != nil {
-		t.Fatalf("Failed to get scopes: %v", err)
-	}
-	t.Logf("Scopes result: %v", scopesResult)
-
-	// Check if scopes returned an error
-	if scopesResult.IsError {
-		errorMsg := "Unknown error"
-		if len(scopesResult.Content) > 0 {
-			if textContent, ok := scopesResult.Content[0].(*mcp.TextContent); ok {
-				errorMsg = textContent.Text
-			}
-		}
-		t.Fatalf("Scopes returned error: %s", errorMsg)
-	}
-
-	// Verify we got scopes data
-	if len(scopesResult.Content) == 0 {
-		t.Fatalf("Expected scopes data, got empty content")
-	}
-
-	// Extract scopes content
-	scopesStr := ""
-	for _, content := range scopesResult.Content {
-		if textContent, ok := content.(*mcp.TextContent); ok {
-			scopesStr += textContent.Text
-		}
-	}
-
-	t.Logf("Scopes output:\n%s", scopesStr)
-
-	// Verify scopes contains expected information
-	// For the helloworld program at line 7, we should have locals scope
-	if !strings.Contains(scopesStr, "Locals") {
-		t.Errorf("Expected scopes to contain 'Locals', got: %s", scopesStr)
-	}
-
-	// The greeting variable should be in the locals scope
-	if !strings.Contains(scopesStr, "greeting") {
-		t.Errorf("Expected scopes to contain 'greeting' variable, got: %s", scopesStr)
-	}
-
-	// Stop debugger
-	ts.stopDebugger(t)
-}
-
-func TestScopesComprehensive(t *testing.T) {
+func TestVariables(t *testing.T) {
 	// Setup test infrastructure
 	ts := setupMCPServerAndClient(t)
 	defer ts.cleanup()
@@ -540,188 +443,34 @@ func TestScopesComprehensive(t *testing.T) {
 	binaryPath, cleanupBinary := compileTestProgram(t, ts.cwd, "scopes")
 	defer cleanupBinary()
 
-	// Start debugger and execute program
-	ts.startDebuggerAndExecuteProgram(t, "9094", binaryPath)
-
-	// Set all breakpoints at once
+	// Start debug session with breakpoint in processCollection function (line 67)
+	// This is the last function called, so we're sure to see variables there
 	f := filepath.Join(ts.cwd, "testdata", "go", "scopes", "main.go")
-
-	// Set breakpoint in greet function at line 42
-	setBreakpointResult, err := ts.session.CallTool(ts.ctx, &mcp.CallToolParams{
-		Name: "set-breakpoints",
-		Arguments: map[string]any{
-			"file":  f,
-			"lines": []int{42, 54, 67},
-		},
+	ts.startDebugSession(t, "9094", binaryPath, []map[string]any{
+		{"file": f, "line": 67},
 	})
-	if err != nil {
-		t.Fatalf("Failed to set breakpoints: %v", err)
-	}
-	t.Logf("Set breakpoints result: %v", setBreakpointResult)
 
-	// Continue to first breakpoint
-	_, err = ts.session.CallTool(ts.ctx, &mcp.CallToolParams{
-		Name: "continue",
-		Arguments: map[string]any{
-			"threadID": 1,
-		},
-	})
-	if err != nil {
-		t.Fatalf("Failed to continue: %v", err)
-	}
+	// The debug tool with breakpoints continues to the first breakpoint automatically
+	// Get context to see variables
+	contextStr := ts.getContextContent(t)
+	t.Logf("Context in processCollection function:\n%s", contextStr)
 
-	// Get stacktrace to ensure we have valid frame IDs
-	_, err = ts.session.CallTool(ts.ctx, &mcp.CallToolParams{
-		Name: "stack-trace",
-		Arguments: map[string]any{
-			"threadID": 1,
-		},
-	})
-	if err != nil {
-		t.Fatalf("Failed to get stacktrace: %v", err)
+	// Verify we're in processCollection
+	if !strings.Contains(contextStr, "processCollection") {
+		t.Errorf("Expected to be in processCollection function")
 	}
-
-	// Get scopes for the greet function frame
-	scopesResult, err := ts.session.CallTool(ts.ctx, &mcp.CallToolParams{
-		Name: "scopes",
-		Arguments: map[string]any{
-			"frameId": 1000, // topmost frame (greet function)
-		},
-	})
-	if err != nil {
-		t.Fatalf("Failed to get scopes: %v", err)
-	}
-
-	scopesStr := ""
-	for _, content := range scopesResult.Content {
-		if textContent, ok := content.(*mcp.TextContent); ok {
-			scopesStr += textContent.Text
-		}
-	}
-	t.Logf("Scopes in greet function:\n%s", scopesStr)
-
-	// Verify function arguments
-	if !strings.Contains(scopesStr, "name") || !strings.Contains(scopesStr, "\"Alice\"") {
-		t.Errorf("Expected to find argument 'name' with value 'Alice'")
-	}
-	if !strings.Contains(scopesStr, "age") || !strings.Contains(scopesStr, "30") {
-		t.Errorf("Expected to find argument 'age' with value 30")
-	}
-
-	// Verify local variables
-	if !strings.Contains(scopesStr, "greeting") {
-		t.Errorf("Expected to find local variable 'greeting'")
-	}
-	if !strings.Contains(scopesStr, "prefix") && !strings.Contains(scopesStr, "Greeting: ") {
-		t.Errorf("Expected to find local variable 'prefix' with value 'Greeting: '")
-	}
-
-	// Test 2: Struct parameter and local variables
-	// Continue to next breakpoint in processPerson at line 54
-	_, err = ts.session.CallTool(ts.ctx, &mcp.CallToolParams{
-		Name: "continue",
-		Arguments: map[string]any{
-			"threadID": 1,
-		},
-	})
-	if err != nil {
-		t.Fatalf("Failed to continue: %v", err)
-	}
-
-	// Get stack trace for processPerson function
-	_, err = ts.session.CallTool(ts.ctx, &mcp.CallToolParams{
-		Name: "stack-trace",
-		Arguments: map[string]any{
-			"threadID": 1,
-		},
-	})
-	if err != nil {
-		t.Fatalf("Failed to get stacktrace: %v", err)
-	}
-
-	// Get scopes for processPerson function
-	scopesResult2, err := ts.session.CallTool(ts.ctx, &mcp.CallToolParams{
-		Name: "scopes",
-		Arguments: map[string]any{
-			"frameId": 1000, // topmost frame (processPerson function)
-		},
-	})
-	if err != nil {
-		t.Fatalf("Failed to get scopes: %v", err)
-	}
-
-	scopesStr2 := ""
-	for _, content := range scopesResult2.Content {
-		if textContent, ok := content.(*mcp.TextContent); ok {
-			scopesStr2 += textContent.Text
-		}
-	}
-	t.Logf("Scopes in processPerson function:\n%s", scopesStr2)
-
-	// Verify struct parameter
-	if !strings.Contains(scopesStr2, "p") {
-		t.Errorf("Expected to find parameter 'p' (Person struct)")
-	}
-	if !strings.Contains(scopesStr2, "description") {
-		t.Errorf("Expected to find local variable 'description'")
-	}
-	if !strings.Contains(scopesStr2, "isAdult") {
-		t.Errorf("Expected to find local variable 'isAdult'")
-	}
-
-	// Test 3: Collection parameters
-	// Continue to next breakpoint in processCollection at line 67
-	_, err = ts.session.CallTool(ts.ctx, &mcp.CallToolParams{
-		Name: "continue",
-		Arguments: map[string]any{
-			"threadID": 1,
-		},
-	})
-	if err != nil {
-		t.Fatalf("Failed to continue: %v", err)
-	}
-
-	// Get stack trace for processCollection function
-	_, err = ts.session.CallTool(ts.ctx, &mcp.CallToolParams{
-		Name: "stack-trace",
-		Arguments: map[string]any{
-			"threadID": 1,
-		},
-	})
-	if err != nil {
-		t.Fatalf("Failed to get stacktrace: %v", err)
-	}
-
-	// Get scopes for processCollection function
-	scopesResult3, err := ts.session.CallTool(ts.ctx, &mcp.CallToolParams{
-		Name: "scopes",
-		Arguments: map[string]any{
-			"frameId": 1000, // topmost frame (processCollection function)
-		},
-	})
-	if err != nil {
-		t.Fatalf("Failed to get scopes: %v", err)
-	}
-
-	scopesStr3 := ""
-	for _, content := range scopesResult3.Content {
-		if textContent, ok := content.(*mcp.TextContent); ok {
-			scopesStr3 += textContent.Text
-		}
-	}
-	t.Logf("Scopes in processCollection function:\n%s", scopesStr3)
 
 	// Verify collection parameters and locals
-	if !strings.Contains(scopesStr3, "nums") {
+	if !strings.Contains(contextStr, "nums") {
 		t.Errorf("Expected to find parameter 'nums' (slice)")
 	}
-	if !strings.Contains(scopesStr3, "dict") {
+	if !strings.Contains(contextStr, "dict") {
 		t.Errorf("Expected to find parameter 'dict' (map)")
 	}
-	if !strings.Contains(scopesStr3, "sum") {
+	if !strings.Contains(contextStr, "sum") {
 		t.Errorf("Expected to find local variable 'sum'")
 	}
-	if !strings.Contains(scopesStr3, "count") {
+	if !strings.Contains(contextStr, "count") {
 		t.Errorf("Expected to find local variable 'count'")
 	}
 
@@ -729,7 +478,7 @@ func TestScopesComprehensive(t *testing.T) {
 	ts.stopDebugger(t)
 }
 
-func TestNextStep(t *testing.T) {
+func TestStep(t *testing.T) {
 	// Setup test infrastructure
 	ts := setupMCPServerAndClient(t)
 	defer ts.cleanup()
@@ -738,119 +487,84 @@ func TestNextStep(t *testing.T) {
 	binaryPath, cleanupBinary := compileTestProgram(t, ts.cwd, "step")
 	defer cleanupBinary()
 
-	// Start debugger and execute program
-	ts.startDebuggerAndExecuteProgram(t, "9090", binaryPath)
+	// Start debug session
+	ts.startDebugSession(t, "9090", binaryPath, nil)
 
 	// Set breakpoint at line 7 (x := 10)
 	f := filepath.Join(ts.cwd, "testdata", "go", "step", "main.go")
 	ts.setBreakpointAndContinue(t, f, 7)
 
-	// Helper function to perform next step
-	performNextStep := func(threadID int) error {
-		args := map[string]any{
-			"threadId": threadID,
-		}
+	// Helper function to perform step over
+	performStepOver := func(threadID int) error {
 		result, err := ts.session.CallTool(ts.ctx, &mcp.CallToolParams{
-			Name:      "next",
-			Arguments: args,
+			Name: "step",
+			Arguments: map[string]any{
+				"mode":     "over",
+				"threadId": threadID,
+			},
 		})
 		if err != nil {
 			return err
 		}
 		// Verify we get a response
 		if len(result.Content) == 0 {
-			return fmt.Errorf("expected content in next step response")
+			return fmt.Errorf("expected content in step response")
 		}
 		return nil
 	}
 
-	// Get initial stack trace to find thread ID
-	stackTraceArgs := map[string]any{
-		"threadId": 1,
-	}
-	stackTraceResult, err := ts.session.CallTool(ts.ctx, &mcp.CallToolParams{
-		Name:      "stack-trace",
-		Arguments: stackTraceArgs,
+	// Get initial context to verify we're at line 7
+	contextResult, err := ts.session.CallTool(ts.ctx, &mcp.CallToolParams{
+		Name:      "context",
+		Arguments: map[string]any{},
 	})
 	if err != nil {
-		t.Fatalf("Failed to get stack trace: %v", err)
+		t.Fatalf("Failed to get context: %v", err)
 	}
+	t.Logf("Initial context: %v", contextResult)
 
 	// Step to line 10 (y := 20)
-	err = performNextStep(1)
+	err = performStepOver(1)
 	if err != nil {
-		t.Fatalf("Failed to perform next step: %v", err)
+		t.Fatalf("Failed to perform step over: %v", err)
 	}
 
-	// Get stack trace to verify we're at line 10
-	stackTraceResult, err = ts.session.CallTool(ts.ctx, &mcp.CallToolParams{
-		Name:      "stack-trace",
-		Arguments: stackTraceArgs,
-	})
-	if err != nil {
-		t.Fatalf("Failed to get stack trace after next: %v", err)
-	}
-	stacktraceStr := stackTraceResult.Content[0].(*mcp.TextContent).Text
-	if !strings.Contains(stacktraceStr, "main.go:10") {
-		t.Errorf("Expected to be at line 10 after next step, got: %s", stacktraceStr)
+	// Get context to verify we're at line 10
+	contextStr := ts.getContextContent(t)
+	if !strings.Contains(contextStr, "main.go:10") {
+		t.Errorf("Expected to be at line 10 after step, got: %s", contextStr)
 	}
 
 	// Step to line 13 (sum := x + y)
-	err = performNextStep(1)
+	err = performStepOver(1)
 	if err != nil {
-		t.Fatalf("Failed to perform second next step: %v", err)
+		t.Fatalf("Failed to perform second step: %v", err)
 	}
 
 	// Verify we're at line 13
-	stackTraceResult, err = ts.session.CallTool(ts.ctx, &mcp.CallToolParams{
-		Name:      "stack-trace",
-		Arguments: stackTraceArgs,
-	})
-	if err != nil {
-		t.Fatalf("Failed to get stack trace after second next: %v", err)
-	}
-	stacktraceStr = stackTraceResult.Content[0].(*mcp.TextContent).Text
-	if !strings.Contains(stacktraceStr, "main.go:13") {
-		t.Errorf("Expected to be at line 13 after second next step, got: %s", stacktraceStr)
+	contextStr = ts.getContextContent(t)
+	if !strings.Contains(contextStr, "main.go:13") {
+		t.Errorf("Expected to be at line 13 after second step, got: %s", contextStr)
 	}
 
 	// Step to line 16 (message := fmt.Sprintf...)
-	err = performNextStep(1)
+	err = performStepOver(1)
 	if err != nil {
-		t.Fatalf("Failed to perform third next step: %v", err)
+		t.Fatalf("Failed to perform third step: %v", err)
 	}
 
-	// Get fresh stack trace to get current frame ID
-	stackTraceResult, err = ts.session.CallTool(ts.ctx, &mcp.CallToolParams{
-		Name:      "stack-trace",
-		Arguments: stackTraceArgs,
-	})
-	if err != nil {
-		t.Fatalf("Failed to get stack trace before scopes: %v", err)
-	}
-
-	// Get variables to verify state
-	scopesArgs := map[string]any{
-		"frameId": 1000,
-	}
-	scopesResult, err := ts.session.CallTool(ts.ctx, &mcp.CallToolParams{
-		Name:      "scopes",
-		Arguments: scopesArgs,
-	})
-	if err != nil {
-		t.Fatalf("Failed to get scopes: %v", err)
-	}
-	scopesStr := scopesResult.Content[0].(*mcp.TextContent).Text
+	// Get context - it should contain variables
+	contextStr = ts.getContextContent(t)
 
 	// Verify variables exist and have expected values
-	if !strings.Contains(scopesStr, "x (int) = 10") {
-		t.Errorf("Expected x to be 10 in scopes, got:\n%s", scopesStr)
+	if !strings.Contains(contextStr, "x (int) = 10") {
+		t.Errorf("Expected x to be 10 in context, got:\n%s", contextStr)
 	}
-	if !strings.Contains(scopesStr, "y (int) = 20") {
-		t.Errorf("Expected y to be 20 in scopes, got:\n%s", scopesStr)
+	if !strings.Contains(contextStr, "y (int) = 20") {
+		t.Errorf("Expected y to be 20 in context, got:\n%s", contextStr)
 	}
-	if !strings.Contains(scopesStr, "sum (int) = 30") {
-		t.Errorf("Expected sum to be 30 in scopes, got:\n%s", scopesStr)
+	if !strings.Contains(contextStr, "sum (int) = 30") {
+		t.Errorf("Expected sum to be 30 in context, got:\n%s", contextStr)
 	}
 
 	// Stop debugger
