@@ -46,7 +46,8 @@ func (c *DAPClient) Close() {
 }
 
 // InitializeRequest sends an 'initialize' request.
-func (c *DAPClient) InitializeRequest() error {
+// InitializeRequest sends an 'initialize' request and returns the server's capabilities.
+func (c *DAPClient) InitializeRequest() (dap.Capabilities, error) {
 	request := &dap.InitializeRequest{Request: *c.newRequest("initialize")}
 	request.Arguments = dap.InitializeRequestArguments{
 		AdapterID:                    "go",
@@ -58,7 +59,21 @@ func (c *DAPClient) InitializeRequest() error {
 		SupportsRunInTerminalRequest: true,
 		Locale:                       "en-us",
 	}
-	return c.send(request)
+	if err := c.send(request); err != nil {
+		return dap.Capabilities{}, err
+	}
+	msg, err := c.ReadMessage()
+	if err != nil {
+		return dap.Capabilities{}, err
+	}
+	resp, ok := msg.(*dap.InitializeResponse)
+	if !ok {
+		return dap.Capabilities{}, fmt.Errorf("expected InitializeResponse, got %T", msg)
+	}
+	if !resp.Success {
+		return dap.Capabilities{}, fmt.Errorf("initialize failed: %s", resp.Message)
+	}
+	return resp.Body, nil
 }
 
 func (c *DAPClient) ReadMessage() (dap.Message, error) {
