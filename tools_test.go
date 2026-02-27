@@ -8,7 +8,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -565,6 +567,96 @@ func TestStep(t *testing.T) {
 	}
 	if !strings.Contains(contextStr, "sum (int) = 30") {
 		t.Errorf("Expected sum to be 30 in context, got:\n%s", contextStr)
+	}
+
+	// Stop debugger
+	ts.stopDebugger(t)
+}
+
+// generateCoreDump runs the binary with GOTRACEBACK=crash to produce a core dump
+// and returns the path to the core file. Skips the test if a core dump cannot be generated.
+func generateCoreDump(t *testing.T, binaryPath string) string {
+	t.Helper()
+
+	// Raise core dump size limit so child process inherits it
+	var rLimit syscall.Rlimit
+	if err := syscall.Getrlimit(syscall.RLIMIT_CORE, &rLimit); err != nil {
+		t.Skipf("Cannot get RLIMIT_CORE: %v", err)
+	}
+	rLimit.Cur = rLimit.Max
+	if err := syscall.Setrlimit(syscall.RLIMIT_CORE, &rLimit); err != nil {
+		t.Skipf("Cannot set RLIMIT_CORE: %v", err)
+	}
+
+	cmd := exec.Command(binaryPath)
+	cmd.Env = append(os.Environ(), "GOTRACEBACK=crash")
+	_ = cmd.Run() // expected to exit via signal
+
+	pid := cmd.Process.Pid
+
+	// Search for core dump in platform-specific locations
+	var candidates []string
+	if runtime.GOOS == "darwin" {
+		candidates = append(candidates, fmt.Sprintf("/cores/core.%d", pid))
+	}
+	candidates = append(candidates,
+		fmt.Sprintf("core.%d", pid),
+		"core",
+	)
+
+	for _, c := range candidates {
+		if _, err := os.Stat(c); err == nil {
+			return c
+		}
+	}
+
+	t.Skip("Could not find core dump file (check ulimit -c and core dump configuration)")
+	return ""
+}
+
+func TestCoreDump(t *testing.T) {
+	ts := setupMCPServerAndClient(t)
+	defer ts.cleanup()
+
+	// Compile the crash program
+	binaryPath, cleanupBinary := compileTestProgram(t, ts.cwd, "coredump")
+	defer cleanupBinary()
+
+	// Generate a core dump
+	corePath := generateCoreDump(t, binaryPath)
+	defer os.Remove(corePath)
+
+	// Start debug session in core mode
+	result, err := ts.session.CallTool(ts.ctx, &mcp.CallToolParams{
+		Name: "debug",
+		Arguments: map[string]any{
+			"mode":         "core",
+			"path":         binaryPath,
+			"coreFilePath": corePath,
+			"port":         "9095",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Failed to start core debug session: %v", err)
+	}
+	if result.IsError {
+		errorMsg := "Unknown error"
+		if len(result.Content) > 0 {
+			if tc, ok := result.Content[0].(*mcp.TextContent); ok {
+				errorMsg = tc.Text
+			}
+		}
+		t.Fatalf("Core debug session returned error: %s", errorMsg)
+	}
+	t.Logf("Core debug session started: %v", result)
+
+	// Get context — should show stack trace from the crashed program
+	contextStr := ts.getContextContent(t)
+	t.Logf("Core dump context:\n%s", contextStr)
+
+	// The stack should contain our program's main package
+	if !strings.Contains(contextStr, "main.") {
+		t.Errorf("Expected stack trace to contain 'main.', got:\n%s", contextStr)
 	}
 
 	// Stop debugger
