@@ -15,81 +15,132 @@ import (
 )
 
 type debuggerSession struct {
-	cmd         *exec.Cmd
-	client      *DAPClient
-	launchMode   string   // "source", "binary", "core", or "attach"
-	programPath  string   // path to program being debugged
-	programArgs  []string // command line arguments
-	coreFilePath string   // path to core dump file (core mode only)
+	cmd          *exec.Cmd
+	client       *DAPClient
+	server       *mcp.Server      // MCP server for dynamic tool registration
+	capabilities dap.Capabilities // capabilities reported by DAP server
+	launchMode   string           // "source", "binary", "core", or "attach"
+	programPath  string           // path to program being debugged
+	programArgs  []string         // command line arguments
+	coreFilePath string           // path to core dump file (core mode only)
 }
 
 // registerTools registers the debugger tools with the MCP server.
 func registerTools(server *mcp.Server) {
-	ds := &debuggerSession{}
+	ds := &debuggerSession{server: server}
 
-	// Session management
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "debug",
 		Description: "Start a complete debugging session. Modes: 'source' (compile & debug), 'binary' (debug executable), 'core' (debug core dump), 'attach' (connect to process). Returns full context at first breakpoint.",
 	}, ds.debug)
-	mcp.AddTool(server, &mcp.Tool{
+}
+
+// sessionToolNames returns the names of all currently registered session tools.
+func (ds *debuggerSession) sessionToolNames() []string {
+	tools := []string{
+		"stop",
+		"breakpoint",
+		"clear-breakpoints",
+		"continue",
+		"step",
+		"pause",
+		"context",
+		"evaluate",
+		"info",
+	}
+
+	// Capability-gated tools
+	if ds.capabilities.SupportsRestartRequest {
+		tools = append(tools, "restart")
+	}
+	if ds.capabilities.SupportsSetVariable {
+		tools = append(tools, "set-variable")
+	}
+	if ds.capabilities.SupportsDisassembleRequest {
+		tools = append(tools, "disassemble")
+	}
+
+	return tools
+}
+
+// registerSessionTools removes the debug tool and registers all session-specific tools.
+func (ds *debuggerSession) registerSessionTools() {
+	// Remove debug tool
+	ds.server.RemoveTools("debug")
+
+	// Always-available tools
+	mcp.AddTool(ds.server, &mcp.Tool{
 		Name:        "stop",
 		Description: "End the debugging session completely.",
 	}, ds.stop)
-	mcp.AddTool(server, &mcp.Tool{
-		Name:        "restart",
-		Description: "Restart the debugging session with optional new arguments.",
-	}, ds.restartDebugger)
-
-	// Breakpoints
-	mcp.AddTool(server, &mcp.Tool{
+	mcp.AddTool(ds.server, &mcp.Tool{
 		Name:        "breakpoint",
 		Description: "Set a breakpoint at file:line or on a function name.",
 	}, ds.breakpoint)
-	mcp.AddTool(server, &mcp.Tool{
+	mcp.AddTool(ds.server, &mcp.Tool{
 		Name:        "clear-breakpoints",
 		Description: "Remove breakpoints from a file or clear all breakpoints.",
 	}, ds.clearBreakpoints)
-
-	// Execution control
-	mcp.AddTool(server, &mcp.Tool{
+	mcp.AddTool(ds.server, &mcp.Tool{
 		Name:        "continue",
 		Description: "Continue execution. Optionally specify 'to' location for run-to-cursor. Returns full context when stopped.",
 	}, ds.continueExecution)
-	mcp.AddTool(server, &mcp.Tool{
+	mcp.AddTool(ds.server, &mcp.Tool{
 		Name:        "step",
 		Description: "Step through code. Mode: 'over', 'in', or 'out'. Returns full context at new location.",
 	}, ds.step)
-	mcp.AddTool(server, &mcp.Tool{
+	mcp.AddTool(ds.server, &mcp.Tool{
 		Name:        "pause",
 		Description: "Pause a running program.",
 	}, ds.pauseExecution)
-
-	// Inspection
-	mcp.AddTool(server, &mcp.Tool{
+	mcp.AddTool(ds.server, &mcp.Tool{
 		Name:        "context",
 		Description: "Get full debugging context: current location, stack trace, and all variables.",
 	}, ds.context)
-	mcp.AddTool(server, &mcp.Tool{
+	mcp.AddTool(ds.server, &mcp.Tool{
 		Name:        "evaluate",
 		Description: "Evaluate an expression in the current context.",
 	}, ds.evaluateExpression)
 
-	// Modification
-	mcp.AddTool(server, &mcp.Tool{
-		Name:        "set-variable",
-		Description: "Modify a variable's value in the debugged program.",
-	}, ds.setVariable)
-
-	// Advanced
-	mcp.AddTool(server, &mcp.Tool{
+	// Info tool with dynamic description
+	infoDesc := "Get program metadata. Type: 'sources'"
+	if ds.capabilities.SupportsModulesRequest {
+		infoDesc = "Get program metadata. Type: 'sources' or 'modules'."
+	}
+	mcp.AddTool(ds.server, &mcp.Tool{
 		Name:        "info",
-		Description: "Get program metadata. Type: 'sources' or 'modules'.",
+		Description: infoDesc,
 	}, ds.info)
-	mcp.AddTool(server, &mcp.Tool{
-		Name:        "disassemble",
-		Description: "Disassemble code at a memory address.",
-	}, ds.disassembleCode)
+
+	// Capability-gated tools
+	if ds.capabilities.SupportsRestartRequest {
+		mcp.AddTool(ds.server, &mcp.Tool{
+			Name:        "restart",
+			Description: "Restart the debugging session with optional new arguments.",
+		}, ds.restartDebugger)
+	}
+	if ds.capabilities.SupportsSetVariable {
+		mcp.AddTool(ds.server, &mcp.Tool{
+			Name:        "set-variable",
+			Description: "Modify a variable's value in the debugged program.",
+		}, ds.setVariable)
+	}
+	if ds.capabilities.SupportsDisassembleRequest {
+		mcp.AddTool(ds.server, &mcp.Tool{
+			Name:        "disassemble",
+			Description: "Disassemble code at a memory address.",
+		}, ds.disassembleCode)
+	}
+}
+
+// unregisterSessionTools removes all session tools and re-registers debug.
+func (ds *debuggerSession) unregisterSessionTools() {
+	ds.server.RemoveTools(ds.sessionToolNames()...)
+
+	mcp.AddTool(ds.server, &mcp.Tool{
+		Name:        "debug",
+		Description: "Start a complete debugging session. Modes: 'source' (compile & debug), 'binary' (debug executable), 'core' (debug core dump), 'attach' (connect to process). Returns full context at first breakpoint.",
+	}, ds.debug)
 }
 
 // BreakpointSpec specifies a breakpoint location.
@@ -421,6 +472,9 @@ func (ds *debuggerSession) info(ctx context.Context, _ *mcp.ServerSession, param
 		}, nil
 
 	case "modules":
+		if !ds.capabilities.SupportsModulesRequest {
+			return nil, fmt.Errorf("modules not supported by this debug adapter")
+		}
 		if err := ds.client.ModulesRequest(); err != nil {
 			return nil, err
 		}
@@ -491,8 +545,10 @@ func (ds *debuggerSession) stop(ctx context.Context, _ *mcp.ServerSession, _ *mc
 
 	// Try to terminate the debuggee gracefully
 	if ds.client != nil {
-		if err := ds.client.TerminateRequest(); err != nil {
-			log.Printf("error terminating debuggee: %v", err)
+		if ds.capabilities.SupportsTerminateRequest {
+			if err := ds.client.TerminateRequest(); err != nil {
+				log.Printf("error terminating debuggee: %v", err)
+			}
 		}
 		if err := ds.client.DisconnectRequest(true); err != nil {
 			log.Printf("error disconnecting: %v", err)
@@ -518,6 +574,8 @@ func (ds *debuggerSession) stop(ctx context.Context, _ *mcp.ServerSession, _ *mc
 	ds.programPath = ""
 	ds.programArgs = nil
 	ds.coreFilePath = ""
+	ds.capabilities = dap.Capabilities{}
+	ds.unregisterSessionTools()
 
 	return &mcp.CallToolResultFor[any]{
 		Content: []mcp.Content{&mcp.TextContent{Text: "Debug session stopped"}},
@@ -593,12 +651,11 @@ func (ds *debuggerSession) debug(ctx context.Context, _ *mcp.ServerSession, para
 
 	// Connect DAP client
 	ds.client = newDAPClient(listenAddr)
-	if err := ds.client.InitializeRequest(); err != nil {
+	caps, err := ds.client.InitializeRequest()
+	if err != nil {
 		return nil, err
 	}
-	if _, err := ds.client.ReadMessage(); err != nil {
-		return nil, err
-	}
+	ds.capabilities = caps
 
 	// Store session state
 	ds.launchMode = mode
@@ -656,6 +713,9 @@ func (ds *debuggerSession) debug(ctx context.Context, _ *mcp.ServerSession, para
 	if err := readAndValidateResponse(ds.client, "unable to complete configuration"); err != nil {
 		return nil, err
 	}
+
+	// Register session-specific tools based on capabilities
+	ds.registerSessionTools()
 
 	// If we have breakpoints and not explicitly stopping on entry, continue to first breakpoint
 	if len(params.Arguments.Breakpoints) > 0 && !params.Arguments.StopOnEntry {
