@@ -81,6 +81,18 @@ func (c *DAPClient) LaunchRequest(mode, program string, stopOnEntry bool, args [
 	return c.send(request)
 }
 
+// CoreRequest sends a 'launch' request in core dump mode.
+func (c *DAPClient) CoreRequest(program, coreFilePath string) error {
+	request := &dap.LaunchRequest{Request: *c.newRequest("launch")}
+	request.Arguments = toRawMessage(map[string]any{
+		"request":      "launch",
+		"mode":         "core",
+		"program":      program,
+		"coreFilePath": coreFilePath,
+	})
+	return c.send(request)
+}
+
 func (c *DAPClient) newRequest(command string) *dap.Request {
 	request := &dap.Request{}
 	request.Type = "request"

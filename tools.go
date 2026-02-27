@@ -17,9 +17,10 @@ import (
 type debuggerSession struct {
 	cmd         *exec.Cmd
 	client      *DAPClient
-	launchMode  string   // "source", "binary", or "attach"
-	programPath string   // path to program being debugged
-	programArgs []string // command line arguments
+	launchMode   string   // "source", "binary", "core", or "attach"
+	programPath  string   // path to program being debugged
+	programArgs  []string // command line arguments
+	coreFilePath string   // path to core dump file (core mode only)
 }
 
 // registerTools registers the debugger tools with the MCP server.
@@ -29,7 +30,7 @@ func registerTools(server *mcp.Server) {
 	// Session management
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "debug",
-		Description: "Start a complete debugging session. Modes: 'source' (compile & debug), 'binary' (debug executable), 'attach' (connect to process). Returns full context at first breakpoint.",
+		Description: "Start a complete debugging session. Modes: 'source' (compile & debug), 'binary' (debug executable), 'core' (debug core dump), 'attach' (connect to process). Returns full context at first breakpoint.",
 	}, ds.debug)
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "stop",
@@ -100,10 +101,11 @@ type BreakpointSpec struct {
 
 // DebugParams defines the parameters for starting a complete debug session.
 type DebugParams struct {
-	Mode        string           `json:"mode" mcp:"'source' (compile & debug), 'binary' (debug executable), or 'attach' (connect to process)"`
-	Path        string           `json:"path,omitempty" mcp:"program path (required for source/binary modes)"`
-	Args        []string         `json:"args,omitempty" mcp:"command line arguments for the program"`
-	ProcessID   int              `json:"processId,omitempty" mcp:"process ID (required for attach mode)"`
+	Mode         string           `json:"mode" mcp:"'source' (compile & debug), 'binary' (debug executable), 'core' (debug core dump), or 'attach' (connect to process)"`
+	Path         string           `json:"path,omitempty" mcp:"program path (required for source/binary/core modes)"`
+	Args         []string         `json:"args,omitempty" mcp:"command line arguments for the program"`
+	CoreFilePath string           `json:"coreFilePath,omitempty" mcp:"path to core dump file (required for core mode)"`
+	ProcessID    int              `json:"processId,omitempty" mcp:"process ID (required for attach mode)"`
 	Breakpoints []BreakpointSpec `json:"breakpoints,omitempty" mcp:"initial breakpoints"`
 	StopOnEntry bool             `json:"stopOnEntry,omitempty" mcp:"stop at program entry instead of running to first breakpoint"`
 	Port        string           `json:"port,omitempty" mcp:"port for DAP server (default: auto-assigned)"`
@@ -515,6 +517,7 @@ func (ds *debuggerSession) stop(ctx context.Context, _ *mcp.ServerSession, _ *mc
 	ds.launchMode = ""
 	ds.programPath = ""
 	ds.programArgs = nil
+	ds.coreFilePath = ""
 
 	return &mcp.CallToolResultFor[any]{
 		Content: []mcp.Content{&mcp.TextContent{Text: "Debug session stopped"}},
@@ -536,10 +539,10 @@ func (ds *debuggerSession) debug(ctx context.Context, _ *mcp.ServerSession, para
 	// Validate mode
 	mode := params.Arguments.Mode
 	switch mode {
-	case "source", "binary", "attach":
+	case "source", "binary", "core", "attach":
 		// valid
 	default:
-		return nil, fmt.Errorf("invalid mode: %s (must be 'source', 'binary', or 'attach')", mode)
+		return nil, fmt.Errorf("invalid mode: %s (must be 'source', 'binary', 'core', or 'attach')", mode)
 	}
 
 	// Validate required parameters
@@ -551,6 +554,9 @@ func (ds *debuggerSession) debug(ctx context.Context, _ *mcp.ServerSession, para
 		if params.Arguments.Path == "" {
 			return nil, fmt.Errorf("path is required for %s mode", mode)
 		}
+	}
+	if mode == "core" && params.Arguments.CoreFilePath == "" {
+		return nil, fmt.Errorf("coreFilePath is required for core mode")
 	}
 
 	// Start Delve DAP server
@@ -598,6 +604,7 @@ func (ds *debuggerSession) debug(ctx context.Context, _ *mcp.ServerSession, para
 	ds.launchMode = mode
 	ds.programPath = params.Arguments.Path
 	ds.programArgs = params.Arguments.Args
+	ds.coreFilePath = params.Arguments.CoreFilePath
 
 	// Launch or attach
 	stopOnEntry := params.Arguments.StopOnEntry || len(params.Arguments.Breakpoints) == 0
@@ -608,6 +615,10 @@ func (ds *debuggerSession) debug(ctx context.Context, _ *mcp.ServerSession, para
 		}
 	case "binary":
 		if err := ds.client.LaunchRequest("exec", params.Arguments.Path, stopOnEntry, params.Arguments.Args); err != nil {
+			return nil, err
+		}
+	case "core":
+		if err := ds.client.CoreRequest(params.Arguments.Path, params.Arguments.CoreFilePath); err != nil {
 			return nil, err
 		}
 	case "attach":
