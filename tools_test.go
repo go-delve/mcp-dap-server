@@ -237,7 +237,7 @@ func TestBasic(t *testing.T) {
 	defer cleanupBinary()
 
 	// Start debug session (stopOnEntry since no initial breakpoints)
-	ts.startDebugSession(t, "9090", binaryPath, nil)
+	ts.startDebugSession(t, "0", binaryPath, nil)
 
 	// Set breakpoint and continue
 	f := filepath.Join(ts.cwd, "testdata", "go", "helloworld", "main.go")
@@ -314,7 +314,7 @@ func TestRestart(t *testing.T) {
 	defer cleanupBinary()
 
 	// Start debug session with initial argument
-	ts.startDebugSession(t, "9092", binaryPath, nil, "world")
+	ts.startDebugSession(t, "0", binaryPath, nil, "world")
 
 	// Set breakpoint and continue
 	f := filepath.Join(ts.cwd, "testdata", "go", "restart", "main.go")
@@ -399,7 +399,7 @@ func TestContext(t *testing.T) {
 	defer cleanupBinary()
 
 	// Start debug session
-	ts.startDebugSession(t, "9091", binaryPath, nil)
+	ts.startDebugSession(t, "0", binaryPath, nil)
 
 	// Set breakpoint and continue
 	f := filepath.Join(ts.cwd, "testdata", "go", "helloworld", "main.go")
@@ -446,7 +446,7 @@ func TestVariables(t *testing.T) {
 	// Start debug session with breakpoint in processCollection function (line 67)
 	// This is the last function called, so we're sure to see variables there
 	f := filepath.Join(ts.cwd, "testdata", "go", "scopes", "main.go")
-	ts.startDebugSession(t, "9094", binaryPath, []map[string]any{
+	ts.startDebugSession(t, "0", binaryPath, []map[string]any{
 		{"file": f, "line": 67},
 	})
 
@@ -488,7 +488,7 @@ func TestStep(t *testing.T) {
 	defer cleanupBinary()
 
 	// Start debug session
-	ts.startDebugSession(t, "9090", binaryPath, nil)
+	ts.startDebugSession(t, "0", binaryPath, nil)
 
 	// Set breakpoint at line 7 (x := 10)
 	f := filepath.Join(ts.cwd, "testdata", "go", "step", "main.go")

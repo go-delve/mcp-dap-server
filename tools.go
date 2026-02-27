@@ -106,7 +106,7 @@ type DebugParams struct {
 	ProcessID   int              `json:"processId,omitempty" mcp:"process ID (required for attach mode)"`
 	Breakpoints []BreakpointSpec `json:"breakpoints,omitempty" mcp:"initial breakpoints"`
 	StopOnEntry bool             `json:"stopOnEntry,omitempty" mcp:"stop at program entry instead of running to first breakpoint"`
-	Port        string           `json:"port,omitempty" mcp:"port for DAP server (default: 9090)"`
+	Port        string           `json:"port,omitempty" mcp:"port for DAP server (default: auto-assigned)"`
 }
 
 // ContextParams defines the parameters for getting debugging context.
@@ -527,7 +527,7 @@ func (ds *debuggerSession) debug(ctx context.Context, _ *mcp.ServerSession, para
 	// Default port
 	port := params.Arguments.Port
 	if port == "" {
-		port = "9090"
+		port = "0"
 	}
 	if !strings.HasPrefix(port, ":") {
 		port = ":" + port
@@ -564,20 +564,29 @@ func (ds *debuggerSession) debug(ctx context.Context, _ *mcp.ServerSession, para
 		return nil, err
 	}
 
-	// Wait for server to start
+	// Wait for server to start and parse actual listen address
 	r := bufio.NewReader(stdout)
+	var listenAddr string
 	for {
 		s, err := r.ReadString('\n')
 		if err != nil {
 			return nil, err
 		}
 		if strings.HasPrefix(s, "DAP server listening at") {
+			// Parse address from "DAP server listening at: 127.0.0.1:PORT"
+			parts := strings.SplitN(s, ": ", 2)
+			if len(parts) == 2 {
+				listenAddr = strings.TrimSpace(parts[1])
+			}
 			break
 		}
 	}
+	if listenAddr == "" {
+		return nil, fmt.Errorf("failed to parse DAP server listen address")
+	}
 
 	// Connect DAP client
-	ds.client = newDAPClient("localhost" + port)
+	ds.client = newDAPClient(listenAddr)
 	if err := ds.client.InitializeRequest(); err != nil {
 		return nil, err
 	}
