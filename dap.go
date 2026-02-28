@@ -45,7 +45,6 @@ func (c *DAPClient) Close() {
 	c.conn.Close()
 }
 
-// InitializeRequest sends an 'initialize' request.
 // InitializeRequest sends an 'initialize' request and returns the server's capabilities.
 func (c *DAPClient) InitializeRequest() (dap.Capabilities, error) {
 	request := &dap.InitializeRequest{Request: *c.newRequest("initialize")}
