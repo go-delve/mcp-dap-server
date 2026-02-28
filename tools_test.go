@@ -685,3 +685,91 @@ func TestCoreDump(t *testing.T) {
 	// Stop debugger
 	ts.stopDebugger(t)
 }
+
+func TestToolListChangesWithCapabilities(t *testing.T) {
+	ts := setupMCPServerAndClient(t)
+	defer ts.cleanup()
+
+	// Before debug session: only "debug" should be available
+	toolList, err := ts.session.ListTools(ts.ctx, &mcp.ListToolsParams{})
+	if err != nil {
+		t.Fatalf("Failed to list tools: %v", err)
+	}
+
+	toolNames := make(map[string]bool)
+	for _, tool := range toolList.Tools {
+		toolNames[tool.Name] = true
+	}
+
+	if !toolNames["debug"] {
+		t.Error("Expected 'debug' tool before session start")
+	}
+	if toolNames["stop"] {
+		t.Error("Did not expect 'stop' tool before session start")
+	}
+	if toolNames["breakpoint"] {
+		t.Error("Did not expect 'breakpoint' tool before session start")
+	}
+
+	// Start debug session
+	binaryPath, cleanupBinary := compileTestProgram(t, ts.cwd, "helloworld")
+	defer cleanupBinary()
+	ts.startDebugSession(t, "0", binaryPath, nil)
+
+	// After debug session: session tools should be available, debug should not
+	toolList, err = ts.session.ListTools(ts.ctx, &mcp.ListToolsParams{})
+	if err != nil {
+		t.Fatalf("Failed to list tools after debug: %v", err)
+	}
+
+	toolNames = make(map[string]bool)
+	for _, tool := range toolList.Tools {
+		toolNames[tool.Name] = true
+	}
+
+	if toolNames["debug"] {
+		t.Error("Did not expect 'debug' tool during active session")
+	}
+	if !toolNames["stop"] {
+		t.Error("Expected 'stop' tool during active session")
+	}
+	if !toolNames["breakpoint"] {
+		t.Error("Expected 'breakpoint' tool during active session")
+	}
+	if !toolNames["continue"] {
+		t.Error("Expected 'continue' tool during active session")
+	}
+	if !toolNames["step"] {
+		t.Error("Expected 'step' tool during active session")
+	}
+	if !toolNames["context"] {
+		t.Error("Expected 'context' tool during active session")
+	}
+	if !toolNames["evaluate"] {
+		t.Error("Expected 'evaluate' tool during active session")
+	}
+
+	// Stop debug session
+	ts.stopDebugger(t)
+
+	// After stop: should be back to just "debug"
+	toolList, err = ts.session.ListTools(ts.ctx, &mcp.ListToolsParams{})
+	if err != nil {
+		t.Fatalf("Failed to list tools after stop: %v", err)
+	}
+
+	toolNames = make(map[string]bool)
+	for _, tool := range toolList.Tools {
+		toolNames[tool.Name] = true
+	}
+
+	if !toolNames["debug"] {
+		t.Error("Expected 'debug' tool after session stop")
+	}
+	if toolNames["stop"] {
+		t.Error("Did not expect 'stop' tool after session stop")
+	}
+	if toolNames["breakpoint"] {
+		t.Error("Did not expect 'breakpoint' tool after session stop")
+	}
+}
