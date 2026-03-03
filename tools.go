@@ -1,12 +1,10 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"errors"
 	"fmt"
 	"log"
-	"os"
 	"os/exec"
 	"strings"
 
@@ -18,6 +16,7 @@ type debuggerSession struct {
 	cmd          *exec.Cmd
 	client       *DAPClient
 	server       *mcp.Server      // MCP server for dynamic tool registration
+	backend      DebuggerBackend  // debugger-specific backend (delve, gdb, etc.)
 	capabilities dap.Capabilities // capabilities reported by DAP server
 	launchMode   string           // "source", "binary", "core", or "attach"
 	programPath  string           // path to program being debugged
@@ -157,9 +156,11 @@ type DebugParams struct {
 	Args         []string         `json:"args,omitempty" mcp:"command line arguments for the program"`
 	CoreFilePath string           `json:"coreFilePath,omitempty" mcp:"path to core dump file (required for core mode)"`
 	ProcessID    int              `json:"processId,omitempty" mcp:"process ID (required for attach mode)"`
-	Breakpoints []BreakpointSpec `json:"breakpoints,omitempty" mcp:"initial breakpoints"`
-	StopOnEntry bool             `json:"stopOnEntry,omitempty" mcp:"stop at program entry instead of running to first breakpoint"`
-	Port        string           `json:"port,omitempty" mcp:"port for DAP server (default: auto-assigned)"`
+	Breakpoints  []BreakpointSpec `json:"breakpoints,omitempty" mcp:"initial breakpoints"`
+	StopOnEntry  bool             `json:"stopOnEntry,omitempty" mcp:"stop at program entry instead of running to first breakpoint"`
+	Port         string           `json:"port,omitempty" mcp:"port for DAP server (default: auto-assigned)"`
+	Debugger     string           `json:"debugger,omitempty" mcp:"debugger to use: 'delve' (default) or 'gdb'"`
+	AdapterPath  string           `json:"adapterPath,omitempty" mcp:"path to DAP adapter binary (for gdb: path to OpenDebugAD7; falls back to MCP_DAP_CPPTOOLS_PATH env var)"`
 }
 
 // ContextParams defines the parameters for getting debugging context.
@@ -617,40 +618,34 @@ func (ds *debuggerSession) debug(ctx context.Context, _ *mcp.ServerSession, para
 		return nil, fmt.Errorf("coreFilePath is required for core mode")
 	}
 
-	// Start Delve DAP server
-	ds.cmd = exec.Command("dlv", "dap", "--listen", port, "--log", "--log-output", "dap")
-	ds.cmd.Stderr = os.Stderr
-	stdout, err := ds.cmd.StdoutPipe()
+	// Select debugger backend
+	debugger := params.Arguments.Debugger
+	if debugger == "" {
+		debugger = "delve"
+	}
+	switch debugger {
+	case "delve":
+		ds.backend = &delveBackend{}
+	case "gdb":
+		return nil, fmt.Errorf("gdb support not yet implemented")
+	default:
+		return nil, fmt.Errorf("unsupported debugger: %s (must be 'delve' or 'gdb')", debugger)
+	}
+
+	// Spawn DAP server via backend
+	cmd, listenAddr, err := ds.backend.Spawn(port)
 	if err != nil {
 		return nil, err
 	}
-	if err := ds.cmd.Start(); err != nil {
-		return nil, err
-	}
+	ds.cmd = cmd
 
-	// Wait for server to start and parse actual listen address
-	r := bufio.NewReader(stdout)
-	var listenAddr string
-	for {
-		s, err := r.ReadString('\n')
-		if err != nil {
-			return nil, err
-		}
-		if strings.HasPrefix(s, "DAP server listening at") {
-			// Parse address from "DAP server listening at: 127.0.0.1:PORT"
-			parts := strings.SplitN(s, ": ", 2)
-			if len(parts) == 2 {
-				listenAddr = strings.TrimSpace(parts[1])
-			}
-			break
-		}
+	// Connect DAP client based on transport mode
+	switch ds.backend.TransportMode() {
+	case "tcp":
+		ds.client = newDAPClient(listenAddr)
+	default:
+		return nil, fmt.Errorf("unsupported transport mode: %s", ds.backend.TransportMode())
 	}
-	if listenAddr == "" {
-		return nil, fmt.Errorf("failed to parse DAP server listen address")
-	}
-
-	// Connect DAP client
-	ds.client = newDAPClient(listenAddr)
 	caps, err := ds.client.InitializeRequest()
 	if err != nil {
 		return nil, err
@@ -663,23 +658,37 @@ func (ds *debuggerSession) debug(ctx context.Context, _ *mcp.ServerSession, para
 	ds.programArgs = params.Arguments.Args
 	ds.coreFilePath = params.Arguments.CoreFilePath
 
-	// Launch or attach
+	// Launch or attach using backend-specific args
 	stopOnEntry := params.Arguments.StopOnEntry || len(params.Arguments.Breakpoints) == 0
 	switch mode {
-	case "source":
-		if err := ds.client.LaunchRequest("debug", params.Arguments.Path, stopOnEntry, params.Arguments.Args); err != nil {
+	case "source", "binary":
+		launchArgs, err := ds.backend.LaunchArgs(mode, params.Arguments.Path, stopOnEntry, params.Arguments.Args)
+		if err != nil {
 			return nil, err
 		}
-	case "binary":
-		if err := ds.client.LaunchRequest("exec", params.Arguments.Path, stopOnEntry, params.Arguments.Args); err != nil {
+		request := &dap.LaunchRequest{Request: *ds.client.newRequest("launch")}
+		request.Arguments = toRawMessage(launchArgs)
+		if err := ds.client.send(request); err != nil {
 			return nil, err
 		}
 	case "core":
-		if err := ds.client.CoreRequest(params.Arguments.Path, params.Arguments.CoreFilePath); err != nil {
+		coreArgs, err := ds.backend.CoreArgs(params.Arguments.Path, params.Arguments.CoreFilePath)
+		if err != nil {
+			return nil, err
+		}
+		request := &dap.LaunchRequest{Request: *ds.client.newRequest("launch")}
+		request.Arguments = toRawMessage(coreArgs)
+		if err := ds.client.send(request); err != nil {
 			return nil, err
 		}
 	case "attach":
-		if err := ds.client.AttachRequest("local", params.Arguments.ProcessID); err != nil {
+		attachArgs, err := ds.backend.AttachArgs(params.Arguments.ProcessID)
+		if err != nil {
+			return nil, err
+		}
+		request := &dap.AttachRequest{Request: *ds.client.newRequest("attach")}
+		request.Arguments = toRawMessage(attachArgs)
+		if err := ds.client.send(request); err != nil {
 			return nil, err
 		}
 	}
