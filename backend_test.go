@@ -2,6 +2,7 @@ package main
 
 import (
 	"os/exec"
+	"strings"
 	"testing"
 )
 
@@ -110,5 +111,43 @@ func TestDelveBackendAttachArgs(t *testing.T) {
 	}
 	if args["processId"] != 12345 {
 		t.Errorf("expected processId 12345, got: %v", args["processId"])
+	}
+}
+
+func TestGDBBackendLaunchArgs(t *testing.T) {
+	backend := &gdbBackend{adapterPath: "OpenDebugAD7"}
+
+	args, err := backend.LaunchArgs("binary", "/path/to/prog", false, []string{"--flag"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if args["MIMode"] != "gdb" {
+		t.Errorf("expected MIMode=gdb, got: %v", args["MIMode"])
+	}
+	if args["program"] != "/path/to/prog" {
+		t.Errorf("expected program=/path/to/prog, got: %v", args["program"])
+	}
+	if args["miDebuggerPath"] != "gdb" {
+		t.Errorf("expected miDebuggerPath=gdb, got: %v", args["miDebuggerPath"])
+	}
+}
+
+func TestGDBBackendSourceModeError(t *testing.T) {
+	backend := &gdbBackend{adapterPath: "OpenDebugAD7"}
+
+	_, err := backend.LaunchArgs("source", "/path/to/prog", false, nil)
+	if err == nil {
+		t.Fatal("expected error for source mode with GDB")
+	}
+	if !strings.Contains(err.Error(), "source") {
+		t.Errorf("expected error message to mention 'source', got: %s", err.Error())
+	}
+}
+
+func TestGDBBackendTransportMode(t *testing.T) {
+	backend := &gdbBackend{adapterPath: "OpenDebugAD7"}
+	if backend.TransportMode() != "stdio" {
+		t.Errorf("expected stdio, got: %s", backend.TransportMode())
 	}
 }

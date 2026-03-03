@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"strings"
@@ -123,5 +124,94 @@ func (b *delveBackend) AttachArgs(processID int) (map[string]any, error) {
 		"request":   "attach",
 		"mode":      "local",
 		"processId": processID,
+	}, nil
+}
+
+// gdbBackend implements DebuggerBackend for GDB via the cpptools DAP adapter
+// (OpenDebugAD7). It communicates over stdio rather than TCP.
+type gdbBackend struct {
+	adapterPath string
+	stdin       io.WriteCloser
+	stdout      io.ReadCloser
+}
+
+// Spawn starts the cpptools DAP adapter (OpenDebugAD7) over stdio.
+// Unlike TCP-based backends, there is no listen address; the process
+// communicates via stdin/stdout pipes.
+func (g *gdbBackend) Spawn(port string) (*exec.Cmd, string, error) {
+	cmd := exec.Command(g.adapterPath)
+	cmd.Stderr = os.Stderr
+
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return nil, "", fmt.Errorf("failed to create stdin pipe: %w", err)
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, "", fmt.Errorf("failed to create stdout pipe: %w", err)
+	}
+
+	g.stdin = stdin
+	g.stdout = stdout
+
+	if err := cmd.Start(); err != nil {
+		return nil, "", fmt.Errorf("failed to start cpptools adapter: %w", err)
+	}
+
+	// stdio transport — no listen address
+	return cmd, "", nil
+}
+
+// TransportMode returns "stdio" because the cpptools adapter communicates
+// over process stdin/stdout.
+func (g *gdbBackend) TransportMode() string {
+	return "stdio"
+}
+
+// StdioPipes returns the captured stdout and stdin pipes from Spawn.
+// These are used to create a DAPClient over the stdio transport.
+func (g *gdbBackend) StdioPipes() (stdout io.ReadCloser, stdin io.WriteCloser) {
+	return g.stdout, g.stdin
+}
+
+// LaunchArgs builds the cpptools-specific argument map for a DAP LaunchRequest.
+// GDB does not support "source" mode; programs must be pre-compiled with
+// debug symbols (gcc -g -O0) and launched in "binary" mode.
+func (g *gdbBackend) LaunchArgs(mode, programPath string, stopOnEntry bool, programArgs []string) (map[string]any, error) {
+	if mode == "source" {
+		return nil, fmt.Errorf("GDB does not support 'source' mode. Compile your program with debug symbols (gcc -g -O0) and use 'binary' mode instead")
+	}
+
+	cwd, _ := os.Getwd()
+	args := map[string]any{
+		"program":        programPath,
+		"MIMode":         "gdb",
+		"miDebuggerPath": "gdb",
+		"cwd":            cwd,
+		"stopAtEntry":    stopOnEntry,
+	}
+	if len(programArgs) > 0 {
+		args["args"] = programArgs
+	}
+	return args, nil
+}
+
+// CoreArgs builds the cpptools-specific argument map for core dump debugging.
+func (g *gdbBackend) CoreArgs(programPath, coreFilePath string) (map[string]any, error) {
+	cwd, _ := os.Getwd()
+	return map[string]any{
+		"program":      programPath,
+		"coreDumpPath": coreFilePath,
+		"MIMode":       "gdb",
+		"cwd":          cwd,
+	}, nil
+}
+
+// AttachArgs builds the cpptools-specific argument map for attaching to a process.
+func (g *gdbBackend) AttachArgs(processID int) (map[string]any, error) {
+	return map[string]any{
+		"processId":      processID,
+		"MIMode":         "gdb",
+		"miDebuggerPath": "gdb",
 	}, nil
 }

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"os"
 	"os/exec"
 	"strings"
 
@@ -627,7 +628,14 @@ func (ds *debuggerSession) debug(ctx context.Context, _ *mcp.ServerSession, para
 	case "delve":
 		ds.backend = &delveBackend{}
 	case "gdb":
-		return nil, fmt.Errorf("gdb support not yet implemented")
+		adapterPath := params.Arguments.AdapterPath
+		if adapterPath == "" {
+			adapterPath = os.Getenv("MCP_DAP_CPPTOOLS_PATH")
+		}
+		if adapterPath == "" {
+			return nil, fmt.Errorf("GDB debugging requires the cpptools DAP adapter (OpenDebugAD7). Set the adapterPath parameter or MCP_DAP_CPPTOOLS_PATH environment variable")
+		}
+		ds.backend = &gdbBackend{adapterPath: adapterPath}
 	default:
 		return nil, fmt.Errorf("unsupported debugger: %s (must be 'delve' or 'gdb')", debugger)
 	}
@@ -643,6 +651,13 @@ func (ds *debuggerSession) debug(ctx context.Context, _ *mcp.ServerSession, para
 	switch ds.backend.TransportMode() {
 	case "tcp":
 		ds.client = newDAPClient(listenAddr)
+	case "stdio":
+		gdb := ds.backend.(*gdbBackend)
+		stdout, stdin := gdb.StdioPipes()
+		ds.client = newDAPClientFromRWC(&readWriteCloser{
+			Reader:      stdout,
+			WriteCloser: stdin,
+		})
 	default:
 		return nil, fmt.Errorf("unsupported transport mode: %s", ds.backend.TransportMode())
 	}
