@@ -230,6 +230,76 @@ func (ts *testSetup) stopDebugger(t *testing.T) {
 	t.Logf("Stop debugger result: %v", stopResult)
 }
 
+// requireGDBDeps skips the test if GDB or the cpptools adapter are not available.
+func requireGDBDeps(t *testing.T) {
+	t.Helper()
+	if _, err := exec.LookPath("gdb"); err != nil {
+		t.Skip("gdb not found in PATH")
+	}
+	if _, err := exec.LookPath("OpenDebugAD7"); err != nil {
+		adapterPath := os.Getenv("MCP_DAP_CPPTOOLS_PATH")
+		if adapterPath == "" {
+			t.Skip("OpenDebugAD7 not found in PATH and MCP_DAP_CPPTOOLS_PATH not set")
+		}
+	}
+}
+
+// compileTestCProgram compiles a C test program with debug symbols and returns the binary path.
+func compileTestCProgram(t *testing.T, cwd, name string) (binaryPath string, cleanup func()) {
+	t.Helper()
+
+	if _, err := exec.LookPath("gcc"); err != nil {
+		t.Skip("gcc not found in PATH")
+	}
+
+	programDir := filepath.Join(cwd, "testdata", "c", name)
+	binaryPath = filepath.Join(programDir, "debugprog")
+
+	os.Remove(binaryPath)
+
+	cmd := exec.Command("gcc", "-g", "-O0", "-o", binaryPath, "main.c")
+	cmd.Dir = programDir
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("Failed to compile C program: %v\nOutput: %s", err, output)
+	}
+
+	cleanup = func() {
+		os.Remove(binaryPath)
+	}
+
+	return binaryPath, cleanup
+}
+
+func TestCompileTestCProgram(t *testing.T) {
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("Failed to get cwd: %v", err)
+	}
+
+	binaryPath, cleanup := compileTestCProgram(t, cwd, "helloworld")
+	defer cleanup()
+
+	// Verify the binary exists and is executable
+	info, err := os.Stat(binaryPath)
+	if err != nil {
+		t.Fatalf("Binary not found: %v", err)
+	}
+	if info.Size() == 0 {
+		t.Error("Binary is empty")
+	}
+
+	// Verify it runs
+	cmd := exec.Command(binaryPath)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("Binary failed to run: %v\nOutput: %s", err, output)
+	}
+	if !strings.Contains(string(output), "Sum: 30") {
+		t.Errorf("Expected output to contain 'Sum: 30', got: %s", output)
+	}
+}
+
 func TestBasic(t *testing.T) {
 	// Setup test infrastructure
 	ts := setupMCPServerAndClient(t)
