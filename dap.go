@@ -4,17 +4,24 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net"
 
 	"github.com/google/go-dap"
 )
 
+// readWriteCloser combines separate reader and writer into io.ReadWriteCloser.
+type readWriteCloser struct {
+	io.Reader
+	io.WriteCloser
+}
+
 // DAPClient is a debugger service client that uses Debug Adaptor Protocol.
 // It does not (yet?) implement service.DAPClient interface.
 // All client methods are synchronous.
 type DAPClient struct {
-	conn   net.Conn
+	rwc    io.ReadWriteCloser
 	reader *bufio.Reader
 	// seq is used to track the sequence number of each
 	// requests that the client sends to the server
@@ -32,17 +39,23 @@ func newDAPClient(addr string) *DAPClient {
 	return newDAPClientFromConn(conn)
 }
 
-// newDAPClientFromConn creates a new Client with the given TCP connection.
-// Call Close to close the connection.
-func newDAPClientFromConn(conn net.Conn) *DAPClient {
-	c := &DAPClient{conn: conn, reader: bufio.NewReader(conn)}
+// newDAPClientFromRWC creates a new Client with the given ReadWriteCloser.
+// Call Close to close the underlying transport.
+func newDAPClientFromRWC(rwc io.ReadWriteCloser) *DAPClient {
+	c := &DAPClient{rwc: rwc, reader: bufio.NewReader(rwc)}
 	c.seq = 1 // match VS Code numbering
 	return c
 }
 
+// newDAPClientFromConn creates a new Client with the given TCP connection.
+// Call Close to close the connection.
+func newDAPClientFromConn(conn net.Conn) *DAPClient {
+	return newDAPClientFromRWC(conn)
+}
+
 // Close closes the client connection.
 func (c *DAPClient) Close() {
-	c.conn.Close()
+	c.rwc.Close()
 }
 
 // InitializeRequest sends an 'initialize' request and returns the server's capabilities.
@@ -117,7 +130,7 @@ func (c *DAPClient) newRequest(command string) *dap.Request {
 }
 
 func (c *DAPClient) send(request dap.Message) error {
-	return dap.WriteProtocolMessage(c.conn, request)
+	return dap.WriteProtocolMessage(c.rwc, request)
 }
 
 func toRawMessage(in any) json.RawMessage {
