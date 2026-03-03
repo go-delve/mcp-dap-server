@@ -843,3 +843,177 @@ func TestToolListChangesWithCapabilities(t *testing.T) {
 		t.Error("Did not expect 'breakpoint' tool after session stop")
 	}
 }
+
+func TestGDBBasic(t *testing.T) {
+	requireGDBDeps(t)
+
+	ts := setupMCPServerAndClient(t)
+	defer ts.cleanup()
+
+	binaryPath, cleanupBinary := compileTestCProgram(t, ts.cwd, "helloworld")
+	defer cleanupBinary()
+
+	adapterPath := "OpenDebugAD7"
+	if p := os.Getenv("MCP_DAP_CPPTOOLS_PATH"); p != "" {
+		adapterPath = p
+	}
+
+	f := filepath.Join(ts.cwd, "testdata", "c", "helloworld", "main.c")
+
+	// Start GDB debug session with breakpoint at line 11 (int sum = add(x, y))
+	result, err := ts.session.CallTool(ts.ctx, &mcp.CallToolParams{
+		Name: "debug",
+		Arguments: map[string]any{
+			"debugger":    "gdb",
+			"adapterPath": adapterPath,
+			"mode":        "binary",
+			"path":        binaryPath,
+			"breakpoints": []map[string]any{
+				{"file": f, "line": 11},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Failed to start GDB debug session: %v", err)
+	}
+	if result.IsError {
+		errorMsg := ""
+		if len(result.Content) > 0 {
+			if tc, ok := result.Content[0].(*mcp.TextContent); ok {
+				errorMsg = tc.Text
+			}
+		}
+		t.Fatalf("GDB debug session returned error: %s", errorMsg)
+	}
+
+	contextStr := ts.getContextContent(t)
+	t.Logf("GDB context:\n%s", contextStr)
+
+	if !strings.Contains(contextStr, "main") {
+		t.Errorf("Expected context to contain 'main', got: %s", contextStr)
+	}
+
+	ts.stopDebugger(t)
+}
+
+func TestGDBStep(t *testing.T) {
+	requireGDBDeps(t)
+
+	ts := setupMCPServerAndClient(t)
+	defer ts.cleanup()
+
+	binaryPath, cleanupBinary := compileTestCProgram(t, ts.cwd, "helloworld")
+	defer cleanupBinary()
+
+	adapterPath := "OpenDebugAD7"
+	if p := os.Getenv("MCP_DAP_CPPTOOLS_PATH"); p != "" {
+		adapterPath = p
+	}
+
+	f := filepath.Join(ts.cwd, "testdata", "c", "helloworld", "main.c")
+
+	// Start at line 9 (int x = 10)
+	result, err := ts.session.CallTool(ts.ctx, &mcp.CallToolParams{
+		Name: "debug",
+		Arguments: map[string]any{
+			"debugger":    "gdb",
+			"adapterPath": adapterPath,
+			"mode":        "binary",
+			"path":        binaryPath,
+			"breakpoints": []map[string]any{
+				{"file": f, "line": 9},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Failed to start: %v", err)
+	}
+	if result.IsError {
+		t.Fatalf("Debug returned error")
+	}
+
+	// Step over
+	stepResult, err := ts.session.CallTool(ts.ctx, &mcp.CallToolParams{
+		Name: "step",
+		Arguments: map[string]any{
+			"mode": "over",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Failed to step: %v", err)
+	}
+	t.Logf("Step result: %v", stepResult)
+
+	contextStr := ts.getContextContent(t)
+	t.Logf("Context after step:\n%s", contextStr)
+
+	if !strings.Contains(contextStr, "main") {
+		t.Errorf("Expected to still be in main, got: %s", contextStr)
+	}
+
+	ts.stopDebugger(t)
+}
+
+func TestGDBEvaluate(t *testing.T) {
+	requireGDBDeps(t)
+
+	ts := setupMCPServerAndClient(t)
+	defer ts.cleanup()
+
+	binaryPath, cleanupBinary := compileTestCProgram(t, ts.cwd, "helloworld")
+	defer cleanupBinary()
+
+	adapterPath := "OpenDebugAD7"
+	if p := os.Getenv("MCP_DAP_CPPTOOLS_PATH"); p != "" {
+		adapterPath = p
+	}
+
+	// Set breakpoint at line 12 (after x, y, and sum are assigned)
+	f := filepath.Join(ts.cwd, "testdata", "c", "helloworld", "main.c")
+	result, err := ts.session.CallTool(ts.ctx, &mcp.CallToolParams{
+		Name: "debug",
+		Arguments: map[string]any{
+			"debugger":    "gdb",
+			"adapterPath": adapterPath,
+			"mode":        "binary",
+			"path":        binaryPath,
+			"breakpoints": []map[string]any{
+				{"file": f, "line": 12},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Failed to start: %v", err)
+	}
+	if result.IsError {
+		t.Fatalf("Debug returned error")
+	}
+
+	// Evaluate x + y
+	evalResult, err := ts.session.CallTool(ts.ctx, &mcp.CallToolParams{
+		Name: "evaluate",
+		Arguments: map[string]any{
+			"expression": "x + y",
+			"context":    "repl",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Failed to evaluate: %v", err)
+	}
+	if evalResult.IsError {
+		t.Fatalf("Evaluate returned error")
+	}
+	t.Logf("Evaluate result: %v", evalResult)
+
+	resultStr := ""
+	for _, content := range evalResult.Content {
+		if tc, ok := content.(*mcp.TextContent); ok {
+			resultStr += tc.Text
+		}
+	}
+	if !strings.Contains(resultStr, "30") {
+		t.Errorf("Expected evaluation to contain '30', got: %s", resultStr)
+	}
+
+	ts.stopDebugger(t)
+}
