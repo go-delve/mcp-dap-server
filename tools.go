@@ -36,13 +36,23 @@ func (ds *debuggerSession) defaultThreadID() int {
 	return 1
 }
 
+const debugToolDescription = `Start a complete debugging session. Returns full context at first breakpoint.
+
+Modes: 'source' (compile & debug), 'binary' (debug executable), 'core' (debug core dump), 'attach' (connect to process).
+
+Debugger selection (via 'debugger' parameter):
+- 'delve' (default): For Go programs only. Requires dlv to be installed.
+- 'gdb': For C/C++/Rust and other compiled languages. Requires the cpptools DAP adapter (OpenDebugAD7). Set 'adapterPath' to the path of OpenDebugAD7, or set the MCP_DAP_CPPTOOLS_PATH environment variable. GDB does not support 'source' mode; compile your program with debug symbols (gcc -g -O0) and use 'binary' mode.
+
+Choose the debugger based on the language of the program being debugged: use 'delve' for Go, use 'gdb' for C/C++/Rust.`
+
 // registerTools registers the debugger tools with the MCP server.
 func registerTools(server *mcp.Server) {
 	ds := &debuggerSession{server: server}
 
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "debug",
-		Description: "Start a complete debugging session. Modes: 'source' (compile & debug), 'binary' (debug executable), 'core' (debug core dump), 'attach' (connect to process). Returns full context at first breakpoint.",
+		Description: debugToolDescription,
 	}, ds.debug)
 }
 
@@ -150,7 +160,7 @@ func (ds *debuggerSession) unregisterSessionTools() {
 
 	mcp.AddTool(ds.server, &mcp.Tool{
 		Name:        "debug",
-		Description: "Start a complete debugging session. Modes: 'source' (compile & debug), 'binary' (debug executable), 'core' (debug core dump), 'attach' (connect to process). Returns full context at first breakpoint.",
+		Description: debugToolDescription,
 	}, ds.debug)
 }
 
