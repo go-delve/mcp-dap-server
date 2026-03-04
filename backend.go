@@ -22,6 +22,9 @@ type DebuggerBackend interface {
 	// TransportMode returns "tcp" or "stdio" indicating how to connect.
 	TransportMode() string
 
+	// AdapterID returns the DAP adapter identifier for InitializeRequest.
+	AdapterID() string
+
 	// LaunchArgs builds the debugger-specific arguments map for DAP LaunchRequest.
 	LaunchArgs(mode, programPath string, stopOnEntry bool, programArgs []string) (map[string]any, error)
 
@@ -80,6 +83,11 @@ func (b *delveBackend) Spawn(port string) (*exec.Cmd, string, error) {
 // TransportMode returns "tcp" because Delve communicates over a TCP socket.
 func (b *delveBackend) TransportMode() string {
 	return "tcp"
+}
+
+// AdapterID returns "go" for the Delve debug adapter.
+func (b *delveBackend) AdapterID() string {
+	return "go"
 }
 
 // LaunchArgs builds the Delve-specific argument map for a DAP LaunchRequest.
@@ -166,6 +174,11 @@ func (g *gdbBackend) Spawn(port string) (*exec.Cmd, string, error) {
 // over process stdin/stdout.
 func (g *gdbBackend) TransportMode() string {
 	return "stdio"
+}
+
+// AdapterID returns "cppdbg" for the cpptools debug adapter.
+func (g *gdbBackend) AdapterID() string {
+	return "cppdbg"
 }
 
 // StdioPipes returns the captured stdout and stdin pipes from Spawn.

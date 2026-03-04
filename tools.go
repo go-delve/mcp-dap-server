@@ -14,15 +14,26 @@ import (
 )
 
 type debuggerSession struct {
-	cmd          *exec.Cmd
-	client       *DAPClient
-	server       *mcp.Server      // MCP server for dynamic tool registration
-	backend      DebuggerBackend  // debugger-specific backend (delve, gdb, etc.)
-	capabilities dap.Capabilities // capabilities reported by DAP server
-	launchMode   string           // "source", "binary", "core", or "attach"
-	programPath  string           // path to program being debugged
-	programArgs  []string         // command line arguments
-	coreFilePath string           // path to core dump file (core mode only)
+	cmd             *exec.Cmd
+	client          *DAPClient
+	server          *mcp.Server      // MCP server for dynamic tool registration
+	backend         DebuggerBackend  // debugger-specific backend (delve, gdb, etc.)
+	capabilities    dap.Capabilities // capabilities reported by DAP server
+	launchMode      string           // "source", "binary", "core", or "attach"
+	programPath     string           // path to program being debugged
+	programArgs     []string         // command line arguments
+	coreFilePath    string           // path to core dump file (core mode only)
+	stoppedThreadID int              // thread ID from last StoppedEvent (for adapters that use non-sequential IDs)
+	lastFrameID     int              // frame ID from last getFullContext (for adapters that use non-zero frame IDs)
+}
+
+// defaultThreadID returns the thread ID to use when none is specified.
+// It returns the thread ID from the last StoppedEvent, or 1 as a fallback.
+func (ds *debuggerSession) defaultThreadID() int {
+	if ds.stoppedThreadID != 0 {
+		return ds.stoppedThreadID
+	}
+	return 1
 }
 
 // registerTools registers the debugger tools with the MCP server.
@@ -283,7 +294,11 @@ func (ds *debuggerSession) continueExecution(ctx context.Context, _ *mcp.ServerS
 		}
 	}
 
-	if err := ds.client.ContinueRequest(params.Arguments.ThreadID); err != nil {
+	threadID := params.Arguments.ThreadID
+	if threadID == 0 {
+		threadID = ds.defaultThreadID()
+	}
+	if err := ds.client.ContinueRequest(threadID); err != nil {
 		return nil, err
 	}
 
@@ -298,6 +313,7 @@ func (ds *debuggerSession) continueExecution(ctx context.Context, _ *mcp.ServerS
 				return nil, fmt.Errorf("continue failed: %s", resp.GetResponse().Message)
 			}
 		case *dap.StoppedEvent:
+			ds.stoppedThreadID = resp.Body.ThreadId
 			return ds.getFullContext(resp.Body.ThreadId, 0, 20)
 		case *dap.TerminatedEvent:
 			return &mcp.CallToolResultFor[any]{
@@ -347,7 +363,12 @@ func (ds *debuggerSession) evaluateExpression(ctx context.Context, _ *mcp.Server
 		context = "repl"
 	}
 
-	if err := ds.client.EvaluateRequest(params.Arguments.Expression, params.Arguments.FrameID, context); err != nil {
+	frameID := params.Arguments.FrameID
+	if frameID == 0 && ds.lastFrameID != 0 {
+		frameID = ds.lastFrameID
+	}
+
+	if err := ds.client.EvaluateRequest(params.Arguments.Expression, frameID, context); err != nil {
 		return nil, err
 	}
 
@@ -370,6 +391,13 @@ func (ds *debuggerSession) evaluateExpression(ctx context.Context, _ *mcp.Server
 			}
 			return &mcp.CallToolResultFor[any]{
 				Content: []mcp.Content{&mcp.TextContent{Text: result}},
+			}, nil
+		case dap.ResponseMessage:
+			if !resp.GetResponse().Success {
+				return nil, fmt.Errorf("unable to evaluate expression: %s", resp.GetResponse().Message)
+			}
+			return &mcp.CallToolResultFor[any]{
+				Content: []mcp.Content{&mcp.TextContent{Text: "(no result)"}},
 			}, nil
 		case dap.EventMessage:
 			// Ignore events, they can come at any time
@@ -661,7 +689,7 @@ func (ds *debuggerSession) debug(ctx context.Context, _ *mcp.ServerSession, para
 	default:
 		return nil, fmt.Errorf("unsupported transport mode: %s", ds.backend.TransportMode())
 	}
-	caps, err := ds.client.InitializeRequest()
+	caps, err := ds.client.InitializeRequest(ds.backend.AdapterID())
 	if err != nil {
 		return nil, err
 	}
@@ -707,8 +735,46 @@ func (ds *debuggerSession) debug(ctx context.Context, _ *mcp.ServerSession, para
 			return nil, err
 		}
 	}
-	if err := readAndValidateResponse(ds.client, "unable to start debug session"); err != nil {
-		return nil, err
+	// After sending the launch/attach request, we must handle two DAP patterns:
+	//
+	// Delve pattern: launch response arrives immediately, then we set breakpoints
+	// and send configurationDone.
+	//
+	// cpptools pattern: the adapter sends an "initialized" event and defers
+	// the launch response until after configurationDone. We must set breakpoints
+	// and send configurationDone before reading the launch response.
+	//
+	// We unify both by reading messages until we get either the launch response
+	// (Delve) or an initialized event (cpptools), then proceeding accordingly.
+	// After sending the launch/attach request, we must handle two DAP patterns:
+	//
+	// Delve pattern: launch response arrives immediately, then initialized event.
+	//
+	// cpptools pattern (SupportsRunInTerminalRequest=true): the adapter sends an
+	// "initialized" event and defers the launch response until after configurationDone.
+	//
+	// cpptools pattern (SupportsRunInTerminalRequest=false): launch response, then
+	// initialized event (same as Delve).
+	//
+	// In all cases we need to consume both the launch response and the initialized
+	// event before proceeding to set breakpoints. We read messages until we have
+	// seen both (or just initialized for the deferred-response pattern).
+	launchResponseReceived := false
+	initializedReceived := false
+	for !initializedReceived {
+		msg, err := ds.client.ReadMessage()
+		if err != nil {
+			return nil, err
+		}
+		switch resp := msg.(type) {
+		case dap.ResponseMessage:
+			if !resp.GetResponse().Success {
+				return nil, fmt.Errorf("unable to start debug session: %s", resp.GetResponse().Message)
+			}
+			launchResponseReceived = true
+		case *dap.InitializedEvent:
+			initializedReceived = true
+		}
 	}
 
 	// Set breakpoints
@@ -724,7 +790,7 @@ func (ds *debuggerSession) debug(ctx context.Context, _ *mcp.ServerSession, para
 			if err := ds.client.SetBreakpointsRequest(bp.File, []int{bp.Line}); err != nil {
 				return nil, err
 			}
-			if _, err := ds.client.ReadMessage(); err != nil {
+			if err := readAndValidateResponse(ds.client, "unable to set breakpoint"); err != nil {
 				return nil, err
 			}
 		}
@@ -738,28 +804,57 @@ func (ds *debuggerSession) debug(ctx context.Context, _ *mcp.ServerSession, para
 		return nil, err
 	}
 
+	// For adapters that defer the launch response (cpptools with RunInTerminal),
+	// read the deferred launch response now.
+	if !launchResponseReceived {
+		if err := readAndValidateResponse(ds.client, "unable to start debug session"); err != nil {
+			return nil, err
+		}
+	}
+
 	// Register session-specific tools based on capabilities
 	ds.registerSessionTools()
 
-	// If we have breakpoints and not explicitly stopping on entry, continue to first breakpoint
+	// If we have breakpoints and not explicitly stopping on entry, wait for the
+	// debuggee to reach a breakpoint. Different adapters behave differently:
+	//
+	// Delve: stops at entry point first (reason="entry"), then requires
+	// ContinueRequest to proceed to the breakpoint.
+	//
+	// cpptools: with stopAtEntry=false, runs directly to breakpoint without
+	// stopping at entry first.
+	//
+	// We handle both by reading the first StoppedEvent. If it's an entry stop,
+	// we send ContinueRequest and wait for the next stop.
 	if len(params.Arguments.Breakpoints) > 0 && !params.Arguments.StopOnEntry {
-		if err := ds.client.ContinueRequest(0); err != nil {
-			return nil, err
-		}
-		// Wait for stopped or terminated event
+		var stoppedThreadID int
 		for {
 			msg, err := ds.client.ReadMessage()
 			if err != nil {
 				return nil, err
 			}
-			switch msg.(type) {
-			case *dap.StoppedEvent, *dap.TerminatedEvent:
+			switch ev := msg.(type) {
+			case *dap.StoppedEvent:
+				if ev.Body.Reason == "entry" {
+					// Stopped at entry — send continue to reach the breakpoint
+					if err := ds.client.ContinueRequest(ev.Body.ThreadId); err != nil {
+						return nil, err
+					}
+					continue
+				}
+				stoppedThreadID = ev.Body.ThreadId
+				ds.stoppedThreadID = stoppedThreadID
+				goto stopped
+			case *dap.TerminatedEvent:
 				goto stopped
 			}
 		}
 	stopped:
+		if stoppedThreadID == 0 {
+			stoppedThreadID = 1
+		}
 		// Return full context when stopped at breakpoint
-		return ds.getFullContext(1, 0, 20)
+		return ds.getFullContext(stoppedThreadID, 0, 20)
 	}
 
 	// Return simple success message when stopped on entry
@@ -773,7 +868,7 @@ func (ds *debuggerSession) debug(ctx context.Context, _ *mcp.ServerSession, para
 func (ds *debuggerSession) context(ctx context.Context, _ *mcp.ServerSession, params *mcp.CallToolParamsFor[ContextParams]) (*mcp.CallToolResultFor[any], error) {
 	threadID := params.Arguments.ThreadID
 	if threadID == 0 {
-		threadID = 1
+		threadID = ds.defaultThreadID()
 	}
 	maxFrames := params.Arguments.MaxFrames
 	if maxFrames == 0 {
@@ -790,7 +885,7 @@ func (ds *debuggerSession) step(ctx context.Context, _ *mcp.ServerSession, param
 
 	threadID := params.Arguments.ThreadID
 	if threadID == 0 {
-		threadID = 1
+		threadID = ds.defaultThreadID()
 	}
 
 	// Execute the appropriate step command
@@ -823,6 +918,7 @@ func (ds *debuggerSession) step(ctx context.Context, _ *mcp.ServerSession, param
 				return nil, fmt.Errorf("step failed: %s", resp.GetResponse().Message)
 			}
 		case *dap.StoppedEvent:
+			ds.stoppedThreadID = resp.Body.ThreadId
 			return ds.getFullContext(resp.Body.ThreadId, 0, 20)
 		case *dap.TerminatedEvent:
 			return &mcp.CallToolResultFor[any]{
@@ -857,6 +953,11 @@ func (ds *debuggerSession) getFullContext(threadID, frameID, maxFrames int) (*mc
 				return nil, fmt.Errorf("unable to get stack trace: %s", resp.Message)
 			}
 			frames = resp.Body.StackFrames
+			goto gotStack
+		case dap.ResponseMessage:
+			if !resp.GetResponse().Success {
+				return nil, fmt.Errorf("unable to get stack trace: %s", resp.GetResponse().Message)
+			}
 			goto gotStack
 		case dap.EventMessage:
 			continue
@@ -896,6 +997,7 @@ gotStack:
 	if targetFrameID == 0 && len(frames) > 0 {
 		targetFrameID = frames[0].Id
 	}
+	ds.lastFrameID = targetFrameID
 
 	if err := ds.client.ScopesRequest(targetFrameID); err != nil {
 		return nil, err
@@ -916,6 +1018,14 @@ gotStack:
 				goto gotScopes
 			}
 			scopes = resp.Body.Scopes
+			goto gotScopes
+		case dap.ResponseMessage:
+			if !resp.GetResponse().Success {
+				log.Printf("getFullContext: scopes request failed: %s", resp.GetResponse().Message)
+				result.WriteString("## Variables\n")
+				result.WriteString("(unable to retrieve scopes)\n")
+				goto gotScopes
+			}
 			goto gotScopes
 		case dap.EventMessage:
 			continue

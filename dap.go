@@ -59,33 +59,39 @@ func (c *DAPClient) Close() {
 }
 
 // InitializeRequest sends an 'initialize' request and returns the server's capabilities.
-func (c *DAPClient) InitializeRequest() (dap.Capabilities, error) {
+func (c *DAPClient) InitializeRequest(adapterID string) (dap.Capabilities, error) {
 	request := &dap.InitializeRequest{Request: *c.newRequest("initialize")}
 	request.Arguments = dap.InitializeRequestArguments{
-		AdapterID:                    "go",
+		AdapterID:                    adapterID,
 		PathFormat:                   "path",
 		LinesStartAt1:                true,
 		ColumnsStartAt1:              true,
 		SupportsVariableType:         true,
 		SupportsVariablePaging:       true,
-		SupportsRunInTerminalRequest: true,
+		SupportsRunInTerminalRequest: false,
 		Locale:                       "en-us",
 	}
 	if err := c.send(request); err != nil {
 		return dap.Capabilities{}, err
 	}
-	msg, err := c.ReadMessage()
-	if err != nil {
-		return dap.Capabilities{}, err
+	for {
+		msg, err := c.ReadMessage()
+		if err != nil {
+			return dap.Capabilities{}, err
+		}
+		switch resp := msg.(type) {
+		case *dap.InitializeResponse:
+			if !resp.Success {
+				return dap.Capabilities{}, fmt.Errorf("initialize failed: %s", resp.Message)
+			}
+			return resp.Body, nil
+		case dap.EventMessage:
+			// Skip events (e.g. OutputEvent from cpptools) and keep reading
+			continue
+		default:
+			return dap.Capabilities{}, fmt.Errorf("expected InitializeResponse, got %T", msg)
+		}
 	}
-	resp, ok := msg.(*dap.InitializeResponse)
-	if !ok {
-		return dap.Capabilities{}, fmt.Errorf("expected InitializeResponse, got %T", msg)
-	}
-	if !resp.Success {
-		return dap.Capabilities{}, fmt.Errorf("initialize failed: %s", resp.Message)
-	}
-	return resp.Body, nil
 }
 
 func (c *DAPClient) ReadMessage() (dap.Message, error) {
