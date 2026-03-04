@@ -815,6 +815,27 @@ func (ds *debuggerSession) debug(ctx context.Context, _ *mcp.ServerSession, para
 	// Register session-specific tools based on capabilities
 	ds.registerSessionTools()
 
+	// For core dump mode, the program is already stopped at the crash point.
+	// Wait for the StoppedEvent from the adapter before returning context.
+	if mode == "core" {
+		for {
+			msg, err := ds.client.ReadMessage()
+			if err != nil {
+				return nil, err
+			}
+			switch ev := msg.(type) {
+			case *dap.StoppedEvent:
+				ds.stoppedThreadID = ev.Body.ThreadId
+				if ds.stoppedThreadID == 0 {
+					ds.stoppedThreadID = 1
+				}
+				return ds.getFullContext(ds.stoppedThreadID, 0, 20)
+			case dap.EventMessage:
+				continue
+			}
+		}
+	}
+
 	// If we have breakpoints and not explicitly stopping on entry, wait for the
 	// debuggee to reach a breakpoint. Different adapters behave differently:
 	//
