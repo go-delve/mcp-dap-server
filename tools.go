@@ -126,7 +126,7 @@ Modes: 'over' (execute current line, step over function calls), 'in' (step into 
 		Name: "context",
 		Description: `Get full debugging context at the current stop location. Returns: current function and file location, full stack trace with frame IDs, and all local variables with their types and values.
 
-All parameters are optional. Call with no arguments to get context for the current thread and top frame.`,
+Call with no arguments to get context for the current thread and top frame. The only accepted parameters are threadId, frameId, and maxFrames — all optional. Use the 'info' tool with type 'threads' to discover valid thread IDs.`,
 	}, ds.context)
 	mcp.AddTool(ds.server, &mcp.Tool{
 		Name: "evaluate",
@@ -136,9 +136,9 @@ Examples: {"expression": "len(items)"}, {"expression": "user.Name"}, {"expressio
 	}, ds.evaluateExpression)
 
 	// Info tool with dynamic description
-	infoDesc := "List program metadata. Defaults to 'sources' which returns all loaded source file paths."
+	infoDesc := "List program metadata. Type: 'threads' (list all threads with IDs), 'sources' (loaded source file paths, default)."
 	if ds.capabilities.SupportsModulesRequest {
-		infoDesc = "List program metadata. Defaults to 'sources' (loaded source file paths). Set type to 'modules' for loaded modules/libraries."
+		infoDesc = "List program metadata. Type: 'threads' (list all threads with IDs), 'sources' (loaded source file paths, default), or 'modules' (loaded modules/libraries)."
 	}
 	mcp.AddTool(ds.server, &mcp.Tool{
 		Name:        "info",
@@ -217,7 +217,7 @@ type StepParams struct {
 
 // InfoParams defines parameters for getting program metadata.
 type InfoParams struct {
-	Type string `json:"type,omitempty" mcp:"'sources' (loaded source files, default) or 'modules' (loaded modules)"`
+	Type string `json:"type,omitempty" mcp:"'threads' (list threads), 'sources' (loaded source files, default), or 'modules' (loaded modules)"`
 }
 
 // BreakpointToolParams defines parameters for setting a breakpoint.
@@ -509,6 +509,30 @@ func (ds *debuggerSession) info(ctx context.Context, _ *mcp.ServerSession, param
 	}
 
 	switch infoType {
+	case "threads":
+		if err := ds.client.ThreadsRequest(); err != nil {
+			return nil, err
+		}
+		msg, err := ds.client.ReadMessage()
+		if err != nil {
+			return nil, err
+		}
+		resp, ok := msg.(*dap.ThreadsResponse)
+		if !ok {
+			return nil, fmt.Errorf("unexpected response type for threads")
+		}
+		if !resp.Success {
+			return nil, fmt.Errorf("failed to get threads: %s", resp.Message)
+		}
+		var threads strings.Builder
+		threads.WriteString("Threads:\n")
+		for _, t := range resp.Body.Threads {
+			threads.WriteString(fmt.Sprintf("  Thread %d: %s\n", t.Id, t.Name))
+		}
+		return &mcp.CallToolResultFor[any]{
+			Content: []mcp.Content{&mcp.TextContent{Text: threads.String()}},
+		}, nil
+
 	case "sources":
 		if err := ds.client.LoadedSourcesRequest(); err != nil {
 			return nil, err
@@ -561,7 +585,7 @@ func (ds *debuggerSession) info(ctx context.Context, _ *mcp.ServerSession, param
 		}, nil
 
 	default:
-		return nil, fmt.Errorf("invalid type: %s (must be 'sources' or 'modules')", infoType)
+		return nil, fmt.Errorf("invalid type: %s (must be 'threads', 'sources', or 'modules')", infoType)
 	}
 }
 
@@ -931,7 +955,41 @@ func (ds *debuggerSession) context(ctx context.Context, _ *mcp.ServerSession, pa
 	if maxFrames == 0 {
 		maxFrames = 20
 	}
-	return ds.getFullContext(threadID, params.Arguments.FrameID.Int(), maxFrames)
+	result, err := ds.getFullContext(threadID, params.Arguments.FrameID.Int(), maxFrames)
+	if err != nil {
+		// If the thread ID was invalid, try to help by listing available threads
+		if strings.Contains(err.Error(), "threadId") || strings.Contains(err.Error(), "thread") {
+			threadList := ds.getThreadList()
+			if threadList != "" {
+				return nil, fmt.Errorf("%w\n\nAvailable threads (use info tool with type 'threads' to refresh):\n%s", err, threadList)
+			}
+		}
+		return nil, err
+	}
+	return result, nil
+}
+
+// getThreadList returns a formatted string of available threads, or empty string on error.
+func (ds *debuggerSession) getThreadList() string {
+	if ds.client == nil {
+		return ""
+	}
+	if err := ds.client.ThreadsRequest(); err != nil {
+		return ""
+	}
+	msg, err := ds.client.ReadMessage()
+	if err != nil {
+		return ""
+	}
+	resp, ok := msg.(*dap.ThreadsResponse)
+	if !ok || !resp.Success {
+		return ""
+	}
+	var threads strings.Builder
+	for _, t := range resp.Body.Threads {
+		threads.WriteString(fmt.Sprintf("  Thread %d: %s\n", t.Id, t.Name))
+	}
+	return threads.String()
 }
 
 // step executes a step command and returns the full context at the new location.
