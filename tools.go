@@ -92,41 +92,53 @@ func (ds *debuggerSession) registerSessionTools() {
 	// Always-available tools
 	mcp.AddTool(ds.server, &mcp.Tool{
 		Name:        "stop",
-		Description: "End the debugging session completely.",
+		Description: "End the debugging session completely. Terminates the debuggee and cleans up the debugger process.",
 	}, ds.stop)
 	mcp.AddTool(ds.server, &mcp.Tool{
-		Name:        "breakpoint",
-		Description: "Set a breakpoint at file:line or on a function name.",
+		Name: "breakpoint",
+		Description: `Set a breakpoint. Provide EITHER file+line OR function name (not both).
+
+Examples: {"file": "/path/to/main.go", "line": 42} or {"function": "main.processData"}`,
 	}, ds.breakpoint)
 	mcp.AddTool(ds.server, &mcp.Tool{
-		Name:        "clear-breakpoints",
-		Description: "Remove breakpoints from a file or clear all breakpoints.",
+		Name: "clear-breakpoints",
+		Description: `Remove breakpoints. Provide 'file' to clear breakpoints in a specific file, or 'all': true to clear all breakpoints.
+
+Examples: {"file": "/path/to/main.go"} or {"all": true}`,
 	}, ds.clearBreakpoints)
 	mcp.AddTool(ds.server, &mcp.Tool{
-		Name:        "continue",
-		Description: "Continue execution. Optionally specify 'to' location for run-to-cursor. Returns full context when stopped.",
+		Name: "continue",
+		Description: `Continue program execution until the next breakpoint or termination. Returns full context (location, stack trace, variables) when stopped.
+
+Optionally specify 'to' for run-to-cursor: {"to": {"file": "/path/main.go", "line": 50}} or {"to": {"function": "main.Run"}}`,
 	}, ds.continueExecution)
 	mcp.AddTool(ds.server, &mcp.Tool{
-		Name:        "step",
-		Description: "Step through code. Mode: 'over', 'in', or 'out'. Returns full context at new location.",
+		Name: "step",
+		Description: `Step through code one line at a time. Returns full context (location, stack trace, variables) at the new location.
+
+Modes: 'over' (execute current line, step over function calls), 'in' (step into function calls), 'out' (run until current function returns).`,
 	}, ds.step)
 	mcp.AddTool(ds.server, &mcp.Tool{
 		Name:        "pause",
-		Description: "Pause a running program.",
+		Description: "Pause a running program. Use 'context' afterwards to inspect the current state.",
 	}, ds.pauseExecution)
 	mcp.AddTool(ds.server, &mcp.Tool{
-		Name:        "context",
-		Description: "Get full debugging context: current location, stack trace, and all variables.",
+		Name: "context",
+		Description: `Get full debugging context at the current stop location. Returns: current function and file location, full stack trace with frame IDs, and all local variables with their types and values.
+
+All parameters are optional. Call with no arguments to get context for the current thread and top frame.`,
 	}, ds.context)
 	mcp.AddTool(ds.server, &mcp.Tool{
-		Name:        "evaluate",
-		Description: "Evaluate an expression in the current context.",
+		Name: "evaluate",
+		Description: `Evaluate an expression in the debugged program's context. Returns the result value and type. All parameters except 'expression' are optional.
+
+Examples: {"expression": "len(items)"}, {"expression": "user.Name"}, {"expression": "x + y"}`,
 	}, ds.evaluateExpression)
 
 	// Info tool with dynamic description
-	infoDesc := "Get program metadata. Type: 'sources'"
+	infoDesc := "List program metadata. Defaults to 'sources' which returns all loaded source file paths."
 	if ds.capabilities.SupportsModulesRequest {
-		infoDesc = "Get program metadata. Type: 'sources' or 'modules'."
+		infoDesc = "List program metadata. Defaults to 'sources' (loaded source file paths). Set type to 'modules' for loaded modules/libraries."
 	}
 	mcp.AddTool(ds.server, &mcp.Tool{
 		Name:        "info",
@@ -137,19 +149,24 @@ func (ds *debuggerSession) registerSessionTools() {
 	if ds.capabilities.SupportsRestartRequest {
 		mcp.AddTool(ds.server, &mcp.Tool{
 			Name:        "restart",
-			Description: "Restart the debugging session with optional new arguments.",
+			Description: "Restart the debugging session from the beginning. Optionally provide new command line arguments via 'args', or omit to reuse the previous arguments.",
 		}, ds.restartDebugger)
 	}
 	if ds.capabilities.SupportsSetVariable {
 		mcp.AddTool(ds.server, &mcp.Tool{
-			Name:        "set-variable",
-			Description: "Modify a variable's value in the debugged program.",
+			Name: "set-variable",
+			Description: `Modify a variable's value in the debugged program. Requires the variablesReference from a previous 'context' call's scope.
+
+Example: {"variablesReference": 1000, "name": "count", "value": "42"}`,
 		}, ds.setVariable)
 	}
 	if ds.capabilities.SupportsDisassembleRequest {
 		mcp.AddTool(ds.server, &mcp.Tool{
-			Name:        "disassemble",
-			Description: "Disassemble code at a memory address.",
+			Name: "disassemble",
+			Description: `Disassemble machine code at a memory address. Returns assembly instructions.
+
+Example: {"address": "0x00400780"} or {"address": "0x00400780", "count": 30}
+The 'address' is a hex memory address (e.g. from instructionPointerReference in a stack frame). 'count' defaults to 20 instructions.`,
 		}, ds.disassembleCode)
 	}
 }
