@@ -187,27 +187,27 @@ type DebugParams struct {
 
 // ContextParams defines the parameters for getting debugging context.
 type ContextParams struct {
-	ThreadID  int `json:"threadId,omitempty" mcp:"thread to inspect (default: current thread)"`
-	FrameID   int `json:"frameId,omitempty" mcp:"frame to focus on (default: top frame)"`
-	MaxFrames int `json:"maxFrames,omitempty" mcp:"maximum stack frames (default: 20)"`
+	ThreadID  FlexInt `json:"threadId,omitempty" mcp:"thread to inspect (default: current thread)"`
+	FrameID   FlexInt `json:"frameId,omitempty" mcp:"frame to focus on (default: top frame)"`
+	MaxFrames FlexInt `json:"maxFrames,omitempty" mcp:"maximum stack frames (default: 20)"`
 }
 
 // StepParams defines the parameters for stepping through code.
 type StepParams struct {
-	Mode     string `json:"mode" mcp:"'over' (next line), 'in' (into function), 'out' (out of function)"`
-	ThreadID int    `json:"threadId,omitempty" mcp:"thread to step (default: current thread)"`
+	Mode     string  `json:"mode" mcp:"'over' (next line), 'in' (into function), 'out' (out of function)"`
+	ThreadID FlexInt `json:"threadId,omitempty" mcp:"thread to step (default: current thread)"`
 }
 
 // InfoParams defines parameters for getting program metadata.
 type InfoParams struct {
-	Type string `json:"type" mcp:"'sources' (loaded source files) or 'modules' (loaded modules)"`
+	Type string `json:"type,omitempty" mcp:"'sources' (loaded source files, default) or 'modules' (loaded modules)"`
 }
 
 // BreakpointToolParams defines parameters for setting a breakpoint.
 type BreakpointToolParams struct {
-	File     string `json:"file,omitempty" mcp:"source file path (required if no function)"`
-	Line     int    `json:"line,omitempty" mcp:"line number (required if file provided)"`
-	Function string `json:"function,omitempty" mcp:"function name (alternative to file+line)"`
+	File     string  `json:"file,omitempty" mcp:"source file path (required if no function)"`
+	Line     FlexInt `json:"line,omitempty" mcp:"line number (required if file provided)"`
+	Function string  `json:"function,omitempty" mcp:"function name (alternative to file+line)"`
 }
 
 // readAndValidateResponse reads a DAP message and validates the response.
@@ -277,7 +277,7 @@ func (ds *debuggerSession) clearBreakpoints(ctx context.Context, _ *mcp.ServerSe
 
 // ContinueParams defines the parameters for continuing execution.
 type ContinueParams struct {
-	ThreadID int             `json:"threadId,omitempty" mcp:"thread to continue (default: all threads)"`
+	ThreadID FlexInt         `json:"threadId,omitempty" mcp:"thread to continue (default: all threads)"`
 	To       *BreakpointSpec `json:"to,omitempty" mcp:"location to run to (sets temporary breakpoint)"`
 }
 
@@ -304,7 +304,7 @@ func (ds *debuggerSession) continueExecution(ctx context.Context, _ *mcp.ServerS
 		}
 	}
 
-	threadID := params.Arguments.ThreadID
+	threadID := params.Arguments.ThreadID.Int()
 	if threadID == 0 {
 		threadID = ds.defaultThreadID()
 	}
@@ -335,7 +335,7 @@ func (ds *debuggerSession) continueExecution(ctx context.Context, _ *mcp.ServerS
 
 // PauseParams defines the parameters for pausing execution.
 type PauseParams struct {
-	ThreadID int `json:"threadId" mcp:"thread ID to pause"`
+	ThreadID FlexInt `json:"threadId" mcp:"thread ID to pause"`
 }
 
 // pauseExecution pauses execution of a thread.
@@ -343,7 +343,7 @@ func (ds *debuggerSession) pauseExecution(ctx context.Context, _ *mcp.ServerSess
 	if ds.client == nil {
 		return nil, fmt.Errorf("debugger not started")
 	}
-	if err := ds.client.PauseRequest(params.Arguments.ThreadID); err != nil {
+	if err := ds.client.PauseRequest(params.Arguments.ThreadID.Int()); err != nil {
 		return nil, err
 	}
 	if err := readAndValidateResponse(ds.client, "unable to pause execution"); err != nil {
@@ -357,9 +357,9 @@ func (ds *debuggerSession) pauseExecution(ctx context.Context, _ *mcp.ServerSess
 
 // EvaluateParams defines the parameters for evaluating an expression.
 type EvaluateParams struct {
-	Expression string `json:"expression" mcp:"expression to evaluate"`
-	FrameID    int    `json:"frameId" mcp:"stack frame ID for evaluation context"`
-	Context    string `json:"context" mcp:"context for evaluation (watch, repl, hover)"`
+	Expression string  `json:"expression" mcp:"expression to evaluate"`
+	FrameID    FlexInt `json:"frameId,omitempty" mcp:"stack frame ID for evaluation context (default: current frame)"`
+	Context    string  `json:"context,omitempty" mcp:"context for evaluation: watch, repl, hover (default: repl)"`
 }
 
 // evaluateExpression evaluates an expression in the context of a stack frame.
@@ -373,7 +373,7 @@ func (ds *debuggerSession) evaluateExpression(ctx context.Context, _ *mcp.Server
 		context = "repl"
 	}
 
-	frameID := params.Arguments.FrameID
+	frameID := params.Arguments.FrameID.Int()
 	if frameID == 0 && ds.lastFrameID != 0 {
 		frameID = ds.lastFrameID
 	}
@@ -420,7 +420,7 @@ func (ds *debuggerSession) evaluateExpression(ctx context.Context, _ *mcp.Server
 
 // SetVariableParams defines the parameters for setting a variable.
 type SetVariableParams struct {
-	VariablesReference int    `json:"variablesReference" mcp:"reference to the variable container"`
+	VariablesReference FlexInt `json:"variablesReference" mcp:"reference to the variable container"`
 	Name               string `json:"name" mcp:"name of the variable to set"`
 	Value              string `json:"value" mcp:"new value for the variable"`
 }
@@ -430,7 +430,7 @@ func (ds *debuggerSession) setVariable(ctx context.Context, _ *mcp.ServerSession
 	if ds.client == nil {
 		return nil, fmt.Errorf("debugger not started")
 	}
-	if err := ds.client.SetVariableRequest(params.Arguments.VariablesReference, params.Arguments.Name, params.Arguments.Value); err != nil {
+	if err := ds.client.SetVariableRequest(params.Arguments.VariablesReference.Int(), params.Arguments.Name, params.Arguments.Value); err != nil {
 		return nil, err
 	}
 	msg, err := ds.client.ReadMessage()
@@ -486,7 +486,12 @@ func (ds *debuggerSession) info(ctx context.Context, _ *mcp.ServerSession, param
 		return nil, fmt.Errorf("debugger not started")
 	}
 
-	switch params.Arguments.Type {
+	infoType := params.Arguments.Type
+	if infoType == "" {
+		infoType = "sources"
+	}
+
+	switch infoType {
 	case "sources":
 		if err := ds.client.LoadedSourcesRequest(); err != nil {
 			return nil, err
@@ -539,15 +544,15 @@ func (ds *debuggerSession) info(ctx context.Context, _ *mcp.ServerSession, param
 		}, nil
 
 	default:
-		return nil, fmt.Errorf("invalid type: %s (must be 'sources' or 'modules')", params.Arguments.Type)
+		return nil, fmt.Errorf("invalid type: %s (must be 'sources' or 'modules')", infoType)
 	}
 }
 
 // DisassembleParams defines the parameters for disassembling code.
 type DisassembleParams struct {
-	MemoryReference   string `json:"memoryReference" mcp:"memory reference to disassemble"`
-	InstructionOffset int    `json:"instructionOffset" mcp:"offset from the memory reference"`
-	InstructionCount  int    `json:"instructionCount" mcp:"number of instructions to disassemble"`
+	Address string  `json:"address" mcp:"memory address to disassemble (e.g. '0x00400780')"`
+	Offset  FlexInt `json:"offset,omitempty" mcp:"instruction offset from address (default: 0)"`
+	Count   FlexInt `json:"count,omitempty" mcp:"number of instructions to disassemble (default: 20)"`
 }
 
 // disassembleCode disassembles code at a memory reference.
@@ -555,7 +560,11 @@ func (ds *debuggerSession) disassembleCode(ctx context.Context, _ *mcp.ServerSes
 	if ds.client == nil {
 		return nil, fmt.Errorf("debugger not started")
 	}
-	if err := ds.client.DisassembleRequest(params.Arguments.MemoryReference, params.Arguments.InstructionOffset, params.Arguments.InstructionCount); err != nil {
+	count := params.Arguments.Count.Int()
+	if count == 0 {
+		count = 20
+	}
+	if err := ds.client.DisassembleRequest(params.Arguments.Address, params.Arguments.Offset.Int(), count); err != nil {
 		return nil, err
 	}
 	msg, err := ds.client.ReadMessage()
@@ -897,15 +906,15 @@ func (ds *debuggerSession) debug(ctx context.Context, _ *mcp.ServerSession, para
 
 // context returns the full debugging context at the current location.
 func (ds *debuggerSession) context(ctx context.Context, _ *mcp.ServerSession, params *mcp.CallToolParamsFor[ContextParams]) (*mcp.CallToolResultFor[any], error) {
-	threadID := params.Arguments.ThreadID
+	threadID := params.Arguments.ThreadID.Int()
 	if threadID == 0 {
 		threadID = ds.defaultThreadID()
 	}
-	maxFrames := params.Arguments.MaxFrames
+	maxFrames := params.Arguments.MaxFrames.Int()
 	if maxFrames == 0 {
 		maxFrames = 20
 	}
-	return ds.getFullContext(threadID, params.Arguments.FrameID, maxFrames)
+	return ds.getFullContext(threadID, params.Arguments.FrameID.Int(), maxFrames)
 }
 
 // step executes a step command and returns the full context at the new location.
@@ -914,7 +923,7 @@ func (ds *debuggerSession) step(ctx context.Context, _ *mcp.ServerSession, param
 		return nil, fmt.Errorf("debugger not started")
 	}
 
-	threadID := params.Arguments.ThreadID
+	threadID := params.Arguments.ThreadID.Int()
 	if threadID == 0 {
 		threadID = ds.defaultThreadID()
 	}
@@ -1127,11 +1136,11 @@ func (ds *debuggerSession) breakpoint(ctx context.Context, _ *mcp.ServerSession,
 		}, nil
 	}
 
-	if params.Arguments.File == "" || params.Arguments.Line == 0 {
+	if params.Arguments.File == "" || params.Arguments.Line.Int() == 0 {
 		return nil, fmt.Errorf("either function or file+line is required")
 	}
 
-	if err := ds.client.SetBreakpointsRequest(params.Arguments.File, []int{params.Arguments.Line}); err != nil {
+	if err := ds.client.SetBreakpointsRequest(params.Arguments.File, []int{params.Arguments.Line.Int()}); err != nil {
 		return nil, err
 	}
 
