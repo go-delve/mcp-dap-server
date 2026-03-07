@@ -136,11 +136,15 @@ Call with {} (no arguments) to use the current thread and top frame. Only three 
 Examples: {"expression": "len(items)"}, {"expression": "user.Name"}, {"expression": "x + y"}`,
 	}, ds.evaluateExpression)
 
-	// Info tool with dynamic description
-	infoDesc := "List program metadata. Type: 'threads' (list all threads with IDs), 'sources' (loaded source file paths, default)."
-	if ds.capabilities.SupportsModulesRequest {
-		infoDesc = "List program metadata. Type: 'threads' (list all threads with IDs), 'sources' (loaded source file paths, default), or 'modules' (loaded modules/libraries)."
+	// Info tool with dynamic description based on adapter capabilities
+	infoTypes := "'threads' (list all threads with IDs, default)"
+	if ds.capabilities.SupportsLoadedSourcesRequest {
+		infoTypes += ", 'sources' (loaded source file paths)"
 	}
+	if ds.capabilities.SupportsModulesRequest {
+		infoTypes += ", 'modules' (loaded modules/libraries)"
+	}
+	infoDesc := fmt.Sprintf("List program metadata. Type: %s.", infoTypes)
 	mcp.AddTool(ds.server, &mcp.Tool{
 		Name:        "info",
 		Description: infoDesc,
@@ -497,7 +501,11 @@ func (ds *debuggerSession) info(ctx context.Context, _ *mcp.ServerSession, param
 
 	infoType := params.Arguments.Type
 	if infoType == "" {
-		infoType = "sources"
+		if ds.capabilities.SupportsLoadedSourcesRequest {
+			infoType = "sources"
+		} else {
+			infoType = "threads"
+		}
 	}
 
 	switch infoType {
@@ -540,6 +548,9 @@ func (ds *debuggerSession) info(ctx context.Context, _ *mcp.ServerSession, param
 		}, nil
 
 	case "sources":
+		if !ds.capabilities.SupportsLoadedSourcesRequest {
+			return nil, fmt.Errorf("loaded sources not supported by this debug adapter")
+		}
 		if err := ds.client.LoadedSourcesRequest(); err != nil {
 			return nil, err
 		}
