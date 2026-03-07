@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 
 	"github.com/google/go-dap"
@@ -42,7 +43,7 @@ Modes: 'source' (compile & debug), 'binary' (debug executable), 'core' (debug co
 
 Debugger selection (via 'debugger' parameter):
 - 'delve' (default): For Go programs only. Requires dlv to be installed.
-- 'gdb': For C/C++/Rust and other compiled languages. Requires the cpptools DAP adapter (OpenDebugAD7). Set 'adapterPath' to the path of OpenDebugAD7, or set the MCP_DAP_CPPTOOLS_PATH environment variable. GDB does not support 'source' mode; compile your program with debug symbols (gcc -g -O0) and use 'binary' mode.
+- 'gdb': For C/C++/Rust and other compiled languages. Uses the cpptools DAP adapter (OpenDebugAD7), which is auto-detected from VS Code extensions. GDB does not support 'source' mode; compile your program with debug symbols (gcc -g -O0) and use 'binary' mode.
 
 Choose the debugger based on the language of the program being debugged: use 'delve' for Go, use 'gdb' for C/C++/Rust.`
 
@@ -124,9 +125,9 @@ Modes: 'over' (execute current line, step over function calls), 'in' (step into 
 	}, ds.pauseExecution)
 	mcp.AddTool(ds.server, &mcp.Tool{
 		Name: "context",
-		Description: `Get full debugging context at the current stop location. Returns: current function and file location, full stack trace with frame IDs, and all local variables with their types and values.
+		Description: `Get full debugging context at the current stop location. Always returns ALL of the following — source location, full stack trace, and all variables with types and values. There are no flags to control what is included; everything is always returned.
 
-Call with no arguments to get context for the current thread and top frame. The only accepted parameters are threadId, frameId, and maxFrames — all optional. Use the 'info' tool with type 'threads' to discover valid thread IDs.`,
+Call with {} (no arguments) to use the current thread and top frame. Only three optional parameters exist: threadId, frameId, maxFrames. Do NOT pass any other parameters. Use 'info' with type 'threads' to discover valid thread IDs.`,
 	}, ds.context)
 	mcp.AddTool(ds.server, &mcp.Tool{
 		Name: "evaluate",
@@ -199,7 +200,7 @@ type DebugParams struct {
 	StopOnEntry  bool             `json:"stopOnEntry,omitempty" mcp:"stop at program entry instead of running to first breakpoint"`
 	Port         string           `json:"port,omitempty" mcp:"port for DAP server (default: auto-assigned)"`
 	Debugger     string           `json:"debugger,omitempty" mcp:"debugger to use: 'delve' (default) or 'gdb'"`
-	AdapterPath  string           `json:"adapterPath,omitempty" mcp:"path to DAP adapter binary (for gdb: path to OpenDebugAD7; falls back to MCP_DAP_CPPTOOLS_PATH env var)"`
+	AdapterPath  string           `json:"adapterPath,omitempty" mcp:"path to DAP adapter binary (for gdb: path to OpenDebugAD7; auto-detected from VS Code extensions, falls back to MCP_DAP_CPPTOOLS_PATH env var)"`
 }
 
 // ContextParams defines the parameters for getting debugging context.
@@ -721,7 +722,10 @@ func (ds *debuggerSession) debug(ctx context.Context, _ *mcp.ServerSession, para
 			adapterPath = os.Getenv("MCP_DAP_CPPTOOLS_PATH")
 		}
 		if adapterPath == "" {
-			return nil, fmt.Errorf("GDB debugging requires the cpptools DAP adapter (OpenDebugAD7). Set the adapterPath parameter or MCP_DAP_CPPTOOLS_PATH environment variable")
+			adapterPath = findCpptoolsAdapter()
+		}
+		if adapterPath == "" {
+			return nil, fmt.Errorf("GDB debugging requires the cpptools DAP adapter (OpenDebugAD7). Set the adapterPath parameter or MCP_DAP_CPPTOOLS_PATH environment variable, or install the ms-vscode.cpptools VS Code extension")
 		}
 		ds.backend = &gdbBackend{adapterPath: adapterPath}
 	default:
@@ -1240,4 +1244,37 @@ func (ds *debuggerSession) breakpoint(ctx context.Context, _ *mcp.ServerSession,
 	}
 
 	return nil, fmt.Errorf("unexpected response")
+}
+
+// findCpptoolsAdapter searches common locations for the cpptools DAP adapter
+// (OpenDebugAD7). Returns the path if found, empty string otherwise.
+func findCpptoolsAdapter() string {
+	// Check PATH first
+	if p, err := exec.LookPath("OpenDebugAD7"); err == nil {
+		return p
+	}
+
+	// Search VS Code extension directories
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+
+	extensionDirs := []string{
+		filepath.Join(home, ".vscode", "extensions"),
+		filepath.Join(home, ".vscode-server", "extensions"),
+		filepath.Join(home, ".cursor", "extensions"),
+	}
+
+	for _, extDir := range extensionDirs {
+		pattern := filepath.Join(extDir, "ms-vscode.cpptools-*", "debugAdapters", "bin", "OpenDebugAD7")
+		matches, err := filepath.Glob(pattern)
+		if err != nil || len(matches) == 0 {
+			continue
+		}
+		// Return the last match (highest version due to lexicographic sort)
+		return matches[len(matches)-1]
+	}
+
+	return ""
 }
