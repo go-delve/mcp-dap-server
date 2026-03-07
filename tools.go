@@ -269,7 +269,7 @@ func (ds *debuggerSession) clearBreakpoints(ctx context.Context, _ *mcp.ServerSe
 		if err := ds.client.SetFunctionBreakpointsRequest([]string{}); err != nil {
 			return nil, err
 		}
-		if _, err := ds.client.ReadMessage(); err != nil {
+		if err := readAndValidateResponse(ds.client, "unable to clear breakpoints"); err != nil {
 			return nil, err
 		}
 		return &mcp.CallToolResultFor[any]{
@@ -282,7 +282,7 @@ func (ds *debuggerSession) clearBreakpoints(ctx context.Context, _ *mcp.ServerSe
 		if err := ds.client.SetBreakpointsRequest(params.Arguments.File, []int{}); err != nil {
 			return nil, err
 		}
-		if _, err := ds.client.ReadMessage(); err != nil {
+		if err := readAndValidateResponse(ds.client, "unable to clear breakpoints"); err != nil {
 			return nil, err
 		}
 		return &mcp.CallToolResultFor[any]{
@@ -451,21 +451,12 @@ func (ds *debuggerSession) setVariable(ctx context.Context, _ *mcp.ServerSession
 	if err := ds.client.SetVariableRequest(params.Arguments.VariablesReference.Int(), params.Arguments.Name, params.Arguments.Value); err != nil {
 		return nil, err
 	}
-	msg, err := ds.client.ReadMessage()
-	if err != nil {
+	if err := readAndValidateResponse(ds.client, "unable to set variable"); err != nil {
 		return nil, err
 	}
-
-	if resp, ok := msg.(dap.ResponseMessage); ok {
-		if !resp.GetResponse().Success {
-			return nil, fmt.Errorf("unable to set variable: %s", resp.GetResponse().Message)
-		}
-		return &mcp.CallToolResultFor[any]{
-			Content: []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf("Set variable %s to %s", params.Arguments.Name, params.Arguments.Value)}},
-		}, nil
-	}
-
-	return nil, fmt.Errorf("unexpected response type")
+	return &mcp.CallToolResultFor[any]{
+		Content: []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf("Set variable %s to %s", params.Arguments.Name, params.Arguments.Value)}},
+	}, nil
 }
 
 // RestartParams defines the parameters for restarting the debugger.
@@ -514,16 +505,30 @@ func (ds *debuggerSession) info(ctx context.Context, _ *mcp.ServerSession, param
 		if err := ds.client.ThreadsRequest(); err != nil {
 			return nil, err
 		}
-		msg, err := ds.client.ReadMessage()
-		if err != nil {
-			return nil, err
+		var resp *dap.ThreadsResponse
+		for {
+			msg, err := ds.client.ReadMessage()
+			if err != nil {
+				return nil, err
+			}
+			switch m := msg.(type) {
+			case *dap.ThreadsResponse:
+				resp = m
+			case dap.ResponseMessage:
+				if !m.GetResponse().Success {
+					return nil, fmt.Errorf("failed to get threads: %s", m.GetResponse().Message)
+				}
+			case dap.EventMessage:
+				continue
+			}
+			break
 		}
-		resp, ok := msg.(*dap.ThreadsResponse)
-		if !ok {
-			return nil, fmt.Errorf("unexpected response type for threads")
-		}
-		if !resp.Success {
-			return nil, fmt.Errorf("failed to get threads: %s", resp.Message)
+		if resp == nil || !resp.Success {
+			errMsg := "failed to get threads"
+			if resp != nil {
+				errMsg += ": " + resp.Message
+			}
+			return nil, fmt.Errorf("%s", errMsg)
 		}
 		var threads strings.Builder
 		threads.WriteString("Threads:\n")
@@ -538,16 +543,30 @@ func (ds *debuggerSession) info(ctx context.Context, _ *mcp.ServerSession, param
 		if err := ds.client.LoadedSourcesRequest(); err != nil {
 			return nil, err
 		}
-		msg, err := ds.client.ReadMessage()
-		if err != nil {
-			return nil, err
+		var resp *dap.LoadedSourcesResponse
+		for {
+			msg, err := ds.client.ReadMessage()
+			if err != nil {
+				return nil, err
+			}
+			switch m := msg.(type) {
+			case *dap.LoadedSourcesResponse:
+				resp = m
+			case dap.ResponseMessage:
+				if !m.GetResponse().Success {
+					return nil, fmt.Errorf("failed to get loaded sources: %s", m.GetResponse().Message)
+				}
+			case dap.EventMessage:
+				continue
+			}
+			break
 		}
-		resp, ok := msg.(*dap.LoadedSourcesResponse)
-		if !ok {
-			return nil, fmt.Errorf("unexpected response type for loaded sources")
-		}
-		if !resp.Success {
-			return nil, fmt.Errorf("failed to get loaded sources: %s", resp.Message)
+		if resp == nil || !resp.Success {
+			errMsg := "failed to get loaded sources"
+			if resp != nil {
+				errMsg += ": " + resp.Message
+			}
+			return nil, fmt.Errorf("%s", errMsg)
 		}
 		var sources strings.Builder
 		sources.WriteString("Loaded Sources:\n")
@@ -565,16 +584,30 @@ func (ds *debuggerSession) info(ctx context.Context, _ *mcp.ServerSession, param
 		if err := ds.client.ModulesRequest(); err != nil {
 			return nil, err
 		}
-		msg, err := ds.client.ReadMessage()
-		if err != nil {
-			return nil, err
+		var resp *dap.ModulesResponse
+		for {
+			msg, err := ds.client.ReadMessage()
+			if err != nil {
+				return nil, err
+			}
+			switch m := msg.(type) {
+			case *dap.ModulesResponse:
+				resp = m
+			case dap.ResponseMessage:
+				if !m.GetResponse().Success {
+					return nil, fmt.Errorf("failed to get modules: %s", m.GetResponse().Message)
+				}
+			case dap.EventMessage:
+				continue
+			}
+			break
 		}
-		resp, ok := msg.(*dap.ModulesResponse)
-		if !ok {
-			return nil, fmt.Errorf("unexpected response type for modules")
-		}
-		if !resp.Success {
-			return nil, fmt.Errorf("failed to get modules: %s", resp.Message)
+		if resp == nil || !resp.Success {
+			errMsg := "failed to get modules"
+			if resp != nil {
+				errMsg += ": " + resp.Message
+			}
+			return nil, fmt.Errorf("%s", errMsg)
 		}
 		var modules strings.Builder
 		modules.WriteString("Loaded Modules:\n")
@@ -609,21 +642,45 @@ func (ds *debuggerSession) disassembleCode(ctx context.Context, _ *mcp.ServerSes
 	if err := ds.client.DisassembleRequest(params.Arguments.Address, params.Arguments.Offset.Int(), count); err != nil {
 		return nil, err
 	}
-	msg, err := ds.client.ReadMessage()
-	if err != nil {
-		return nil, err
-	}
 
-	if resp, ok := msg.(dap.ResponseMessage); ok {
-		if !resp.GetResponse().Success {
-			return nil, fmt.Errorf("unable to disassemble: %s", resp.GetResponse().Message)
+	var disResp *dap.DisassembleResponse
+	for {
+		msg, err := ds.client.ReadMessage()
+		if err != nil {
+			return nil, err
 		}
-		return &mcp.CallToolResultFor[any]{
-			Content: []mcp.Content{&mcp.TextContent{Text: "Disassembled code"}},
-		}, nil
+		switch m := msg.(type) {
+		case *dap.DisassembleResponse:
+			disResp = m
+		case dap.ResponseMessage:
+			if !m.GetResponse().Success {
+				return nil, fmt.Errorf("unable to disassemble: %s", m.GetResponse().Message)
+			}
+		case dap.EventMessage:
+			continue
+		}
+		break
+	}
+	if disResp == nil || !disResp.Success {
+		errMsg := "unable to disassemble"
+		if disResp != nil {
+			errMsg += ": " + disResp.Message
+		}
+		return nil, fmt.Errorf("%s", errMsg)
 	}
 
-	return nil, fmt.Errorf("unexpected response type")
+	var result strings.Builder
+	result.WriteString("Disassembly:\n")
+	for _, inst := range disResp.Body.Instructions {
+		result.WriteString(fmt.Sprintf("  %s  %s", inst.Address, inst.Instruction))
+		if inst.Location.Path != "" {
+			result.WriteString(fmt.Sprintf("  ; %s:%d", inst.Location.Path, inst.Line))
+		}
+		result.WriteString("\n")
+	}
+	return &mcp.CallToolResultFor[any]{
+		Content: []mcp.Content{&mcp.TextContent{Text: result.String()}},
+	}, nil
 }
 
 // stop ends the debugging session completely.
@@ -981,19 +1038,27 @@ func (ds *debuggerSession) getThreadList() string {
 	if err := ds.client.ThreadsRequest(); err != nil {
 		return ""
 	}
-	msg, err := ds.client.ReadMessage()
-	if err != nil {
-		return ""
+	for {
+		msg, err := ds.client.ReadMessage()
+		if err != nil {
+			return ""
+		}
+		switch m := msg.(type) {
+		case *dap.ThreadsResponse:
+			if !m.Success {
+				return ""
+			}
+			var threads strings.Builder
+			for _, t := range m.Body.Threads {
+				threads.WriteString(fmt.Sprintf("  Thread %d: %s\n", t.Id, t.Name))
+			}
+			return threads.String()
+		case dap.EventMessage:
+			continue
+		default:
+			return ""
+		}
 	}
-	resp, ok := msg.(*dap.ThreadsResponse)
-	if !ok || !resp.Success {
-		return ""
-	}
-	var threads strings.Builder
-	for _, t := range resp.Body.Threads {
-		threads.WriteString(fmt.Sprintf("  Thread %d: %s\n", t.Id, t.Name))
-	}
-	return threads.String()
 }
 
 // step executes a step command and returns the full context at the new location.
@@ -1223,27 +1288,36 @@ func (ds *debuggerSession) breakpoint(ctx context.Context, _ *mcp.ServerSession,
 		return nil, err
 	}
 
-	msg, err := ds.client.ReadMessage()
-	if err != nil {
-		return nil, err
-	}
-
-	switch response := msg.(type) {
-	case *dap.SetBreakpointsResponse:
-		if len(response.Body.Breakpoints) > 0 {
-			bp := response.Body.Breakpoints[0]
-			if bp.Verified {
-				return &mcp.CallToolResultFor[any]{
-					Content: []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf("Breakpoint %d set at %s:%d", bp.Id, params.Arguments.File, bp.Line)}},
-				}, nil
-			}
-			return nil, fmt.Errorf("breakpoint not verified: %s", bp.Message)
+	for {
+		msg, err := ds.client.ReadMessage()
+		if err != nil {
+			return nil, err
 		}
-	case *dap.ErrorResponse:
-		return nil, errors.New(response.Message)
+		switch response := msg.(type) {
+		case *dap.SetBreakpointsResponse:
+			if len(response.Body.Breakpoints) > 0 {
+				bp := response.Body.Breakpoints[0]
+				if bp.Verified {
+					return &mcp.CallToolResultFor[any]{
+						Content: []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf("Breakpoint %d set at %s:%d", bp.Id, params.Arguments.File, bp.Line)}},
+					}, nil
+				}
+				return nil, fmt.Errorf("breakpoint not verified: %s", bp.Message)
+			}
+			return nil, fmt.Errorf("no breakpoints returned")
+		case *dap.ErrorResponse:
+			return nil, errors.New(response.Message)
+		case dap.ResponseMessage:
+			if !response.GetResponse().Success {
+				return nil, fmt.Errorf("unable to set breakpoint: %s", response.GetResponse().Message)
+			}
+			return nil, fmt.Errorf("unexpected response type")
+		case dap.EventMessage:
+			continue
+		default:
+			return nil, fmt.Errorf("unexpected response type")
+		}
 	}
-
-	return nil, fmt.Errorf("unexpected response")
 }
 
 // findCpptoolsAdapter searches common locations for the cpptools DAP adapter
