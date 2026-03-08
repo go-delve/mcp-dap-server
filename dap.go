@@ -31,7 +31,7 @@ type DAPClient struct {
 // newDAPClient creates a new Client over a TCP connection.
 // Call Close() to close the connection.
 func newDAPClient(addr string) *DAPClient {
-	fmt.Println("Connecting to server at:", addr)
+	log.Printf("Connecting to server at: %s", addr)
 	conn, err := net.Dial("tcp", addr)
 	if err != nil {
 		log.Fatal("dialing:", err)

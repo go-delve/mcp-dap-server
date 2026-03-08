@@ -43,7 +43,11 @@ type delveBackend struct{}
 // It waits for the server to report its listen address on stdout.
 func (b *delveBackend) Spawn(port string) (*exec.Cmd, string, error) {
 	cmd := exec.Command("dlv", "dap", "--listen", port, "--log", "--log-output", "dap")
-	cmd.Stderr = os.Stderr
+	// Send adapter stderr to log file, never to os.Stderr.
+	// With MCP stdio transport, os.Stderr is a pipe that can fill and block.
+	if logFile != nil {
+		cmd.Stderr = logFile
+	}
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return nil, "", err
@@ -148,7 +152,11 @@ type gdbBackend struct {
 // communicates via stdin/stdout pipes.
 func (g *gdbBackend) Spawn(port string) (*exec.Cmd, string, error) {
 	cmd := exec.Command(g.adapterPath)
-	cmd.Stderr = os.Stderr
+	// Send adapter stderr to log file, never to os.Stderr.
+	// With MCP stdio transport, os.Stderr is a pipe that can fill and block.
+	if logFile != nil {
+		cmd.Stderr = logFile
+	}
 
 	stdin, err := cmd.StdinPipe()
 	if err != nil {

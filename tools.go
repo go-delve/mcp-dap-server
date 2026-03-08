@@ -48,13 +48,15 @@ Debugger selection (via 'debugger' parameter):
 Choose the debugger based on the language of the program being debugged: use 'delve' for Go, use 'gdb' for C/C++/Rust.`
 
 // registerTools registers the debugger tools with the MCP server.
-func registerTools(server *mcp.Server) {
+func registerTools(server *mcp.Server) *debuggerSession {
 	ds := &debuggerSession{server: server}
 
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "debug",
 		Description: debugToolDescription,
 	}, ds.debug)
+
+	return ds
 }
 
 // sessionToolNames returns the names of all currently registered session tools.
@@ -386,6 +388,7 @@ type EvaluateParams struct {
 
 // evaluateExpression evaluates an expression in the context of a stack frame.
 func (ds *debuggerSession) evaluateExpression(ctx context.Context, _ *mcp.ServerSession, params *mcp.CallToolParamsFor[EvaluateParams]) (*mcp.CallToolResultFor[any], error) {
+	log.Printf("evaluate: expression=%q frameID=%d", params.Arguments.Expression, params.Arguments.FrameID.Int())
 	if ds.client == nil {
 		return nil, fmt.Errorf("debugger not started")
 	}
@@ -406,11 +409,14 @@ func (ds *debuggerSession) evaluateExpression(ctx context.Context, _ *mcp.Server
 
 	// Read messages until we get the EvaluateResponse
 	// Events can come at any time, so we need to handle them
+	log.Printf("evaluate: waiting for response...")
 	for {
 		msg, err := ds.client.ReadMessage()
 		if err != nil {
+			log.Printf("evaluate: read error: %v", err)
 			return nil, err
 		}
+		log.Printf("evaluate: received message type %T", msg)
 
 		switch resp := msg.(type) {
 		case *dap.EvaluateResponse:
@@ -495,6 +501,7 @@ func (ds *debuggerSession) restartDebugger(ctx context.Context, _ *mcp.ServerSes
 
 // info returns program metadata.
 func (ds *debuggerSession) info(ctx context.Context, _ *mcp.ServerSession, params *mcp.CallToolParamsFor[InfoParams]) (*mcp.CallToolResultFor[any], error) {
+	log.Printf("info: type=%q", params.Arguments.Type)
 	if ds.client == nil {
 		return nil, fmt.Errorf("debugger not started")
 	}
@@ -650,25 +657,36 @@ func (ds *debuggerSession) disassembleCode(ctx context.Context, _ *mcp.ServerSes
 	if count == 0 {
 		count = 20
 	}
+	log.Printf("disassemble: sending request address=%s offset=%d count=%d", params.Arguments.Address, params.Arguments.Offset.Int(), count)
 	if err := ds.client.DisassembleRequest(params.Arguments.Address, params.Arguments.Offset.Int(), count); err != nil {
+		log.Printf("disassemble: send error: %v", err)
 		return nil, err
 	}
 
+	log.Printf("disassemble: waiting for response...")
 	var disResp *dap.DisassembleResponse
 	for {
 		msg, err := ds.client.ReadMessage()
 		if err != nil {
+			log.Printf("disassemble: read error: %v", err)
 			return nil, err
 		}
+		log.Printf("disassemble: received message type %T", msg)
 		switch m := msg.(type) {
 		case *dap.DisassembleResponse:
+			log.Printf("disassemble: got DisassembleResponse success=%v", m.Success)
 			disResp = m
 		case dap.ResponseMessage:
 			if !m.GetResponse().Success {
+				log.Printf("disassemble: got error response: %s", m.GetResponse().Message)
 				return nil, fmt.Errorf("unable to disassemble: %s", m.GetResponse().Message)
 			}
+			log.Printf("disassemble: got non-disassemble ResponseMessage command=%s", m.GetResponse().Command)
 		case dap.EventMessage:
+			log.Printf("disassemble: skipping event: %T", msg)
 			continue
+		default:
+			log.Printf("disassemble: unexpected message type: %T", msg)
 		}
 		break
 	}
@@ -680,51 +698,70 @@ func (ds *debuggerSession) disassembleCode(ctx context.Context, _ *mcp.ServerSes
 		return nil, fmt.Errorf("%s", errMsg)
 	}
 
+	log.Printf("disassemble: building result from %d instructions", len(disResp.Body.Instructions))
 	var result strings.Builder
 	result.WriteString("Disassembly:\n")
-	for _, inst := range disResp.Body.Instructions {
+	for i, inst := range disResp.Body.Instructions {
+		log.Printf("disassemble: instruction[%d] addr=%s inst=%q", i, inst.Address, inst.Instruction)
 		result.WriteString(fmt.Sprintf("  %s  %s", inst.Address, inst.Instruction))
-		if inst.Location.Path != "" {
+		if inst.Location != nil && inst.Location.Path != "" {
 			result.WriteString(fmt.Sprintf("  ; %s:%d", inst.Location.Path, inst.Line))
 		}
 		result.WriteString("\n")
 	}
+	log.Printf("disassemble: loop done, result=%d bytes, ctx.Err=%v", result.Len(), ctx.Err())
+	resultStr := result.String()
+	log.Printf("disassemble: returning result to MCP framework")
 	return &mcp.CallToolResultFor[any]{
-		Content: []mcp.Content{&mcp.TextContent{Text: result.String()}},
+		Content: []mcp.Content{&mcp.TextContent{Text: resultStr}},
 	}, nil
 }
 
 // stop ends the debugging session completely.
 func (ds *debuggerSession) stop(ctx context.Context, _ *mcp.ServerSession, _ *mcp.CallToolParamsFor[StopParams]) (*mcp.CallToolResultFor[any], error) {
+	log.Printf("stop: called")
 	if ds.cmd == nil && ds.client == nil {
+		log.Printf("stop: no session active")
 		return &mcp.CallToolResultFor[any]{
 			Content: []mcp.Content{&mcp.TextContent{Text: "No debug session active"}},
 		}, nil
 	}
 
-	// Try to terminate the debuggee gracefully
+	ds.cleanup()
+
+	log.Printf("stop: returning success")
+	return &mcp.CallToolResultFor[any]{
+		Content: []mcp.Content{&mcp.TextContent{Text: "Debug session stopped"}},
+	}, nil
+}
+
+// cleanup kills the DAP adapter process and resets session state.
+// Safe to call multiple times or when no session is active.
+func (ds *debuggerSession) cleanup() {
+	log.Printf("cleanup: starting (client=%v, cmd=%v)", ds.client != nil, ds.cmd != nil)
+
+	// Close the DAP client connection
 	if ds.client != nil {
-		if ds.capabilities.SupportsTerminateRequest {
-			if err := ds.client.TerminateRequest(); err != nil {
-				log.Printf("error terminating debuggee: %v", err)
-			}
-		}
-		if err := ds.client.DisconnectRequest(true); err != nil {
-			log.Printf("error disconnecting: %v", err)
-		}
+		log.Printf("cleanup: closing DAP client...")
 		ds.client.Close()
 		ds.client = nil
+		log.Printf("cleanup: DAP client closed")
 	}
 
-	// Kill the debugger process
+	// Kill the debugger/adapter process immediately
 	if ds.cmd != nil && ds.cmd.Process != nil {
+		log.Printf("cleanup: killing process pid=%d...", ds.cmd.Process.Pid)
 		if err := ds.cmd.Process.Kill(); err != nil {
-			// Only ignore if process already exited
 			if !strings.Contains(err.Error(), "process already finished") {
-				log.Printf("error killing debugger process: %v", err)
+				log.Printf("cleanup: error killing debugger process: %v", err)
+			} else {
+				log.Printf("cleanup: process already finished")
 			}
+		} else {
+			log.Printf("cleanup: kill sent, waiting for process...")
 		}
 		ds.cmd.Wait()
+		log.Printf("cleanup: process wait completed")
 		ds.cmd = nil
 	}
 
@@ -734,16 +771,18 @@ func (ds *debuggerSession) stop(ctx context.Context, _ *mcp.ServerSession, _ *mc
 	ds.programArgs = nil
 	ds.coreFilePath = ""
 	ds.capabilities = dap.Capabilities{}
+	ds.stoppedThreadID = 0
+	ds.lastFrameID = 0
 	ds.unregisterSessionTools()
-
-	return &mcp.CallToolResultFor[any]{
-		Content: []mcp.Content{&mcp.TextContent{Text: "Debug session stopped"}},
-	}, nil
+	log.Printf("cleanup: done")
 }
 
 // debug starts a complete debugging session.
 // It starts the debugger, loads the program, sets initial breakpoints, and runs to the first breakpoint.
 func (ds *debuggerSession) debug(ctx context.Context, _ *mcp.ServerSession, params *mcp.CallToolParamsFor[DebugParams]) (*mcp.CallToolResultFor[any], error) {
+	// Clean up any existing session before starting a new one
+	ds.cleanup()
+
 	// Default port
 	port := params.Arguments.Port
 	if port == "" {
