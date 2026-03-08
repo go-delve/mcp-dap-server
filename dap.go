@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"net"
 
 	"github.com/google/go-dap"
@@ -17,40 +16,34 @@ type readWriteCloser struct {
 	io.WriteCloser
 }
 
-// DAPClient is a debugger service client that uses Debug Adaptor Protocol.
-// It does not (yet?) implement service.DAPClient interface.
-// All client methods are synchronous.
+// DAPClient is a synchronous Debug Adapter Protocol client.
+// It manages a connection to a DAP server and provides methods for
+// sending each DAP request type.
 type DAPClient struct {
 	rwc    io.ReadWriteCloser
 	reader *bufio.Reader
-	// seq is used to track the sequence number of each
-	// requests that the client sends to the server
+	// seq tracks the sequence number for each request sent to the server.
 	seq int
 }
 
 // newDAPClient creates a new Client over a TCP connection.
-// Call Close() to close the connection.
-func newDAPClient(addr string) *DAPClient {
-	log.Printf("Connecting to server at: %s", addr)
+// Call Close to close the connection.
+func newDAPClient(addr string) (*DAPClient, error) {
 	conn, err := net.Dial("tcp", addr)
 	if err != nil {
-		log.Fatal("dialing:", err)
+		return nil, fmt.Errorf("connecting to DAP server at %s: %w", addr, err)
 	}
-	return newDAPClientFromConn(conn)
+	return newDAPClientFromRWC(conn), nil
 }
 
 // newDAPClientFromRWC creates a new Client with the given ReadWriteCloser.
 // Call Close to close the underlying transport.
 func newDAPClientFromRWC(rwc io.ReadWriteCloser) *DAPClient {
-	c := &DAPClient{rwc: rwc, reader: bufio.NewReader(rwc)}
-	c.seq = 1 // match VS Code numbering
-	return c
-}
-
-// newDAPClientFromConn creates a new Client with the given TCP connection.
-// Call Close to close the connection.
-func newDAPClientFromConn(conn net.Conn) *DAPClient {
-	return newDAPClientFromRWC(conn)
+	return &DAPClient{
+		rwc:    rwc,
+		reader: bufio.NewReader(rwc),
+		seq:    1, // match VS Code numbering
+	}
 }
 
 // Close closes the client connection.
@@ -242,7 +235,7 @@ func (c *DAPClient) VariablesRequest(variablesReference int) error {
 	return c.send(request)
 }
 
-// EvaluateRequest sends a 'evaluate' request.
+// EvaluateRequest sends an 'evaluate' request.
 func (c *DAPClient) EvaluateRequest(expression string, frameID int, context string) error {
 	request := &dap.EvaluateRequest{Request: *c.newRequest("evaluate")}
 	request.Arguments.Expression = expression

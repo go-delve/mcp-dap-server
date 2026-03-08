@@ -1,6 +1,7 @@
 package main
 
 import (
+	"io"
 	"os/exec"
 	"strings"
 	"testing"
@@ -12,7 +13,7 @@ func TestDelveBackendSpawn(t *testing.T) {
 	}
 
 	backend := &delveBackend{}
-	cmd, listenAddr, err := backend.Spawn(":0")
+	cmd, listenAddr, err := backend.Spawn(":0", io.Discard)
 	if err != nil {
 		t.Fatalf("failed to spawn delve: %v", err)
 	}

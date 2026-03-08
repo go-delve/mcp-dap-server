@@ -13,11 +13,11 @@ import (
 // server and building the launch/attach argument maps. Each supported debugger
 // (Delve, GDB via OpenDebugAD7, etc.) implements this interface.
 type DebuggerBackend interface {
-	// Spawn starts the DAP server process. Returns the process, the address
-	// or transport info needed to connect, and any error.
+	// Spawn starts the DAP server process. The stderrWriter receives the
+	// adapter's stderr output (typically a log file); pass io.Discard to suppress.
 	// For TCP-based backends (Delve), returns the listen address.
 	// For stdio-based backends (cpptools), returns empty string (use process pipes).
-	Spawn(port string) (cmd *exec.Cmd, listenAddr string, err error)
+	Spawn(port string, stderrWriter io.Writer) (cmd *exec.Cmd, listenAddr string, err error)
 
 	// TransportMode returns "tcp" or "stdio" indicating how to connect.
 	TransportMode() string
@@ -41,13 +41,11 @@ type delveBackend struct{}
 // Spawn starts a Delve DAP server process listening on the given port.
 // The port should be in ":PORT" format (e.g. ":0" for auto-assign).
 // It waits for the server to report its listen address on stdout.
-func (b *delveBackend) Spawn(port string) (*exec.Cmd, string, error) {
+func (b *delveBackend) Spawn(port string, stderrWriter io.Writer) (*exec.Cmd, string, error) {
 	cmd := exec.Command("dlv", "dap", "--listen", port, "--log", "--log-output", "dap")
-	// Send adapter stderr to log file, never to os.Stderr.
+	// Send adapter stderr to the provided writer, never to os.Stderr.
 	// With MCP stdio transport, os.Stderr is a pipe that can fill and block.
-	if logFile != nil {
-		cmd.Stderr = logFile
-	}
+	cmd.Stderr = stderrWriter
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return nil, "", err
@@ -150,13 +148,11 @@ type gdbBackend struct {
 // Spawn starts the cpptools DAP adapter (OpenDebugAD7) over stdio.
 // Unlike TCP-based backends, there is no listen address; the process
 // communicates via stdin/stdout pipes.
-func (g *gdbBackend) Spawn(port string) (*exec.Cmd, string, error) {
+func (g *gdbBackend) Spawn(port string, stderrWriter io.Writer) (*exec.Cmd, string, error) {
 	cmd := exec.Command(g.adapterPath)
-	// Send adapter stderr to log file, never to os.Stderr.
+	// Send adapter stderr to the provided writer, never to os.Stderr.
 	// With MCP stdio transport, os.Stderr is a pipe that can fill and block.
-	if logFile != nil {
-		cmd.Stderr = logFile
-	}
+	cmd.Stderr = stderrWriter
 
 	stdin, err := cmd.StdinPipe()
 	if err != nil {

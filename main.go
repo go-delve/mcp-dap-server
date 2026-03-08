@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
@@ -9,23 +10,21 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-// logFile is the opened log file, shared so the adapter's stderr can be
-// redirected to it as well (see backend.go).
-var logFile *os.File
-
 func main() {
 	// Log only to a file — never to stderr. With MCP stdio transport,
 	// stderr is a pipe to the MCP client. If the pipe buffer fills
 	// (from our logs or the DAP adapter's stderr), any write blocks
 	// the goroutine and hangs the server.
 	logPath := filepath.Join(os.TempDir(), "mcp-dap-server.log")
-	var err error
-	logFile, err = os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	var logWriter io.Writer
+	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
 	if err != nil {
 		// Discard logs if we can't open the file — do NOT fall back to stderr
-		log.SetOutput(os.NewFile(0, os.DevNull))
+		logWriter = io.Discard
+		log.SetOutput(logWriter)
 	} else {
-		log.SetOutput(logFile)
+		logWriter = logFile
+		log.SetOutput(logWriter)
 		defer logFile.Close()
 	}
 
@@ -38,7 +37,7 @@ func main() {
 	}
 	server := mcp.NewServer(&implementation, nil)
 
-	ds := registerTools(server)
+	ds := registerTools(server, logWriter)
 	defer ds.cleanup()
 
 	if err := server.Run(context.Background(), mcp.NewStdioTransport()); err != nil {

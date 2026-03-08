@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -69,7 +70,7 @@ func setupMCPServerAndClient(t *testing.T) *testSetup {
 		Version: "v1.0.0",
 	}
 	server := mcp.NewServer(&implementation, nil)
-	registerTools(server)
+	registerTools(server, io.Discard)
 
 	// Create httptest server
 	getServer := func(request *http.Request) *mcp.Server {

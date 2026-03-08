@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/exec"
@@ -18,6 +19,7 @@ type debuggerSession struct {
 	cmd             *exec.Cmd
 	client          *DAPClient
 	server          *mcp.Server      // MCP server for dynamic tool registration
+	logWriter       io.Writer        // writer for adapter stderr (log file or io.Discard)
 	backend         DebuggerBackend  // debugger-specific backend (delve, gdb, etc.)
 	capabilities    dap.Capabilities // capabilities reported by DAP server
 	launchMode      string           // "source", "binary", "core", or "attach"
@@ -48,8 +50,9 @@ Debugger selection (via 'debugger' parameter):
 Choose the debugger based on the language of the program being debugged: use 'delve' for Go, use 'gdb' for C/C++/Rust.`
 
 // registerTools registers the debugger tools with the MCP server.
-func registerTools(server *mcp.Server) *debuggerSession {
-	ds := &debuggerSession{server: server}
+// logWriter is used to redirect adapter stderr output; pass io.Discard to suppress.
+func registerTools(server *mcp.Server, logWriter io.Writer) *debuggerSession {
+	ds := &debuggerSession{server: server, logWriter: logWriter}
 
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "debug",
@@ -234,9 +237,9 @@ type BreakpointToolParams struct {
 	Function string  `json:"function,omitempty" mcp:"function name (alternative to file+line)"`
 }
 
-// readAndValidateResponse reads a DAP message and validates the response.
-// It returns an error if the read fails or if the response indicates failure.
-// The generic type T allows this function to be used with different response types.
+// readAndValidateResponse reads DAP messages, skipping events, until it
+// receives a ResponseMessage. It returns an error if the response indicates
+// failure or if the read itself fails.
 func readAndValidateResponse(client *DAPClient, errorPrefix string) error {
 	for {
 		msg, err := client.ReadMessage()
@@ -250,7 +253,34 @@ func readAndValidateResponse(client *DAPClient, errorPrefix string) error {
 			}
 			return nil
 		case dap.EventMessage:
-			// Continue looping to wait for ResponseMessage
+			continue
+		}
+	}
+}
+
+// readTypedResponse reads DAP messages, skipping events, until it receives a
+// response of the expected type T. Returns an error if the response indicates
+// failure or if an unexpected response type is received.
+func readTypedResponse[T dap.ResponseMessage](client *DAPClient) (T, error) {
+	var zero T
+	for {
+		msg, err := client.ReadMessage()
+		if err != nil {
+			return zero, err
+		}
+		switch resp := msg.(type) {
+		case T:
+			if !resp.GetResponse().Success {
+				return zero, errors.New(resp.GetResponse().Message)
+			}
+			return resp, nil
+		case dap.ResponseMessage:
+			if !resp.GetResponse().Success {
+				return zero, errors.New(resp.GetResponse().Message)
+			}
+			return zero, fmt.Errorf("expected %T, got %T", zero, msg)
+		case dap.EventMessage:
+			continue
 		}
 	}
 }
@@ -393,9 +423,9 @@ func (ds *debuggerSession) evaluateExpression(ctx context.Context, _ *mcp.Server
 		return nil, fmt.Errorf("debugger not started")
 	}
 
-	context := params.Arguments.Context
-	if context == "" {
-		context = "repl"
+	evalContext := params.Arguments.Context
+	if evalContext == "" {
+		evalContext = "repl"
 	}
 
 	frameID := params.Arguments.FrameID.Int()
@@ -403,27 +433,21 @@ func (ds *debuggerSession) evaluateExpression(ctx context.Context, _ *mcp.Server
 		frameID = ds.lastFrameID
 	}
 
-	if err := ds.client.EvaluateRequest(params.Arguments.Expression, frameID, context); err != nil {
+	if err := ds.client.EvaluateRequest(params.Arguments.Expression, frameID, evalContext); err != nil {
 		return nil, err
 	}
 
-	// Read messages until we get the EvaluateResponse
-	// Events can come at any time, so we need to handle them
-	log.Printf("evaluate: waiting for response...")
 	for {
 		msg, err := ds.client.ReadMessage()
 		if err != nil {
-			log.Printf("evaluate: read error: %v", err)
 			return nil, err
 		}
-		log.Printf("evaluate: received message type %T", msg)
-
 		switch resp := msg.(type) {
 		case *dap.EvaluateResponse:
 			if !resp.Success {
 				return nil, fmt.Errorf("unable to evaluate expression: %s", resp.Message)
 			}
-			result := fmt.Sprintf("%s", resp.Body.Result)
+			result := resp.Body.Result
 			if resp.Body.Type != "" {
 				result = fmt.Sprintf("%s (type: %s)", resp.Body.Result, resp.Body.Type)
 			}
@@ -438,7 +462,6 @@ func (ds *debuggerSession) evaluateExpression(ctx context.Context, _ *mcp.Server
 				Content: []mcp.Content{&mcp.TextContent{Text: "(no result)"}},
 			}, nil
 		case dap.EventMessage:
-			// Ignore events, they can come at any time
 			continue
 		default:
 			return nil, fmt.Errorf("unexpected response type: %T", msg)
@@ -501,7 +524,6 @@ func (ds *debuggerSession) restartDebugger(ctx context.Context, _ *mcp.ServerSes
 
 // info returns program metadata.
 func (ds *debuggerSession) info(ctx context.Context, _ *mcp.ServerSession, params *mcp.CallToolParamsFor[InfoParams]) (*mcp.CallToolResultFor[any], error) {
-	log.Printf("info: type=%q", params.Arguments.Type)
 	if ds.client == nil {
 		return nil, fmt.Errorf("debugger not started")
 	}
@@ -520,35 +542,14 @@ func (ds *debuggerSession) info(ctx context.Context, _ *mcp.ServerSession, param
 		if err := ds.client.ThreadsRequest(); err != nil {
 			return nil, err
 		}
-		var resp *dap.ThreadsResponse
-		for {
-			msg, err := ds.client.ReadMessage()
-			if err != nil {
-				return nil, err
-			}
-			switch m := msg.(type) {
-			case *dap.ThreadsResponse:
-				resp = m
-			case dap.ResponseMessage:
-				if !m.GetResponse().Success {
-					return nil, fmt.Errorf("failed to get threads: %s", m.GetResponse().Message)
-				}
-			case dap.EventMessage:
-				continue
-			}
-			break
-		}
-		if resp == nil || !resp.Success {
-			errMsg := "failed to get threads"
-			if resp != nil {
-				errMsg += ": " + resp.Message
-			}
-			return nil, fmt.Errorf("%s", errMsg)
+		resp, err := readTypedResponse[*dap.ThreadsResponse](ds.client)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get threads: %w", err)
 		}
 		var threads strings.Builder
 		threads.WriteString("Threads:\n")
 		for _, t := range resp.Body.Threads {
-			threads.WriteString(fmt.Sprintf("  Thread %d: %s\n", t.Id, t.Name))
+			fmt.Fprintf(&threads, "  Thread %d: %s\n", t.Id, t.Name)
 		}
 		return &mcp.CallToolResultFor[any]{
 			Content: []mcp.Content{&mcp.TextContent{Text: threads.String()}},
@@ -561,35 +562,14 @@ func (ds *debuggerSession) info(ctx context.Context, _ *mcp.ServerSession, param
 		if err := ds.client.LoadedSourcesRequest(); err != nil {
 			return nil, err
 		}
-		var resp *dap.LoadedSourcesResponse
-		for {
-			msg, err := ds.client.ReadMessage()
-			if err != nil {
-				return nil, err
-			}
-			switch m := msg.(type) {
-			case *dap.LoadedSourcesResponse:
-				resp = m
-			case dap.ResponseMessage:
-				if !m.GetResponse().Success {
-					return nil, fmt.Errorf("failed to get loaded sources: %s", m.GetResponse().Message)
-				}
-			case dap.EventMessage:
-				continue
-			}
-			break
-		}
-		if resp == nil || !resp.Success {
-			errMsg := "failed to get loaded sources"
-			if resp != nil {
-				errMsg += ": " + resp.Message
-			}
-			return nil, fmt.Errorf("%s", errMsg)
+		resp, err := readTypedResponse[*dap.LoadedSourcesResponse](ds.client)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get loaded sources: %w", err)
 		}
 		var sources strings.Builder
 		sources.WriteString("Loaded Sources:\n")
 		for _, src := range resp.Body.Sources {
-			sources.WriteString(fmt.Sprintf("  %s\n", src.Path))
+			fmt.Fprintf(&sources, "  %s\n", src.Path)
 		}
 		return &mcp.CallToolResultFor[any]{
 			Content: []mcp.Content{&mcp.TextContent{Text: sources.String()}},
@@ -602,35 +582,14 @@ func (ds *debuggerSession) info(ctx context.Context, _ *mcp.ServerSession, param
 		if err := ds.client.ModulesRequest(); err != nil {
 			return nil, err
 		}
-		var resp *dap.ModulesResponse
-		for {
-			msg, err := ds.client.ReadMessage()
-			if err != nil {
-				return nil, err
-			}
-			switch m := msg.(type) {
-			case *dap.ModulesResponse:
-				resp = m
-			case dap.ResponseMessage:
-				if !m.GetResponse().Success {
-					return nil, fmt.Errorf("failed to get modules: %s", m.GetResponse().Message)
-				}
-			case dap.EventMessage:
-				continue
-			}
-			break
-		}
-		if resp == nil || !resp.Success {
-			errMsg := "failed to get modules"
-			if resp != nil {
-				errMsg += ": " + resp.Message
-			}
-			return nil, fmt.Errorf("%s", errMsg)
+		resp, err := readTypedResponse[*dap.ModulesResponse](ds.client)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get modules: %w", err)
 		}
 		var modules strings.Builder
 		modules.WriteString("Loaded Modules:\n")
 		for _, mod := range resp.Body.Modules {
-			modules.WriteString(fmt.Sprintf("  %s (%s)\n", mod.Name, mod.Path))
+			fmt.Fprintf(&modules, "  %s (%s)\n", mod.Name, mod.Path)
 		}
 		return &mcp.CallToolResultFor[any]{
 			Content: []mcp.Content{&mcp.TextContent{Text: modules.String()}},
@@ -650,6 +609,7 @@ type DisassembleParams struct {
 
 // disassembleCode disassembles code at a memory reference.
 func (ds *debuggerSession) disassembleCode(ctx context.Context, _ *mcp.ServerSession, params *mcp.CallToolParamsFor[DisassembleParams]) (*mcp.CallToolResultFor[any], error) {
+	log.Printf("disassemble: address=%s offset=%d", params.Arguments.Address, params.Arguments.Offset.Int())
 	if ds.client == nil {
 		return nil, fmt.Errorf("debugger not started")
 	}
@@ -657,71 +617,33 @@ func (ds *debuggerSession) disassembleCode(ctx context.Context, _ *mcp.ServerSes
 	if count == 0 {
 		count = 20
 	}
-	log.Printf("disassemble: sending request address=%s offset=%d count=%d", params.Arguments.Address, params.Arguments.Offset.Int(), count)
 	if err := ds.client.DisassembleRequest(params.Arguments.Address, params.Arguments.Offset.Int(), count); err != nil {
-		log.Printf("disassemble: send error: %v", err)
 		return nil, err
 	}
 
-	log.Printf("disassemble: waiting for response...")
-	var disResp *dap.DisassembleResponse
-	for {
-		msg, err := ds.client.ReadMessage()
-		if err != nil {
-			log.Printf("disassemble: read error: %v", err)
-			return nil, err
-		}
-		log.Printf("disassemble: received message type %T", msg)
-		switch m := msg.(type) {
-		case *dap.DisassembleResponse:
-			log.Printf("disassemble: got DisassembleResponse success=%v", m.Success)
-			disResp = m
-		case dap.ResponseMessage:
-			if !m.GetResponse().Success {
-				log.Printf("disassemble: got error response: %s", m.GetResponse().Message)
-				return nil, fmt.Errorf("unable to disassemble: %s", m.GetResponse().Message)
-			}
-			log.Printf("disassemble: got non-disassemble ResponseMessage command=%s", m.GetResponse().Command)
-		case dap.EventMessage:
-			log.Printf("disassemble: skipping event: %T", msg)
-			continue
-		default:
-			log.Printf("disassemble: unexpected message type: %T", msg)
-		}
-		break
-	}
-	if disResp == nil || !disResp.Success {
-		errMsg := "unable to disassemble"
-		if disResp != nil {
-			errMsg += ": " + disResp.Message
-		}
-		return nil, fmt.Errorf("%s", errMsg)
+	disResp, err := readTypedResponse[*dap.DisassembleResponse](ds.client)
+	if err != nil {
+		return nil, fmt.Errorf("unable to disassemble: %w", err)
 	}
 
-	log.Printf("disassemble: building result from %d instructions", len(disResp.Body.Instructions))
 	var result strings.Builder
 	result.WriteString("Disassembly:\n")
-	for i, inst := range disResp.Body.Instructions {
-		log.Printf("disassemble: instruction[%d] addr=%s inst=%q", i, inst.Address, inst.Instruction)
-		result.WriteString(fmt.Sprintf("  %s  %s", inst.Address, inst.Instruction))
+	for _, inst := range disResp.Body.Instructions {
+		fmt.Fprintf(&result, "  %s  %s", inst.Address, inst.Instruction)
 		if inst.Location != nil && inst.Location.Path != "" {
-			result.WriteString(fmt.Sprintf("  ; %s:%d", inst.Location.Path, inst.Line))
+			fmt.Fprintf(&result, "  ; %s:%d", inst.Location.Path, inst.Line)
 		}
 		result.WriteString("\n")
 	}
-	log.Printf("disassemble: loop done, result=%d bytes, ctx.Err=%v", result.Len(), ctx.Err())
-	resultStr := result.String()
-	log.Printf("disassemble: returning result to MCP framework")
 	return &mcp.CallToolResultFor[any]{
-		Content: []mcp.Content{&mcp.TextContent{Text: resultStr}},
+		Content: []mcp.Content{&mcp.TextContent{Text: result.String()}},
 	}, nil
 }
 
 // stop ends the debugging session completely.
 func (ds *debuggerSession) stop(ctx context.Context, _ *mcp.ServerSession, _ *mcp.CallToolParamsFor[StopParams]) (*mcp.CallToolResultFor[any], error) {
-	log.Printf("stop: called")
+	log.Printf("stop")
 	if ds.cmd == nil && ds.client == nil {
-		log.Printf("stop: no session active")
 		return &mcp.CallToolResultFor[any]{
 			Content: []mcp.Content{&mcp.TextContent{Text: "No debug session active"}},
 		}, nil
@@ -729,7 +651,6 @@ func (ds *debuggerSession) stop(ctx context.Context, _ *mcp.ServerSession, _ *mc
 
 	ds.cleanup()
 
-	log.Printf("stop: returning success")
 	return &mcp.CallToolResultFor[any]{
 		Content: []mcp.Content{&mcp.TextContent{Text: "Debug session stopped"}},
 	}, nil
@@ -738,34 +659,21 @@ func (ds *debuggerSession) stop(ctx context.Context, _ *mcp.ServerSession, _ *mc
 // cleanup kills the DAP adapter process and resets session state.
 // Safe to call multiple times or when no session is active.
 func (ds *debuggerSession) cleanup() {
-	log.Printf("cleanup: starting (client=%v, cmd=%v)", ds.client != nil, ds.cmd != nil)
-
-	// Close the DAP client connection
 	if ds.client != nil {
-		log.Printf("cleanup: closing DAP client...")
 		ds.client.Close()
 		ds.client = nil
-		log.Printf("cleanup: DAP client closed")
 	}
 
-	// Kill the debugger/adapter process immediately
 	if ds.cmd != nil && ds.cmd.Process != nil {
-		log.Printf("cleanup: killing process pid=%d...", ds.cmd.Process.Pid)
 		if err := ds.cmd.Process.Kill(); err != nil {
 			if !strings.Contains(err.Error(), "process already finished") {
 				log.Printf("cleanup: error killing debugger process: %v", err)
-			} else {
-				log.Printf("cleanup: process already finished")
 			}
-		} else {
-			log.Printf("cleanup: kill sent, waiting for process...")
 		}
 		ds.cmd.Wait()
-		log.Printf("cleanup: process wait completed")
 		ds.cmd = nil
 	}
 
-	// Clear session state
 	ds.launchMode = ""
 	ds.programPath = ""
 	ds.programArgs = nil
@@ -774,7 +682,6 @@ func (ds *debuggerSession) cleanup() {
 	ds.stoppedThreadID = 0
 	ds.lastFrameID = 0
 	ds.unregisterSessionTools()
-	log.Printf("cleanup: done")
 }
 
 // debug starts a complete debugging session.
@@ -840,7 +747,7 @@ func (ds *debuggerSession) debug(ctx context.Context, _ *mcp.ServerSession, para
 	}
 
 	// Spawn DAP server via backend
-	cmd, listenAddr, err := ds.backend.Spawn(port)
+	cmd, listenAddr, err := ds.backend.Spawn(port, ds.logWriter)
 	if err != nil {
 		return nil, err
 	}
@@ -849,7 +756,11 @@ func (ds *debuggerSession) debug(ctx context.Context, _ *mcp.ServerSession, para
 	// Connect DAP client based on transport mode
 	switch ds.backend.TransportMode() {
 	case "tcp":
-		ds.client = newDAPClient(listenAddr)
+		client, err := newDAPClient(listenAddr)
+		if err != nil {
+			return nil, err
+		}
+		ds.client = client
 	case "stdio":
 		gdb := ds.backend.(*gdbBackend)
 		stdout, stdin := gdb.StdioPipes()
@@ -908,28 +819,13 @@ func (ds *debuggerSession) debug(ctx context.Context, _ *mcp.ServerSession, para
 	}
 	// After sending the launch/attach request, we must handle two DAP patterns:
 	//
-	// Delve pattern: launch response arrives immediately, then we set breakpoints
-	// and send configurationDone.
+	// Delve: launch response arrives immediately, then initialized event.
 	//
-	// cpptools pattern: the adapter sends an "initialized" event and defers
-	// the launch response until after configurationDone. We must set breakpoints
-	// and send configurationDone before reading the launch response.
+	// cpptools: may send an "initialized" event and defer the launch response
+	// until after configurationDone, or may send launch response first.
 	//
-	// We unify both by reading messages until we get either the launch response
-	// (Delve) or an initialized event (cpptools), then proceeding accordingly.
-	// After sending the launch/attach request, we must handle two DAP patterns:
-	//
-	// Delve pattern: launch response arrives immediately, then initialized event.
-	//
-	// cpptools pattern (SupportsRunInTerminalRequest=true): the adapter sends an
-	// "initialized" event and defers the launch response until after configurationDone.
-	//
-	// cpptools pattern (SupportsRunInTerminalRequest=false): launch response, then
-	// initialized event (same as Delve).
-	//
-	// In all cases we need to consume both the launch response and the initialized
-	// event before proceeding to set breakpoints. We read messages until we have
-	// seen both (or just initialized for the deferred-response pattern).
+	// We unify both by reading messages until we see the initialized event,
+	// noting whether the launch response has also arrived.
 	launchResponseReceived := false
 	initializedReceived := false
 	for !initializedReceived {
@@ -1088,27 +984,15 @@ func (ds *debuggerSession) getThreadList() string {
 	if err := ds.client.ThreadsRequest(); err != nil {
 		return ""
 	}
-	for {
-		msg, err := ds.client.ReadMessage()
-		if err != nil {
-			return ""
-		}
-		switch m := msg.(type) {
-		case *dap.ThreadsResponse:
-			if !m.Success {
-				return ""
-			}
-			var threads strings.Builder
-			for _, t := range m.Body.Threads {
-				threads.WriteString(fmt.Sprintf("  Thread %d: %s\n", t.Id, t.Name))
-			}
-			return threads.String()
-		case dap.EventMessage:
-			continue
-		default:
-			return ""
-		}
+	resp, err := readTypedResponse[*dap.ThreadsResponse](ds.client)
+	if err != nil {
+		return ""
 	}
+	var threads strings.Builder
+	for _, t := range resp.Body.Threads {
+		fmt.Fprintf(&threads, "  Thread %d: %s\n", t.Id, t.Name)
+	}
+	return threads.String()
 }
 
 // step executes a step command and returns the full context at the new location.
@@ -1174,40 +1058,19 @@ func (ds *debuggerSession) getFullContext(threadID, frameID, maxFrames int) (*mc
 	if err := ds.client.StackTraceRequest(threadID, 0, maxFrames); err != nil {
 		return nil, err
 	}
-
-	var frames []dap.StackFrame
-	for {
-		msg, err := ds.client.ReadMessage()
-		if err != nil {
-			return nil, err
-		}
-		switch resp := msg.(type) {
-		case *dap.StackTraceResponse:
-			if !resp.Success {
-				return nil, fmt.Errorf("unable to get stack trace: %s", resp.Message)
-			}
-			frames = resp.Body.StackFrames
-			goto gotStack
-		case dap.ResponseMessage:
-			if !resp.GetResponse().Success {
-				return nil, fmt.Errorf("unable to get stack trace: %s", resp.GetResponse().Message)
-			}
-			goto gotStack
-		case dap.EventMessage:
-			continue
-		default:
-			return nil, fmt.Errorf("unexpected response type: %T", msg)
-		}
+	stResp, err := readTypedResponse[*dap.StackTraceResponse](ds.client)
+	if err != nil {
+		return nil, fmt.Errorf("unable to get stack trace: %w", err)
 	}
-gotStack:
+	frames := stResp.Body.StackFrames
 
 	// Current location
 	if len(frames) > 0 {
 		top := frames[0]
 		result.WriteString("## Current Location\n")
-		result.WriteString(fmt.Sprintf("Function: %s\n", top.Name))
+		fmt.Fprintf(&result, "Function: %s\n", top.Name)
 		if top.Source != nil {
-			result.WriteString(fmt.Sprintf("File: %s:%d\n", top.Source.Path, top.Line))
+			fmt.Fprintf(&result, "File: %s:%d\n", top.Source.Path, top.Line)
 		}
 		result.WriteString("\n")
 	}
@@ -1215,9 +1078,9 @@ gotStack:
 	// Stack trace
 	result.WriteString("## Stack Trace\n")
 	for i, frame := range frames {
-		result.WriteString(fmt.Sprintf("#%d (Frame ID: %d) %s", i, frame.Id, frame.Name))
+		fmt.Fprintf(&result, "#%d (Frame ID: %d) %s", i, frame.Id, frame.Name)
 		if frame.Source != nil && frame.Source.Path != "" {
-			result.WriteString(fmt.Sprintf(" at %s:%d", frame.Source.Path, frame.Line))
+			fmt.Fprintf(&result, " at %s:%d", frame.Source.Path, frame.Line)
 		}
 		if frame.PresentationHint == "subtle" {
 			result.WriteString(" (runtime)")
@@ -1226,90 +1089,64 @@ gotStack:
 	}
 	result.WriteString("\n")
 
-	// Get scopes and variables for the target frame
+	// Determine the target frame for scopes/variables
 	targetFrameID := frameID
 	if targetFrameID == 0 && len(frames) > 0 {
 		targetFrameID = frames[0].Id
 	}
 	ds.lastFrameID = targetFrameID
 
-	if err := ds.client.ScopesRequest(targetFrameID); err != nil {
-		return nil, err
-	}
-
-	var scopes []dap.Scope
-	for {
-		msg, err := ds.client.ReadMessage()
-		if err != nil {
-			return nil, err
-		}
-		switch resp := msg.(type) {
-		case *dap.ScopesResponse:
-			if !resp.Success {
-				log.Printf("getFullContext: scopes request failed: %s", resp.Message)
-				result.WriteString("## Variables\n")
-				result.WriteString("(unable to retrieve scopes)\n")
-				goto gotScopes
-			}
-			scopes = resp.Body.Scopes
-			goto gotScopes
-		case dap.ResponseMessage:
-			if !resp.GetResponse().Success {
-				log.Printf("getFullContext: scopes request failed: %s", resp.GetResponse().Message)
-				result.WriteString("## Variables\n")
-				result.WriteString("(unable to retrieve scopes)\n")
-				goto gotScopes
-			}
-			goto gotScopes
-		case dap.EventMessage:
-			continue
-		default:
-			return nil, fmt.Errorf("unexpected response type: %T", msg)
-		}
-	}
-gotScopes:
-
-	if len(scopes) > 0 {
-		result.WriteString("## Variables\n")
-		for _, scope := range scopes {
-			result.WriteString(fmt.Sprintf("### %s\n", scope.Name))
-			if scope.VariablesReference > 0 {
-				if err := ds.client.VariablesRequest(scope.VariablesReference); err != nil {
-					log.Printf("getFullContext: variables request failed for scope %s: %v", scope.Name, err)
-					result.WriteString("  (unable to retrieve variables)\n")
-					continue
-				}
-				varMsg, err := ds.client.ReadMessage()
-				if err != nil {
-					log.Printf("getFullContext: reading variables response failed for scope %s: %v", scope.Name, err)
-					result.WriteString("  (unable to retrieve variables)\n")
-					continue
-				}
-				varResp, ok := varMsg.(*dap.VariablesResponse)
-				if !ok {
-					log.Printf("getFullContext: unexpected response type for variables: %T", varMsg)
-					result.WriteString("  (unable to retrieve variables)\n")
-					continue
-				}
-				if !varResp.Success {
-					log.Printf("getFullContext: variables request failed for scope %s: %s", scope.Name, varResp.Message)
-					result.WriteString("  (unable to retrieve variables)\n")
-					continue
-				}
-				for _, v := range varResp.Body.Variables {
-					result.WriteString(fmt.Sprintf("  %s", v.Name))
-					if v.Type != "" {
-						result.WriteString(fmt.Sprintf(" (%s)", v.Type))
-					}
-					result.WriteString(fmt.Sprintf(" = %s\n", v.Value))
-				}
-			}
-		}
-	}
+	// Get scopes and variables
+	ds.writeScopesAndVariables(&result, targetFrameID)
 
 	return &mcp.CallToolResultFor[any]{
 		Content: []mcp.Content{&mcp.TextContent{Text: result.String()}},
 	}, nil
+}
+
+// writeScopesAndVariables fetches scopes and their variables for the given
+// frame and writes them to the result builder. Errors are written inline
+// rather than propagated, since partial context is better than none.
+func (ds *debuggerSession) writeScopesAndVariables(result *strings.Builder, frameID int) {
+	if err := ds.client.ScopesRequest(frameID); err != nil {
+		result.WriteString("## Variables\n(unable to retrieve scopes)\n")
+		return
+	}
+
+	scopesResp, err := readTypedResponse[*dap.ScopesResponse](ds.client)
+	if err != nil {
+		result.WriteString("## Variables\n(unable to retrieve scopes)\n")
+		return
+	}
+
+	scopes := scopesResp.Body.Scopes
+	if len(scopes) == 0 {
+		return
+	}
+
+	result.WriteString("## Variables\n")
+	for _, scope := range scopes {
+		fmt.Fprintf(result, "### %s\n", scope.Name)
+		if scope.VariablesReference <= 0 {
+			continue
+		}
+		if err := ds.client.VariablesRequest(scope.VariablesReference); err != nil {
+			result.WriteString("  (unable to retrieve variables)\n")
+			continue
+		}
+		varResp, err := readTypedResponse[*dap.VariablesResponse](ds.client)
+		if err != nil {
+			result.WriteString("  (unable to retrieve variables)\n")
+			continue
+		}
+		for _, v := range varResp.Body.Variables {
+			if v.Type != "" {
+				fmt.Fprintf(result, "  %s (%s) = %s\n", v.Name, v.Type, v.Value)
+			} else {
+				fmt.Fprintf(result, "  %s = %s\n", v.Name, v.Value)
+			}
+		}
+	}
 }
 
 // breakpoint sets a breakpoint at the specified location.
@@ -1338,36 +1175,20 @@ func (ds *debuggerSession) breakpoint(ctx context.Context, _ *mcp.ServerSession,
 		return nil, err
 	}
 
-	for {
-		msg, err := ds.client.ReadMessage()
-		if err != nil {
-			return nil, err
-		}
-		switch response := msg.(type) {
-		case *dap.SetBreakpointsResponse:
-			if len(response.Body.Breakpoints) > 0 {
-				bp := response.Body.Breakpoints[0]
-				if bp.Verified {
-					return &mcp.CallToolResultFor[any]{
-						Content: []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf("Breakpoint %d set at %s:%d", bp.Id, params.Arguments.File, bp.Line)}},
-					}, nil
-				}
-				return nil, fmt.Errorf("breakpoint not verified: %s", bp.Message)
-			}
-			return nil, fmt.Errorf("no breakpoints returned")
-		case *dap.ErrorResponse:
-			return nil, errors.New(response.Message)
-		case dap.ResponseMessage:
-			if !response.GetResponse().Success {
-				return nil, fmt.Errorf("unable to set breakpoint: %s", response.GetResponse().Message)
-			}
-			return nil, fmt.Errorf("unexpected response type")
-		case dap.EventMessage:
-			continue
-		default:
-			return nil, fmt.Errorf("unexpected response type")
-		}
+	resp, err := readTypedResponse[*dap.SetBreakpointsResponse](ds.client)
+	if err != nil {
+		return nil, fmt.Errorf("unable to set breakpoint: %w", err)
 	}
+	if len(resp.Body.Breakpoints) == 0 {
+		return nil, fmt.Errorf("no breakpoints returned")
+	}
+	bp := resp.Body.Breakpoints[0]
+	if !bp.Verified {
+		return nil, fmt.Errorf("breakpoint not verified: %s", bp.Message)
+	}
+	return &mcp.CallToolResultFor[any]{
+		Content: []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf("Breakpoint %d set at %s:%d", bp.Id, params.Arguments.File, bp.Line)}},
+	}, nil
 }
 
 // findCpptoolsAdapter searches common locations for the cpptools DAP adapter
