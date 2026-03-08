@@ -1018,3 +1018,383 @@ func TestGDBEvaluate(t *testing.T) {
 
 	ts.stopDebugger(t)
 }
+
+// callTool is a test helper that calls an MCP tool and returns the text content.
+// It fatals on transport errors and returns (text, isError) for tool-level results.
+func (ts *testSetup) callTool(t *testing.T, name string, args map[string]any) (string, bool) {
+	t.Helper()
+	result, err := ts.session.CallTool(ts.ctx, &mcp.CallToolParams{
+		Name:      name,
+		Arguments: args,
+	})
+	if err != nil {
+		t.Fatalf("Failed to call tool %s: %v", name, err)
+	}
+	var text string
+	for _, content := range result.Content {
+		if tc, ok := content.(*mcp.TextContent); ok {
+			text += tc.Text
+		}
+	}
+	return text, result.IsError
+}
+
+func TestClearBreakpoints(t *testing.T) {
+	ts := setupMCPServerAndClient(t)
+	defer ts.cleanup()
+
+	binaryPath, cleanupBinary := compileTestProgram(t, ts.cwd, "helloworld")
+	defer cleanupBinary()
+
+	ts.startDebugSession(t, "0", binaryPath, nil)
+
+	f := filepath.Join(ts.cwd, "testdata", "go", "helloworld", "main.go")
+
+	// Set a breakpoint first
+	text, isErr := ts.callTool(t, "breakpoint", map[string]any{"file": f, "line": 7})
+	if isErr {
+		t.Fatalf("Failed to set breakpoint: %s", text)
+	}
+	t.Logf("Set breakpoint: %s", text)
+
+	// Clear breakpoints in the specific file
+	text, isErr = ts.callTool(t, "clear-breakpoints", map[string]any{"file": f})
+	if isErr {
+		t.Fatalf("clear-breakpoints returned error: %s", text)
+	}
+	if !strings.Contains(text, "Cleared breakpoints in") {
+		t.Errorf("Expected 'Cleared breakpoints in' message, got: %s", text)
+	}
+	t.Logf("Cleared file breakpoints: %s", text)
+
+	// Clear all breakpoints
+	text, isErr = ts.callTool(t, "clear-breakpoints", map[string]any{"all": true})
+	if isErr {
+		t.Fatalf("clear-breakpoints all returned error: %s", text)
+	}
+	if !strings.Contains(text, "Cleared all breakpoints") {
+		t.Errorf("Expected 'Cleared all breakpoints' message, got: %s", text)
+	}
+	t.Logf("Cleared all breakpoints: %s", text)
+
+	// Error case: no file or all specified — tool returns (nil, error)
+	// The MCP go-sdk wraps this as an isError result or a transport error
+	result, err := ts.session.CallTool(ts.ctx, &mcp.CallToolParams{
+		Name:      "clear-breakpoints",
+		Arguments: map[string]any{},
+	})
+	if err != nil {
+		t.Logf("Got expected transport error: %v", err)
+	} else if result.IsError {
+		t.Logf("Got expected tool error result")
+	} else {
+		t.Error("Expected error when neither file nor all specified")
+	}
+
+	ts.stopDebugger(t)
+}
+
+func TestInfo(t *testing.T) {
+	ts := setupMCPServerAndClient(t)
+	defer ts.cleanup()
+
+	binaryPath, cleanupBinary := compileTestProgram(t, ts.cwd, "helloworld")
+	defer cleanupBinary()
+
+	ts.startDebugSession(t, "0", binaryPath, nil)
+
+	// Hit a breakpoint so we're in a stopped state
+	f := filepath.Join(ts.cwd, "testdata", "go", "helloworld", "main.go")
+	ts.setBreakpointAndContinue(t, f, 7)
+
+	// Test info with type "threads"
+	text, isErr := ts.callTool(t, "info", map[string]any{"type": "threads"})
+	if isErr {
+		t.Fatalf("info threads returned error: %s", text)
+	}
+	if !strings.Contains(text, "Thread") {
+		t.Errorf("Expected thread info to contain 'Thread', got: %s", text)
+	}
+	t.Logf("Info threads: %s", text)
+
+	// Test info with default type (no type specified)
+	text, isErr = ts.callTool(t, "info", map[string]any{})
+	if isErr {
+		t.Fatalf("info default returned error: %s", text)
+	}
+	t.Logf("Info default: %s", text)
+
+	// Test info with invalid type — tool returns (nil, error)
+	result, err := ts.session.CallTool(ts.ctx, &mcp.CallToolParams{
+		Name:      "info",
+		Arguments: map[string]any{"type": "invalid"},
+	})
+	if err != nil {
+		t.Logf("Got expected transport error for invalid info type: %v", err)
+	} else if result.IsError {
+		t.Logf("Got expected tool error for invalid info type")
+	} else {
+		t.Error("Expected error for invalid info type")
+	}
+
+	ts.stopDebugger(t)
+}
+
+func TestDisassemble(t *testing.T) {
+	ts := setupMCPServerAndClient(t)
+	defer ts.cleanup()
+
+	binaryPath, cleanupBinary := compileTestProgram(t, ts.cwd, "step")
+	defer cleanupBinary()
+
+	ts.startDebugSession(t, "0", binaryPath, nil)
+
+	// Hit a breakpoint so we're in a stopped state
+	f := filepath.Join(ts.cwd, "testdata", "go", "step", "main.go")
+	ts.setBreakpointAndContinue(t, f, 13)
+
+	// Use evaluate to get the program counter via a runtime expression.
+	// Try multiple approaches to get a hex address for disassembly.
+	var addr string
+	expressions := []string{
+		"runtime.firstmoduledata.text",
+	}
+	for _, expr := range expressions {
+		addrText, isErr := ts.callTool(t, "evaluate", map[string]any{
+			"expression": expr,
+			"context":    "repl",
+		})
+		t.Logf("Evaluate %q: %s (isErr=%v)", expr, addrText, isErr)
+		if isErr {
+			continue
+		}
+		for _, word := range strings.Fields(addrText) {
+			if strings.HasPrefix(word, "0x") {
+				addr = word
+				break
+			}
+		}
+		if addr != "" {
+			break
+		}
+		// Check if the result itself is a number we can use
+		addrText = strings.TrimSpace(addrText)
+		if len(addrText) > 0 && addrText[0] >= '0' && addrText[0] <= '9' {
+			// It's a numeric value — format as hex
+			addr = fmt.Sprintf("0x%x", func() int64 {
+				var n int64
+				fmt.Sscanf(addrText, "%d", &n)
+				return n
+			}())
+			if addr != "0x0" {
+				break
+			}
+			addr = ""
+		}
+	}
+
+	if addr == "" {
+		t.Skip("Could not determine instruction address for disassemble test")
+	}
+
+	// Call disassemble with the address
+	text, isErr := ts.callTool(t, "disassemble", map[string]any{
+		"address": addr,
+		"count":   5,
+	})
+	if isErr {
+		t.Fatalf("disassemble returned error: %s", text)
+	}
+	if !strings.Contains(text, "Disassembly") {
+		t.Errorf("Expected disassembly output, got: %s", text)
+	}
+	t.Logf("Disassembly:\n%s", text)
+
+	ts.stopDebugger(t)
+}
+
+func TestSetVariable(t *testing.T) {
+	ts := setupMCPServerAndClient(t)
+	defer ts.cleanup()
+
+	binaryPath, cleanupBinary := compileTestProgram(t, ts.cwd, "step")
+	defer cleanupBinary()
+
+	ts.startDebugSession(t, "0", binaryPath, nil)
+
+	// Set breakpoint after x := 10 and y := 20, at sum := x + y (line 13)
+	f := filepath.Join(ts.cwd, "testdata", "go", "step", "main.go")
+	ts.setBreakpointAndContinue(t, f, 13)
+
+	// Get context to confirm we can see x
+	contextStr := ts.getContextContent(t)
+	if !strings.Contains(contextStr, "x (int) = 10") {
+		t.Fatalf("Expected x to be 10, got context:\n%s", contextStr)
+	}
+
+	// Delve uses variablesReference = 1001 for the Locals scope in frame 1000
+	// Set x to 99
+	text, isErr := ts.callTool(t, "set-variable", map[string]any{
+		"variablesReference": 1001,
+		"name":               "x",
+		"value":              "99",
+	})
+	if isErr {
+		t.Fatalf("set-variable returned error: %s", text)
+	}
+	if !strings.Contains(text, "Set variable x to 99") {
+		t.Errorf("Expected confirmation message, got: %s", text)
+	}
+	t.Logf("Set variable result: %s", text)
+
+	// Verify the new value via evaluate
+	evalText, isErr := ts.callTool(t, "evaluate", map[string]any{
+		"expression": "x",
+		"context":    "repl",
+	})
+	if isErr {
+		t.Fatalf("evaluate returned error: %s", evalText)
+	}
+	if !strings.Contains(evalText, "99") {
+		t.Errorf("Expected x to be 99 after set-variable, got: %s", evalText)
+	}
+
+	ts.stopDebugger(t)
+}
+
+func TestPause(t *testing.T) {
+	ts := setupMCPServerAndClient(t)
+	defer ts.cleanup()
+
+	binaryPath, cleanupBinary := compileTestProgram(t, ts.cwd, "helloworld")
+	defer cleanupBinary()
+
+	// Start debug session stopped at entry
+	ts.startDebugSession(t, "0", binaryPath, nil)
+
+	// Set a breakpoint and continue to it
+	f := filepath.Join(ts.cwd, "testdata", "go", "helloworld", "main.go")
+	ts.setBreakpointAndContinue(t, f, 7)
+
+	// Call pause while already stopped — exercises the pause code path.
+	// Full concurrent pause (continue + pause) requires concurrent DAP reads
+	// which is not supported by the current single-reader architecture.
+	text, isErr := ts.callTool(t, "pause", map[string]any{"threadId": 1})
+	if isErr {
+		t.Fatalf("pause returned error: %s", text)
+	}
+	if !strings.Contains(text, "Paused") {
+		t.Errorf("Expected 'Paused' message, got: %s", text)
+	}
+	t.Logf("Pause result: %s", text)
+
+	ts.stopDebugger(t)
+}
+
+func TestStepIn(t *testing.T) {
+	ts := setupMCPServerAndClient(t)
+	defer ts.cleanup()
+
+	binaryPath, cleanupBinary := compileTestProgram(t, ts.cwd, "step")
+	defer cleanupBinary()
+
+	ts.startDebugSession(t, "0", binaryPath, nil)
+
+	// Set breakpoint at fmt.Sprintf call (line 16)
+	f := filepath.Join(ts.cwd, "testdata", "go", "step", "main.go")
+	ts.setBreakpointAndContinue(t, f, 16)
+
+	// Step in — should step into fmt.Sprintf
+	text, isErr := ts.callTool(t, "step", map[string]any{
+		"mode":     "in",
+		"threadId": 1,
+	})
+	if isErr {
+		t.Fatalf("step in returned error: %s", text)
+	}
+
+	// After stepping in, the current function should be fmt.Sprintf (not main.main)
+	if !strings.Contains(text, "Function: fmt.Sprintf") {
+		t.Errorf("Expected to be in fmt.Sprintf after step in, got:\n%s", text)
+	}
+	t.Logf("Step in result:\n%s", text)
+
+	ts.stopDebugger(t)
+}
+
+func TestStepOut(t *testing.T) {
+	ts := setupMCPServerAndClient(t)
+	defer ts.cleanup()
+
+	binaryPath, cleanupBinary := compileTestProgram(t, ts.cwd, "step")
+	defer cleanupBinary()
+
+	ts.startDebugSession(t, "0", binaryPath, nil)
+
+	// Set breakpoint at fmt.Sprintf call (line 16) and step in first
+	f := filepath.Join(ts.cwd, "testdata", "go", "step", "main.go")
+	ts.setBreakpointAndContinue(t, f, 16)
+
+	// Step in
+	_, isErr := ts.callTool(t, "step", map[string]any{
+		"mode":     "in",
+		"threadId": 1,
+	})
+	if isErr {
+		t.Fatal("step in failed")
+	}
+
+	// Step out — should return to main.main
+	text, isErr := ts.callTool(t, "step", map[string]any{
+		"mode":     "out",
+		"threadId": 1,
+	})
+	if isErr {
+		t.Fatalf("step out returned error: %s", text)
+	}
+
+	// After stepping out, we should be back in main.main
+	if !strings.Contains(text, "main.main") {
+		t.Errorf("Expected to be back in main.main after step out, got: %s", text)
+	}
+	t.Logf("Step out result:\n%s", text)
+
+	ts.stopDebugger(t)
+}
+
+func TestErrorBeforeDebuggerStarted(t *testing.T) {
+	ts := setupMCPServerAndClient(t)
+	defer ts.cleanup()
+
+	// Before starting a debug session, the only available tool is "debug".
+	// Calling session tools should fail because they're not registered yet.
+	toolsToTest := []struct {
+		name string
+		args map[string]any
+	}{
+		{"context", map[string]any{}},
+		{"continue", map[string]any{}},
+		{"breakpoint", map[string]any{"file": "/tmp/test.go", "line": 1}},
+		{"step", map[string]any{"mode": "over"}},
+		{"stop", map[string]any{}},
+		{"evaluate", map[string]any{"expression": "x"}},
+		{"info", map[string]any{}},
+		{"pause", map[string]any{"threadId": 1}},
+		{"clear-breakpoints", map[string]any{"all": true}},
+	}
+
+	for _, tt := range toolsToTest {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := ts.session.CallTool(ts.ctx, &mcp.CallToolParams{
+				Name:      tt.name,
+				Arguments: tt.args,
+			})
+			// These tools aren't registered before debug starts, so we expect an error
+			if err == nil {
+				t.Errorf("Expected error calling %s before debugger started, got nil", tt.name)
+			} else {
+				t.Logf("Got expected error for %s: %v", tt.name, err)
+			}
+		})
+	}
+}
