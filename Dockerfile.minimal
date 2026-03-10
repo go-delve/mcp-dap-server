@@ -1,0 +1,3 @@
+FROM gcr.io/distroless/static-debian12:nonroot
+COPY mcp-dap-server /usr/local/bin/mcp-dap-server
+ENTRYPOINT ["mcp-dap-server"]
