@@ -118,9 +118,9 @@ signs:
     args:
       - "sign-blob"
       - "--yes"
-      - "${artifact}"
       - "--output-signature=${signature}"
       - "--output-certificate=${certificate}"
+      - "${artifact}"
 
 docker_signs:
   - cmd: cosign
@@ -137,13 +137,13 @@ changelog:
   sort: asc
   groups:
     - title: Features
-      regexp: '^.*?feat(\([[:word:]]+\))??!?:.+$'
+      regexp: '^.*?feat(\(\w+\))??!?:.+$'
       order: 0
     - title: Bug fixes
-      regexp: '^.*?fix(\([[:word:]]+\))??!?:.+$'
+      regexp: '^.*?fix(\(\w+\))??!?:.+$'
       order: 1
     - title: Documentation
-      regexp: '^.*?docs(\([[:word:]]+\))??!?:.+$'
+      regexp: '^.*?docs(\(\w+\))??!?:.+$'
       order: 2
     - title: Other
       order: 999

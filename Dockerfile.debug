@@ -19,9 +19,10 @@ RUN ARCH=$(dpkg --print-architecture) && \
     if [ "$ARCH" = "amd64" ]; then VSIX_ARCH="linux-x64"; \
     elif [ "$ARCH" = "arm64" ]; then VSIX_ARCH="linux-aarch64"; \
     else echo "Unsupported architecture: $ARCH" && exit 1; fi && \
-    LATEST_URL=$(curl -s https://api.github.com/repos/microsoft/vscode-cpptools/releases/latest \
+    LATEST_URL=$(curl -fsSL https://api.github.com/repos/microsoft/vscode-cpptools/releases/latest \
         | grep "browser_download_url.*cpptools-${VSIX_ARCH}.vsix" \
         | head -1 | cut -d '"' -f 4) && \
+    [ -n "$LATEST_URL" ] || { echo "Could not find cpptools download URL for $VSIX_ARCH"; exit 1; } && \
     curl -fSL -o /tmp/cpptools.vsix "$LATEST_URL" && \
     mkdir -p /opt/cpptools && \
     unzip -q /tmp/cpptools.vsix -d /opt/cpptools && \
