@@ -2,3 +2,4 @@ bin/
 .worktrees/
 .serena/
 mcp-dap-server
+dist/

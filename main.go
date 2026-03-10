@@ -10,6 +10,8 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
+var version = "dev"
+
 func main() {
 	// Log only to a file — never to stderr. With MCP stdio transport,
 	// stderr is a pipe to the MCP client. If the pipe buffer fills
@@ -33,7 +35,7 @@ func main() {
 	// Create MCP server
 	implementation := mcp.Implementation{
 		Name:    "mcp-dap-server",
-		Version: "v1.0.0",
+		Version: version,
 	}
 	server := mcp.NewServer(&implementation, nil)
 

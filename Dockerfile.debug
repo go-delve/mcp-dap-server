@@ -1,0 +1,41 @@
+# Stage 1: Install Delve
+FROM golang:1.24-bookworm AS delve-builder
+RUN go install github.com/go-delve/delve/cmd/dlv@latest
+
+# Stage 2: Final image with all debugging tools
+FROM debian:bookworm-slim
+
+# Install GDB and dependencies
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        gdb \
+        curl \
+        ca-certificates \
+        unzip \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install OpenDebugAD7 from cpptools release
+RUN ARCH=$(dpkg --print-architecture) && \
+    if [ "$ARCH" = "amd64" ]; then VSIX_ARCH="linux-x64"; \
+    elif [ "$ARCH" = "arm64" ]; then VSIX_ARCH="linux-aarch64"; \
+    else echo "Unsupported architecture: $ARCH" && exit 1; fi && \
+    LATEST_URL=$(curl -fsSL https://api.github.com/repos/microsoft/vscode-cpptools/releases/latest \
+        | grep "browser_download_url.*cpptools-${VSIX_ARCH}.vsix" \
+        | head -1 | cut -d '"' -f 4) && \
+    [ -n "$LATEST_URL" ] || { echo "Could not find cpptools download URL for $VSIX_ARCH"; exit 1; } && \
+    curl -fSL -o /tmp/cpptools.vsix "$LATEST_URL" && \
+    mkdir -p /opt/cpptools && \
+    unzip -q /tmp/cpptools.vsix -d /opt/cpptools && \
+    chmod +x /opt/cpptools/extension/debugAdapters/bin/OpenDebugAD7 && \
+    rm /tmp/cpptools.vsix
+
+# Copy Delve from builder
+COPY --from=delve-builder /go/bin/dlv /usr/local/bin/dlv
+
+# Copy mcp-dap-server binary (provided by GoReleaser)
+COPY mcp-dap-server /usr/local/bin/mcp-dap-server
+
+# Set cpptools path so mcp-dap-server can find OpenDebugAD7
+ENV MCP_DAP_CPPTOOLS_PATH=/opt/cpptools/extension/debugAdapters/bin/OpenDebugAD7
+
+ENTRYPOINT ["mcp-dap-server"]
