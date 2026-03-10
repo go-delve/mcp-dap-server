@@ -1,0 +1,154 @@
+version: 2
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: mcp-dap-server
+    binary: mcp-dap-server
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    ignore:
+      - goos: windows
+        goarch: arm64
+    ldflags:
+      - -s -w -X main.version={{.Version}}
+
+archives:
+  - id: default
+    formats:
+      - tar.gz
+    format_overrides:
+      - goos: windows
+        formats:
+          - zip
+    files:
+      - LICENSE
+      - README.md
+
+dockers:
+  # Minimal image - amd64
+  - id: minimal-amd64
+    ids: [mcp-dap-server]
+    goos: linux
+    goarch: amd64
+    image_templates:
+      - "ghcr.io/go-delve/mcp-dap-server:{{ .Version }}-amd64"
+    dockerfile: Dockerfile.minimal
+    use: buildx
+    build_flag_templates:
+      - "--platform=linux/amd64"
+
+  # Minimal image - arm64
+  - id: minimal-arm64
+    ids: [mcp-dap-server]
+    goos: linux
+    goarch: arm64
+    image_templates:
+      - "ghcr.io/go-delve/mcp-dap-server:{{ .Version }}-arm64"
+    dockerfile: Dockerfile.minimal
+    use: buildx
+    build_flag_templates:
+      - "--platform=linux/arm64"
+
+  # Debug image - amd64
+  - id: debug-amd64
+    ids: [mcp-dap-server]
+    goos: linux
+    goarch: amd64
+    image_templates:
+      - "ghcr.io/go-delve/mcp-dap-server-debug:{{ .Version }}-amd64"
+    dockerfile: Dockerfile.debug
+    use: buildx
+    build_flag_templates:
+      - "--platform=linux/amd64"
+
+  # Debug image - arm64
+  - id: debug-arm64
+    ids: [mcp-dap-server]
+    goos: linux
+    goarch: arm64
+    image_templates:
+      - "ghcr.io/go-delve/mcp-dap-server-debug:{{ .Version }}-arm64"
+    dockerfile: Dockerfile.debug
+    use: buildx
+    build_flag_templates:
+      - "--platform=linux/arm64"
+
+docker_manifests:
+  # Minimal image manifests
+  - name_template: "ghcr.io/go-delve/mcp-dap-server:{{ .Version }}"
+    image_templates:
+      - "ghcr.io/go-delve/mcp-dap-server:{{ .Version }}-amd64"
+      - "ghcr.io/go-delve/mcp-dap-server:{{ .Version }}-arm64"
+  - name_template: "ghcr.io/go-delve/mcp-dap-server:{{ .Major }}.{{ .Minor }}"
+    image_templates:
+      - "ghcr.io/go-delve/mcp-dap-server:{{ .Version }}-amd64"
+      - "ghcr.io/go-delve/mcp-dap-server:{{ .Version }}-arm64"
+  - name_template: "ghcr.io/go-delve/mcp-dap-server:latest"
+    image_templates:
+      - "ghcr.io/go-delve/mcp-dap-server:{{ .Version }}-amd64"
+      - "ghcr.io/go-delve/mcp-dap-server:{{ .Version }}-arm64"
+
+  # Debug image manifests
+  - name_template: "ghcr.io/go-delve/mcp-dap-server-debug:{{ .Version }}"
+    image_templates:
+      - "ghcr.io/go-delve/mcp-dap-server-debug:{{ .Version }}-amd64"
+      - "ghcr.io/go-delve/mcp-dap-server-debug:{{ .Version }}-arm64"
+  - name_template: "ghcr.io/go-delve/mcp-dap-server-debug:{{ .Major }}.{{ .Minor }}"
+    image_templates:
+      - "ghcr.io/go-delve/mcp-dap-server-debug:{{ .Version }}-amd64"
+      - "ghcr.io/go-delve/mcp-dap-server-debug:{{ .Version }}-arm64"
+  - name_template: "ghcr.io/go-delve/mcp-dap-server-debug:latest"
+    image_templates:
+      - "ghcr.io/go-delve/mcp-dap-server-debug:{{ .Version }}-amd64"
+      - "ghcr.io/go-delve/mcp-dap-server-debug:{{ .Version }}-arm64"
+
+signs:
+  - cmd: cosign
+    artifacts: checksum
+    args:
+      - "sign-blob"
+      - "--yes"
+      - "${artifact}"
+      - "--output-signature=${signature}"
+      - "--output-certificate=${certificate}"
+
+docker_signs:
+  - cmd: cosign
+    artifacts: manifests
+    args:
+      - "sign"
+      - "--yes"
+      - "${artifact}"
+
+checksum:
+  name_template: "checksums.txt"
+
+changelog:
+  sort: asc
+  groups:
+    - title: Features
+      regexp: '^.*?feat(\([[:word:]]+\))??!?:.+$'
+      order: 0
+    - title: Bug fixes
+      regexp: '^.*?fix(\([[:word:]]+\))??!?:.+$'
+      order: 1
+    - title: Documentation
+      regexp: '^.*?docs(\([[:word:]]+\))??!?:.+$'
+      order: 2
+    - title: Other
+      order: 999
+
+release:
+  github:
+    owner: go-delve
+    name: mcp-dap-server
