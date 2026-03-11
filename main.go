@@ -42,6 +42,8 @@ func main() {
 	ds := registerTools(server, logWriter)
 	defer ds.cleanup()
 
+	registerPrompts(server)
+
 	if err := server.Run(context.Background(), mcp.NewStdioTransport()); err != nil {
 		log.Fatalf("server error: %v", err)
 	}
