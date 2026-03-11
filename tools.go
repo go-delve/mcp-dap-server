@@ -98,7 +98,7 @@ func (ds *debuggerSession) registerSessionTools() {
 	// Always-available tools
 	mcp.AddTool(ds.server, &mcp.Tool{
 		Name:        "stop",
-		Description: "End the debugging session completely. Terminates the debuggee and cleans up the debugger process.",
+		Description: "End the debugging session. By default terminates the debuggee. Pass detach=true to detach without killing the process (leaves it running); detach requires adapter support (Delve supports it; GDB via cpptools may not).",
 	}, ds.stop)
 	mcp.AddTool(ds.server, &mcp.Tool{
 		Name: "breakpoint",
@@ -292,7 +292,9 @@ type ClearBreakpointsParams struct {
 }
 
 // StopParams defines parameters for stopping the debug session.
-type StopParams struct{}
+type StopParams struct {
+	Detach bool `json:"detach,omitempty" mcp:"if true, detach from the process without terminating it (leaves the debuggee running); default false terminates the debuggee"`
+}
 
 // clearBreakpoints removes breakpoints.
 func (ds *debuggerSession) clearBreakpoints(ctx context.Context, _ *mcp.ServerSession, params *mcp.CallToolParamsFor[ClearBreakpointsParams]) (*mcp.CallToolResultFor[any], error) {
@@ -640,12 +642,29 @@ func (ds *debuggerSession) disassembleCode(ctx context.Context, _ *mcp.ServerSes
 	}, nil
 }
 
-// stop ends the debugging session completely.
-func (ds *debuggerSession) stop(ctx context.Context, _ *mcp.ServerSession, _ *mcp.CallToolParamsFor[StopParams]) (*mcp.CallToolResultFor[any], error) {
+// stop ends the debugging session.
+// If params.Detach is true, a DAP disconnect request is sent with terminateDebuggee=false
+// so the debuggee keeps running after the adapter disconnects.
+func (ds *debuggerSession) stop(ctx context.Context, _ *mcp.ServerSession, params *mcp.CallToolParamsFor[StopParams]) (*mcp.CallToolResultFor[any], error) {
 	log.Printf("stop")
 	if ds.cmd == nil && ds.client == nil {
 		return &mcp.CallToolResultFor[any]{
 			Content: []mcp.Content{&mcp.TextContent{Text: "No debug session active"}},
+		}, nil
+	}
+
+	if params.Arguments.Detach && ds.client != nil {
+		// Send disconnect with terminateDebuggee=false so the debuggee keeps running.
+		if err := ds.client.DisconnectRequest(false); err != nil {
+			log.Printf("stop: disconnect request failed: %v", err)
+		} else {
+			if err := readAndValidateResponse(ds.client, "disconnect"); err != nil {
+				log.Printf("stop: disconnect response error: %v", err)
+			}
+		}
+		ds.cleanup()
+		return &mcp.CallToolResultFor[any]{
+			Content: []mcp.Content{&mcp.TextContent{Text: "Detached from process (debuggee still running)"}},
 		}, nil
 	}
 

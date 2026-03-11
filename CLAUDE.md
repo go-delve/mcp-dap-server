@@ -13,7 +13,13 @@ This is an MCP (Model Context Protocol) server that bridges MCP clients with DAP
 **main.go**: MCP server initialization
 - Creates the MCP server using the `go-sdk`
 - Registers all debugging tools via `registerTools()`
-- Exposes SSE (Server-Sent Events) transport on port 8080
+- Registers workflow prompts via `registerPrompts()`
+- Exposes stdio transport
+
+**prompts.go**: MCP prompt implementations
+- 4 prompt handlers for guided debugging workflows (source, attach, core dump, binary)
+- Registered via `server.AddPrompt()` — no session state, always available
+- Each prompt returns a `GetPromptResult` with step-by-step tool invocation guidance
 
 **tools.go**: MCP tool implementations (~1200 lines)
 - All MCP tools are methods on `debuggerSession` struct
@@ -199,3 +205,38 @@ func TestSomething(t *testing.T) {
 - `github.com/modelcontextprotocol/go-sdk` - MCP server framework
 - Requires `dlv` (Delve debugger) in `$PATH` for Go debugging
 - Optional: `OpenDebugAD7` (cpptools) for GDB debugging (set `MCP_DAP_CPPTOOLS_PATH` or install ms-vscode.cpptools)
+
+## Workflow Guidance
+
+### MCP Prompts
+
+The server exposes 4 prompts (via `prompts/list` and `prompts/get`) that return guided debugging workflows:
+
+| Prompt | Required Args | Use for |
+|--------|--------------|---------|
+| `debug-source` | `path` | Debugging Go/C/C++ from source |
+| `debug-attach` | `pid` | Attaching to a running process |
+| `debug-core-dump` | `binary_path`, `core_path` | Post-mortem crash analysis |
+| `debug-binary` | `path` | Assembly-level binary debugging |
+
+Prompts are registered in `prompts.go` via `registerPrompts()`, called from `main.go`.
+
+### Claude Code Skills
+
+Four skills live in `skills/` for use with the Claude Code Superpowers plugin:
+
+| Skill file | Trigger |
+|-----------|---------|
+| `debug-source.md` | Debugging from source code |
+| `debug-attach.md` | Attaching to a running process |
+| `debug-core-dump.md` | Analyzing a core dump |
+| `debug-binary.md` | Assembly-level binary debugging |
+
+To register skills with Claude Code, configure the `skills/` directory as a skills source in your Superpowers plugin settings.
+
+### Human Reference
+
+See `docs/debugging-workflows.md` for:
+- Decision table: scenario → mode → which prompt/skill to use
+- Mermaid workflow diagrams for each scenario
+- Common gotchas and patterns per scenario
