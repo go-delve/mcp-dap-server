@@ -223,7 +223,7 @@ Prompts are registered in `prompts.go` via `registerPrompts()`, called from `mai
 
 ### Claude Code Skills
 
-Four skills live in `docs/superpowers/skills/` for use with the Claude Code Superpowers plugin:
+Four skills live in `skills/` for use with the Claude Code Superpowers plugin:
 
 | Skill file | Trigger |
 |-----------|---------|
@@ -232,7 +232,7 @@ Four skills live in `docs/superpowers/skills/` for use with the Claude Code Supe
 | `debug-core-dump.md` | Analyzing a core dump |
 | `debug-binary.md` | Assembly-level binary debugging |
 
-To register skills with Claude Code, configure the `docs/superpowers/skills/` directory as a skills source in your Superpowers plugin settings.
+To register skills with Claude Code, configure the `skills/` directory as a skills source in your Superpowers plugin settings.
 
 ### Human Reference
 

@@ -19,7 +19,7 @@ Before starting, gather:
 ## Important warnings
 
 - Attaching pauses the process. In production, this affects real users.
-- After `stop()`, the target process is **terminated** — plan accordingly.
+- `stop()` terminates the debuggee; use `stop(detach=true)` to leave it running.
 - You may need `sudo` or `ptrace_scope=0` permissions.
 
 ---
@@ -42,17 +42,14 @@ If attach fails:
 
 ### 2. Understand what the process was doing
 
-Immediately call:
-```json
-context()
-```
-
-This shows the state at the moment of pause. Key questions:
+The `debug()` call already returns the initial context at the moment of attach — review it immediately. Key questions:
 - **Where is it?** What function and file?
 - **Why is it there?** Does the stack trace make sense?
 - **What are the local values?** Do they look reasonable?
 
 If the process was in a system call (I/O, sleep, mutex wait), the stack will show that explicitly.
+
+Call `context()` again after resuming (e.g., after `continue()` or `pause()`) to refresh the current state.
 
 ### 3. Check all threads / goroutines
 
@@ -61,14 +58,23 @@ info(kind="threads")
 ```
 
 This is critical for concurrent programs. Look for:
-- Threads blocked on the **same mutex or channel** → potential deadlock
-- **More threads than expected** → goroutine leak
+- Threads blocked on the **same lock or channel** → potential deadlock
+- **More threads than expected** → goroutine/thread leak
 - Threads in **unexpected functions** → processing wrong data or stuck in error path
 
 For each suspicious thread:
 ```json
 context(threadId=<ID>)
 ```
+
+**Go-specific indicators:**
+- `sync.(*Mutex).Lock` or `<-chan` in every goroutine's stack → classic deadlock
+- Many goroutines in `runtime.park` → goroutines blocked on channel/select
+
+**C/C++-specific indicators:**
+- `pthread_mutex_lock` or `futex` in every thread's stack → mutex deadlock
+- Thread in `__GI___poll` or `epoll_wait` → waiting on I/O (usually expected)
+- Thread in `malloc` / `free` with another in `malloc` → heap lock contention
 
 ### 4. Scenario-specific investigation
 
@@ -96,21 +102,29 @@ After attach, all threads should be visible. Look for:
 
 Use `context(threadId=<ID>)` on each blocked thread to see what lock/channel it's waiting on.
 
-**Red flag:** `sync.(*Mutex).Lock` or `<-chan` in every goroutine's stack → classic deadlock.
+**Go red flag:** `sync.(*Mutex).Lock` or `<-chan` in every goroutine's stack → classic deadlock.
+**C/C++ red flag:** `pthread_mutex_lock` stacked below a function that also calls `pthread_mutex_lock` → lock ordering issue.
 
 #### Memory growth / leak
 
-Check sizes of collections:
+**Go — check collection sizes:**
 ```json
 evaluate(expression="len(cache)")
 evaluate(expression="len(connections)")
 evaluate(expression="cap(buffer)")
 ```
 
+**C/C++ — inspect pointer chains and reference counts:**
+```json
+evaluate(expression="list->size")
+evaluate(expression="pool->count")
+evaluate(expression="obj->refcount")
+```
+
 Look for:
-- Maps/slices that grow but never shrink
-- Connection pools that accumulate but don't close
-- Goroutines accumulating in `info(kind="threads")`
+- Collections that grow but never shrink
+- Connection/object pools that accumulate but don't release
+- Goroutines / threads accumulating in `info(kind="threads")`
 
 #### Unexpected behavior / wrong results
 
@@ -141,9 +155,14 @@ State findings clearly:
 > **The process is stuck in** `FunctionName` **at** `file.go:42` **because** `mutex.Lock()` **is blocked waiting for a lock held by goroutine** `threadId=3`.
 > **Root cause:** goroutine 3 is holding lock A while waiting for lock B; goroutine 1 holds lock B while waiting for lock A — circular deadlock.
 
-Then clean up:
+To **terminate** the debuggee:
 ```json
 stop()
+```
+
+To **detach** and leave the process running:
+```json
+stop(detach=true)
 ```
 
 ---

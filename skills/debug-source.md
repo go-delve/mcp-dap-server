@@ -80,16 +80,28 @@ Refresh context at any time:
 context()
 ```
 
-Drill into specific values:
+Drill into specific values. Expression syntax differs by debugger:
+
+**Delve (Go):**
 ```json
 evaluate(expression="user.Address.City")
 evaluate(expression="items[0]")
 evaluate(expression="len(queue)")
 evaluate(expression="err.Error()")
+evaluate(expression="*ptr")
+```
+
+**GDB (C/C++):**
+```json
+evaluate(expression="user->address.city")
+evaluate(expression="items[0]")
+evaluate(expression="*(int*)ptr")
+evaluate(expression="ptr == NULL ? \"nil\" : ptr->name")
+evaluate(expression="(struct Node*)node->next")
 ```
 
 **Decision guide:**
-- Value is nil when it shouldn't be → trace back where it was set
+- Value is nil/NULL when it shouldn't be → trace back where it was set or returned
 - Value is wrong → find where it was assigned incorrectly
 - Value is correct here → the bug is downstream; add a later breakpoint
 
@@ -143,13 +155,35 @@ stop()
 
 ## Common Patterns and Root Causes
 
+### Go (Delve)
+
 | Symptom | Likely cause | What to check |
 |---------|-------------|---------------|
 | `nil` pointer panic | Missing nil check | Where was the pointer created/returned? |
 | Wrong value in calculation | Logic error or uninitialized var | Step through the computation |
 | Function called with wrong args | Caller bug | Step out to the caller, inspect args |
-| Infinite loop | Missing termination condition | Evaluate the loop condition, check iterator |
-| Goroutine deadlock | Lock ordering or missing unlock | Check all goroutines with `info(kind="threads")` |
+| Infinite loop | Missing termination condition | `evaluate(expression="len(slice)")` or loop var |
+| Goroutine deadlock | Lock ordering or missing unlock | `info(kind="threads")`, look for blocked goroutines |
+| Index out of range | Off-by-one or empty slice | `evaluate(expression="len(s)")` before indexing |
+
+### C/C++ (GDB)
+
+| Symptom | Likely cause | What to check |
+|---------|-------------|---------------|
+| Segfault on pointer dereference | NULL pointer or dangling pointer | `evaluate(expression="ptr")` — is it `0x0`? |
+| Segfault in memory function | Heap corruption, buffer overflow | Check array bounds, `malloc`/`free` pairing |
+| Wrong value in struct field | Uninitialized memory or aliasing | `evaluate(expression="*(MyStruct*)ptr")` |
+| Use-after-free | Accessing freed memory | Check ownership; use valgrind/ASAN for confirmation |
+| Stack overflow | Deep recursion, large stack allocs | Look for repeated frames in the stack trace |
+| Infinite loop | Off-by-one in termination condition | `evaluate(expression="i")`, `evaluate(expression="n")` in the loop |
+
+### Rust (GDB)
+
+| Symptom | Likely cause | What to check |
+|---------|-------------|---------------|
+| Panic: unwrap on None/Err | Missing error handling | Check what function returned None/Err |
+| Panic: index out of bounds | Length check missing | `evaluate(expression="v.len")` |
+| Segfault (rare, unsafe code) | Unsafe block bug | Examine unsafe blocks in the call stack |
 
 ## How to present findings
 

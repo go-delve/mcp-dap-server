@@ -130,7 +130,7 @@ step(mode="over")  // step over (skip function call body)
 step(mode="out")   // run until current function returns
 ```
 
-After each step, call `context()` to see the new instruction pointer.
+`step` automatically returns the new location and context — no need to call `context()` separately unless you want to refresh after other operations.
 
 **Track state changes:**
 - Which registers change after each instruction?

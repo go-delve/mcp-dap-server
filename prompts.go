@@ -303,9 +303,10 @@ Common attach scenarios and what to look for:
 
 State your findings: **"The process is [doing X] because [reason]. The issue is [description]."**
 
-Call: `+"`"+`stop()`+"`"+`
+To **terminate** the process: `+"`"+`stop()`+"`"+`
+To **detach** (leave the process running): `+"`"+`stop(detach=true)`+"`"+`
 
-> After stop, the target process is terminated. If you need to detach without killing, that is not currently supported — plan accordingly.
+> Use detach when you want to observe without disrupting the process long-term.
 `,
 		programDesc, pid, pid,
 	)

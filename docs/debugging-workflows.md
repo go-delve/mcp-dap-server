@@ -208,4 +208,4 @@ If using Claude Code with the `mcp-dap-server` skills configured, invoke the app
 - `/debug-core-dump` — post-mortem core dump analysis
 - `/debug-binary` — assembly-level binary debugging
 
-Skills are located in `docs/superpowers/skills/` and provide the same workflow guidance with additional AI-specific decision trees and interpretation hints.
+Skills are located in `skills/` and provide the same workflow guidance with additional AI-specific decision trees and interpretation hints.
