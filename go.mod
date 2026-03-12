@@ -1,6 +1,6 @@
 module github.com/go-delve/mcp-dap-server
 
-go 1.24.4
+go 1.26.1
 
 require (
 	github.com/google/go-dap v0.12.0
