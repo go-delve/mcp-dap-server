@@ -40,7 +40,7 @@ If loading fails:
 - Check paths are absolute and files are readable
 - Confirm binary matches core (same build, not recompiled after crash)
 - For Go: `dlv version` to confirm Delve is installed
-- For C/C++: check cpptools adapter is available (`MCP_DAP_CPPTOOLS_PATH`)
+- For C/C++: check GDB 14+ is installed (`gdb --version`)
 
 ### 2. Get the full picture of the crash
 

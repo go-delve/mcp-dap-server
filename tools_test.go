@@ -231,17 +231,11 @@ func (ts *testSetup) stopDebugger(t *testing.T) {
 	t.Logf("Stop debugger result: %v", stopResult)
 }
 
-// requireGDBDeps skips the test if GDB or the cpptools adapter are not available.
+// requireGDBDeps skips the test if GDB is not available.
 func requireGDBDeps(t *testing.T) {
 	t.Helper()
 	if _, err := exec.LookPath("gdb"); err != nil {
 		t.Skip("gdb not found in PATH")
-	}
-	if _, err := exec.LookPath("OpenDebugAD7"); err != nil {
-		adapterPath := os.Getenv("MCP_DAP_CPPTOOLS_PATH")
-		if adapterPath == "" {
-			t.Skip("OpenDebugAD7 not found in PATH and MCP_DAP_CPPTOOLS_PATH not set")
-		}
 	}
 }
 
@@ -854,21 +848,15 @@ func TestGDBBasic(t *testing.T) {
 	binaryPath, cleanupBinary := compileTestCProgram(t, ts.cwd, "helloworld")
 	defer cleanupBinary()
 
-	adapterPath := "OpenDebugAD7"
-	if p := os.Getenv("MCP_DAP_CPPTOOLS_PATH"); p != "" {
-		adapterPath = p
-	}
-
 	f := filepath.Join(ts.cwd, "testdata", "c", "helloworld", "main.c")
 
 	// Start GDB debug session with breakpoint at line 11 (int sum = add(x, y))
 	result, err := ts.session.CallTool(ts.ctx, &mcp.CallToolParams{
 		Name: "debug",
 		Arguments: map[string]any{
-			"debugger":    "gdb",
-			"adapterPath": adapterPath,
-			"mode":        "binary",
-			"path":        binaryPath,
+			"debugger": "gdb",
+			"mode":     "binary",
+			"path":     binaryPath,
 			"breakpoints": []map[string]any{
 				{"file": f, "line": 11},
 			},
@@ -906,21 +894,15 @@ func TestGDBStep(t *testing.T) {
 	binaryPath, cleanupBinary := compileTestCProgram(t, ts.cwd, "helloworld")
 	defer cleanupBinary()
 
-	adapterPath := "OpenDebugAD7"
-	if p := os.Getenv("MCP_DAP_CPPTOOLS_PATH"); p != "" {
-		adapterPath = p
-	}
-
 	f := filepath.Join(ts.cwd, "testdata", "c", "helloworld", "main.c")
 
 	// Start at line 9 (int x = 10)
 	result, err := ts.session.CallTool(ts.ctx, &mcp.CallToolParams{
 		Name: "debug",
 		Arguments: map[string]any{
-			"debugger":    "gdb",
-			"adapterPath": adapterPath,
-			"mode":        "binary",
-			"path":        binaryPath,
+			"debugger": "gdb",
+			"mode":     "binary",
+			"path":     binaryPath,
 			"breakpoints": []map[string]any{
 				{"file": f, "line": 9},
 			},
@@ -964,20 +946,14 @@ func TestGDBEvaluate(t *testing.T) {
 	binaryPath, cleanupBinary := compileTestCProgram(t, ts.cwd, "helloworld")
 	defer cleanupBinary()
 
-	adapterPath := "OpenDebugAD7"
-	if p := os.Getenv("MCP_DAP_CPPTOOLS_PATH"); p != "" {
-		adapterPath = p
-	}
-
 	// Set breakpoint at line 12 (after x, y, and sum are assigned)
 	f := filepath.Join(ts.cwd, "testdata", "c", "helloworld", "main.c")
 	result, err := ts.session.CallTool(ts.ctx, &mcp.CallToolParams{
 		Name: "debug",
 		Arguments: map[string]any{
-			"debugger":    "gdb",
-			"adapterPath": adapterPath,
-			"mode":        "binary",
-			"path":        binaryPath,
+			"debugger": "gdb",
+			"mode":     "binary",
+			"path":     binaryPath,
 			"breakpoints": []map[string]any{
 				{"file": f, "line": 12},
 			},
@@ -990,11 +966,13 @@ func TestGDBEvaluate(t *testing.T) {
 		t.Fatalf("Debug returned error")
 	}
 
-	// Evaluate x + y
+	// Evaluate x + y using GDB's print command.
+	// GDB's native DAP repl context runs GDB commands, not C expressions,
+	// so we use "print x + y" rather than bare "x + y".
 	evalResult, err := ts.session.CallTool(ts.ctx, &mcp.CallToolParams{
 		Name: "evaluate",
 		Arguments: map[string]any{
-			"expression": "x + y",
+			"expression": "print x + y",
 			"context":    "repl",
 		},
 	})

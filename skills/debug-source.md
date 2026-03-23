@@ -43,7 +43,7 @@ Expected: debugger starts, stops at entry or breakpoint. You receive stack trace
 
 If this fails:
 - Go: check `dlv` is in `$PATH` (`dlv version`)
-- C/C++: check cpptools adapter; compile with `-g -O0`
+- C/C++: check GDB 14+ is installed; compile with `-g -O0`
 - Ensure path is absolute
 
 ### 2. Set strategic breakpoints

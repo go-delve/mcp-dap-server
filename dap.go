@@ -79,7 +79,7 @@ func (c *DAPClient) InitializeRequest(adapterID string) (dap.Capabilities, error
 			}
 			return resp.Body, nil
 		case dap.EventMessage:
-			// Skip events (e.g. OutputEvent from cpptools) and keep reading
+			// Skip events (e.g. OutputEvent) during initialization and keep reading
 			continue
 		default:
 			return dap.Capabilities{}, fmt.Errorf("expected InitializeResponse, got %T", msg)
