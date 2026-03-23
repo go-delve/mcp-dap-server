@@ -191,7 +191,7 @@ Call: `+"`"+`stop()`+"`"+`
 			if debugger == "delve" {
 				return "dlv"
 			}
-			return "OpenDebugAD7 (cpptools)"
+			return "gdb (native DAP)"
 		}(),
 	)
 
@@ -364,7 +364,7 @@ Expected: The debugger loads the core dump and positions at the crash frame. You
 - Ensure the binary matches the core dump exactly (same build, not rebuilt after crash)
 - Check file paths are absolute and readable
 - For Go: ensure Delve is installed (`+"`"+`dlv version`+"`"+`)
-- For C/C++: ensure the cpptools adapter is available
+- For C/C++: ensure GDB 14+ is installed (`+"`"+`gdb -i dap`+"`"+`)
 
 ---
 

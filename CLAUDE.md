@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-This is an MCP (Model Context Protocol) server that bridges MCP clients with DAP (Debug Adapter Protocol) debuggers. It exposes debugging capabilities as MCP tools, allowing AI assistants to programmatically control debuggers. Supports Delve (Go) and GDB (C/C++ via cpptools adapter).
+This is an MCP (Model Context Protocol) server that bridges MCP clients with DAP (Debug Adapter Protocol) debuggers. It exposes debugging capabilities as MCP tools, allowing AI assistants to programmatically control debuggers. Supports Delve (Go) and GDB (C/C++ via native DAP).
 
 ## Architecture
 
@@ -38,7 +38,7 @@ This is an MCP (Model Context Protocol) server that bridges MCP clients with DAP
 **backend.go**: Debugger backend abstraction
 - `DebuggerBackend` interface abstracts debugger-specific behavior (spawning, launch args, transport)
 - `delveBackend`: Spawns `dlv dap`, uses TCP transport
-- `gdbBackend`: Spawns `OpenDebugAD7` (cpptools), uses stdio transport
+- `gdbBackend`: Spawns `gdb -i dap`, uses stdio transport
 
 **flexint.go**: Flexible integer parsing
 - `FlexInt` type handles JSON values that may be integers or string-encoded integers
@@ -171,7 +171,7 @@ func TestSomething(t *testing.T) {
 
 ### Multi-Debugger Support
 - Delve (default): Go programs, TCP transport, spawns `dlv dap`
-- GDB: C/C++ programs, stdio transport, requires `OpenDebugAD7` (cpptools adapter)
+- GDB: C/C++ programs, stdio transport, requires GDB 14+ (native DAP)
 - Backend selection via `debugger` parameter in `debug` tool ("delve" or "gdb")
 
 ### State Management
@@ -204,7 +204,7 @@ func TestSomething(t *testing.T) {
 - `github.com/google/go-dap` - DAP protocol implementation
 - `github.com/modelcontextprotocol/go-sdk` - MCP server framework
 - Requires `dlv` (Delve debugger) in `$PATH` for Go debugging
-- Optional: `OpenDebugAD7` (cpptools) for GDB debugging (set `MCP_DAP_CPPTOOLS_PATH` or install ms-vscode.cpptools)
+- Optional: GDB 14+ for C/C++ debugging (native DAP support via `gdb -i dap`)
 
 ## Workflow Guidance
 
