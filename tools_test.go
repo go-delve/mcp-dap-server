@@ -966,11 +966,13 @@ func TestGDBEvaluate(t *testing.T) {
 		t.Fatalf("Debug returned error")
 	}
 
-	// Evaluate x + y
+	// Evaluate x + y using GDB's print command.
+	// GDB's native DAP repl context runs GDB commands, not C expressions,
+	// so we use "print x + y" rather than bare "x + y".
 	evalResult, err := ts.session.CallTool(ts.ctx, &mcp.CallToolParams{
 		Name: "evaluate",
 		Arguments: map[string]any{
-			"expression": "x + y",
+			"expression": "print x + y",
 			"context":    "repl",
 		},
 	})
