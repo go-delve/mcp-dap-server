@@ -6,9 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"os"
 	"os/exec"
-	"path/filepath"
 	"strings"
 
 	"github.com/google/go-dap"
@@ -45,7 +43,7 @@ Modes: 'source' (compile & debug), 'binary' (debug executable), 'core' (debug co
 
 Debugger selection (via 'debugger' parameter):
 - 'delve' (default): For Go programs only. Requires dlv to be installed.
-- 'gdb': For C/C++/Rust and other compiled languages. Uses the cpptools DAP adapter (OpenDebugAD7), which is auto-detected from VS Code extensions. GDB does not support 'source' mode; compile your program with debug symbols (gcc -g -O0) and use 'binary' mode.
+- 'gdb': For C/C++/Rust and other compiled languages. Requires GDB 14+ with native DAP support (gdb -i dap). GDB does not support 'source' mode; compile your program with debug symbols (gcc -g -O0) and use 'binary' mode.
 
 Choose the debugger based on the language of the program being debugged: use 'delve' for Go, use 'gdb' for C/C++/Rust.`
 
@@ -98,7 +96,7 @@ func (ds *debuggerSession) registerSessionTools() {
 	// Always-available tools
 	mcp.AddTool(ds.server, &mcp.Tool{
 		Name:        "stop",
-		Description: "End the debugging session. By default terminates the debuggee. Pass detach=true to detach without killing the process (leaves it running); detach requires adapter support (Delve supports it; GDB via cpptools may not).",
+		Description: "End the debugging session. By default terminates the debuggee. Pass detach=true to detach without killing the process (leaves it running); detach requires adapter support.",
 	}, ds.stop)
 	mcp.AddTool(ds.server, &mcp.Tool{
 		Name: "breakpoint",
@@ -208,8 +206,8 @@ type DebugParams struct {
 	Breakpoints  []BreakpointSpec `json:"breakpoints,omitempty" mcp:"initial breakpoints"`
 	StopOnEntry  bool             `json:"stopOnEntry,omitempty" mcp:"stop at program entry instead of running to first breakpoint"`
 	Port         string           `json:"port,omitempty" mcp:"port for DAP server (default: auto-assigned)"`
-	Debugger     string           `json:"debugger,omitempty" mcp:"debugger to use: 'delve' (default) or 'gdb'"`
-	AdapterPath  string           `json:"adapterPath,omitempty" mcp:"path to DAP adapter binary (for gdb: path to OpenDebugAD7; auto-detected from VS Code extensions, falls back to MCP_DAP_CPPTOOLS_PATH env var)"`
+	Debugger string `json:"debugger,omitempty" mcp:"debugger to use: 'delve' (default) or 'gdb'"`
+	GDBPath  string `json:"gdbPath,omitempty" mcp:"path to gdb binary (default: auto-detected from PATH). Requires GDB 14+."`
 }
 
 // ContextParams defines the parameters for getting debugging context.
@@ -750,17 +748,15 @@ func (ds *debuggerSession) debug(ctx context.Context, _ *mcp.ServerSession, para
 	case "delve":
 		ds.backend = &delveBackend{}
 	case "gdb":
-		adapterPath := params.Arguments.AdapterPath
-		if adapterPath == "" {
-			adapterPath = os.Getenv("MCP_DAP_CPPTOOLS_PATH")
+		gdbPath := params.Arguments.GDBPath
+		if gdbPath == "" {
+			var err error
+			gdbPath, err = exec.LookPath("gdb")
+			if err != nil {
+				return nil, fmt.Errorf("GDB not found in PATH. Install GDB 14+ or set the gdbPath parameter")
+			}
 		}
-		if adapterPath == "" {
-			adapterPath = findCpptoolsAdapter()
-		}
-		if adapterPath == "" {
-			return nil, fmt.Errorf("GDB debugging requires the cpptools DAP adapter (OpenDebugAD7). Set the adapterPath parameter or MCP_DAP_CPPTOOLS_PATH environment variable, or install the ms-vscode.cpptools VS Code extension")
-		}
-		ds.backend = &gdbBackend{gdbPath: adapterPath}
+		ds.backend = &gdbBackend{gdbPath: gdbPath}
 	default:
 		return nil, fmt.Errorf("unsupported debugger: %s (must be 'delve' or 'gdb')", debugger)
 	}
@@ -840,8 +836,8 @@ func (ds *debuggerSession) debug(ctx context.Context, _ *mcp.ServerSession, para
 	//
 	// Delve: launch response arrives immediately, then initialized event.
 	//
-	// cpptools: may send an "initialized" event and defer the launch response
-	// until after configurationDone, or may send launch response first.
+	// GDB native DAP: may send an "initialized" event before or after the
+	// launch response.
 	//
 	// We unify both by reading messages until we see the initialized event,
 	// noting whether the launch response has also arrived.
@@ -890,7 +886,7 @@ func (ds *debuggerSession) debug(ctx context.Context, _ *mcp.ServerSession, para
 		return nil, err
 	}
 
-	// For adapters that defer the launch response (cpptools with RunInTerminal),
+	// For adapters that defer the launch response,
 	// read the deferred launch response now.
 	if !launchResponseReceived {
 		if err := readAndValidateResponse(ds.client, "unable to start debug session"); err != nil {
@@ -928,8 +924,8 @@ func (ds *debuggerSession) debug(ctx context.Context, _ *mcp.ServerSession, para
 	// Delve: stops at entry point first (reason="entry"), then requires
 	// ContinueRequest to proceed to the breakpoint.
 	//
-	// cpptools: with stopAtEntry=false, runs directly to breakpoint without
-	// stopping at entry first.
+	// GDB native DAP: with stopAtEntry=false, may run directly to breakpoint
+	// without stopping at entry first.
 	//
 	// We handle both by reading the first StoppedEvent. If it's an entry stop,
 	// we send ContinueRequest and wait for the next stop.
@@ -1208,37 +1204,4 @@ func (ds *debuggerSession) breakpoint(ctx context.Context, _ *mcp.ServerSession,
 	return &mcp.CallToolResultFor[any]{
 		Content: []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf("Breakpoint %d set at %s:%d", bp.Id, params.Arguments.File, bp.Line)}},
 	}, nil
-}
-
-// findCpptoolsAdapter searches common locations for the cpptools DAP adapter
-// (OpenDebugAD7). Returns the path if found, empty string otherwise.
-func findCpptoolsAdapter() string {
-	// Check PATH first
-	if p, err := exec.LookPath("OpenDebugAD7"); err == nil {
-		return p
-	}
-
-	// Search VS Code extension directories
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return ""
-	}
-
-	extensionDirs := []string{
-		filepath.Join(home, ".vscode", "extensions"),
-		filepath.Join(home, ".vscode-server", "extensions"),
-		filepath.Join(home, ".cursor", "extensions"),
-	}
-
-	for _, extDir := range extensionDirs {
-		pattern := filepath.Join(extDir, "ms-vscode.cpptools-*", "debugAdapters", "bin", "OpenDebugAD7")
-		matches, err := filepath.Glob(pattern)
-		if err != nil || len(matches) == 0 {
-			continue
-		}
-		// Return the last match (highest version due to lexicographic sort)
-		return matches[len(matches)-1]
-	}
-
-	return ""
 }
