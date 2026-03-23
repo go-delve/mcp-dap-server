@@ -116,7 +116,7 @@ func TestDelveBackendAttachArgs(t *testing.T) {
 }
 
 func TestGDBBackendLaunchArgs(t *testing.T) {
-	backend := &gdbBackend{adapterPath: "OpenDebugAD7"}
+	backend := &gdbBackend{gdbPath: "gdb"}
 
 	args, err := backend.LaunchArgs("binary", "/path/to/prog", false, []string{"--flag"})
 	if err != nil {
@@ -135,7 +135,7 @@ func TestGDBBackendLaunchArgs(t *testing.T) {
 }
 
 func TestGDBBackendSourceModeError(t *testing.T) {
-	backend := &gdbBackend{adapterPath: "OpenDebugAD7"}
+	backend := &gdbBackend{gdbPath: "gdb"}
 
 	_, err := backend.LaunchArgs("source", "/path/to/prog", false, nil)
 	if err == nil {
@@ -147,7 +147,7 @@ func TestGDBBackendSourceModeError(t *testing.T) {
 }
 
 func TestGDBBackendTransportMode(t *testing.T) {
-	backend := &gdbBackend{adapterPath: "OpenDebugAD7"}
+	backend := &gdbBackend{gdbPath: "gdb"}
 	if backend.TransportMode() != "stdio" {
 		t.Errorf("expected stdio, got: %s", backend.TransportMode())
 	}

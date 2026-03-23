@@ -760,7 +760,7 @@ func (ds *debuggerSession) debug(ctx context.Context, _ *mcp.ServerSession, para
 		if adapterPath == "" {
 			return nil, fmt.Errorf("GDB debugging requires the cpptools DAP adapter (OpenDebugAD7). Set the adapterPath parameter or MCP_DAP_CPPTOOLS_PATH environment variable, or install the ms-vscode.cpptools VS Code extension")
 		}
-		ds.backend = &gdbBackend{adapterPath: adapterPath}
+		ds.backend = &gdbBackend{gdbPath: adapterPath}
 	default:
 		return nil, fmt.Errorf("unsupported debugger: %s (must be 'delve' or 'gdb')", debugger)
 	}

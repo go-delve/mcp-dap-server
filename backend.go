@@ -11,12 +11,12 @@ import (
 
 // DebuggerBackend abstracts the debugger-specific logic for spawning a DAP
 // server and building the launch/attach argument maps. Each supported debugger
-// (Delve, GDB via OpenDebugAD7, etc.) implements this interface.
+// (Delve, GDB via native DAP, etc.) implements this interface.
 type DebuggerBackend interface {
 	// Spawn starts the DAP server process. The stderrWriter receives the
 	// adapter's stderr output (typically a log file); pass io.Discard to suppress.
 	// For TCP-based backends (Delve), returns the listen address.
-	// For stdio-based backends (cpptools), returns empty string (use process pipes).
+	// For stdio-based backends (GDB native DAP), returns empty string (use process pipes).
 	Spawn(port string, stderrWriter io.Writer) (cmd *exec.Cmd, listenAddr string, err error)
 
 	// TransportMode returns "tcp" or "stdio" indicating how to connect.
@@ -137,21 +137,23 @@ func (b *delveBackend) AttachArgs(processID int) (map[string]any, error) {
 	}, nil
 }
 
-// gdbBackend implements DebuggerBackend for GDB via the cpptools DAP adapter
-// (OpenDebugAD7). It communicates over stdio rather than TCP.
+// gdbBackend implements DebuggerBackend for GDB's native DAP server.
+// Requires GDB 14+. Communicates over stdio.
 type gdbBackend struct {
-	adapterPath string
-	stdin       io.WriteCloser
-	stdout      io.ReadCloser
+	gdbPath string // path to gdb binary (default: "gdb")
+	stdin   io.WriteCloser
+	stdout  io.ReadCloser
 }
 
-// Spawn starts the cpptools DAP adapter (OpenDebugAD7) over stdio.
+// Spawn starts GDB in native DAP mode over stdio.
 // Unlike TCP-based backends, there is no listen address; the process
 // communicates via stdin/stdout pipes.
 func (g *gdbBackend) Spawn(port string, stderrWriter io.Writer) (*exec.Cmd, string, error) {
-	cmd := exec.Command(g.adapterPath)
-	// Send adapter stderr to the provided writer, never to os.Stderr.
-	// With MCP stdio transport, os.Stderr is a pipe that can fill and block.
+	gdbPath := g.gdbPath
+	if gdbPath == "" {
+		gdbPath = "gdb"
+	}
+	cmd := exec.Command(gdbPath, "-i", "dap")
 	cmd.Stderr = stderrWriter
 
 	stdin, err := cmd.StdinPipe()
@@ -167,22 +169,22 @@ func (g *gdbBackend) Spawn(port string, stderrWriter io.Writer) (*exec.Cmd, stri
 	g.stdout = stdout
 
 	if err := cmd.Start(); err != nil {
-		return nil, "", fmt.Errorf("failed to start cpptools adapter: %w", err)
+		return nil, "", fmt.Errorf("failed to start gdb: %w (is GDB 14+ installed?)", err)
 	}
 
 	// stdio transport — no listen address
 	return cmd, "", nil
 }
 
-// TransportMode returns "stdio" because the cpptools adapter communicates
+// TransportMode returns "stdio" because GDB's native DAP server communicates
 // over process stdin/stdout.
 func (g *gdbBackend) TransportMode() string {
 	return "stdio"
 }
 
-// AdapterID returns "cppdbg" for the cpptools debug adapter.
+// AdapterID returns "gdb" for the native GDB DAP server.
 func (g *gdbBackend) AdapterID() string {
-	return "cppdbg"
+	return "gdb"
 }
 
 // StdioPipes returns the captured stdout and stdin pipes from Spawn.
@@ -191,7 +193,7 @@ func (g *gdbBackend) StdioPipes() (stdout io.ReadCloser, stdin io.WriteCloser) {
 	return g.stdout, g.stdin
 }
 
-// LaunchArgs builds the cpptools-specific argument map for a DAP LaunchRequest.
+// LaunchArgs builds the GDB native DAP argument map for a DAP LaunchRequest.
 // GDB does not support "source" mode; programs must be pre-compiled with
 // debug symbols (gcc -g -O0) and launched in "binary" mode.
 func (g *gdbBackend) LaunchArgs(mode, programPath string, stopOnEntry bool, programArgs []string) (map[string]any, error) {
@@ -201,11 +203,9 @@ func (g *gdbBackend) LaunchArgs(mode, programPath string, stopOnEntry bool, prog
 
 	cwd, _ := os.Getwd()
 	args := map[string]any{
-		"program":        programPath,
-		"MIMode":         "gdb",
-		"miDebuggerPath": "gdb",
-		"cwd":            cwd,
-		"stopAtEntry":    stopOnEntry,
+		"program":     programPath,
+		"cwd":         cwd,
+		"stopAtEntry": stopOnEntry,
 	}
 	if len(programArgs) > 0 {
 		args["args"] = programArgs
@@ -213,22 +213,17 @@ func (g *gdbBackend) LaunchArgs(mode, programPath string, stopOnEntry bool, prog
 	return args, nil
 }
 
-// CoreArgs builds the cpptools-specific argument map for core dump debugging.
+// CoreArgs builds the GDB native DAP argument map for core dump debugging.
 func (g *gdbBackend) CoreArgs(programPath, coreFilePath string) (map[string]any, error) {
-	cwd, _ := os.Getwd()
 	return map[string]any{
-		"program":      programPath,
-		"coreDumpPath": coreFilePath,
-		"MIMode":       "gdb",
-		"cwd":          cwd,
+		"program":  programPath,
+		"coreFile": coreFilePath,
 	}, nil
 }
 
-// AttachArgs builds the cpptools-specific argument map for attaching to a process.
+// AttachArgs builds the GDB native DAP argument map for attaching to a process.
 func (g *gdbBackend) AttachArgs(processID int) (map[string]any, error) {
 	return map[string]any{
-		"processId":      processID,
-		"MIMode":         "gdb",
-		"miDebuggerPath": "gdb",
+		"pid": processID,
 	}, nil
 }
