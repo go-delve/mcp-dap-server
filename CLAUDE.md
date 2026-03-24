@@ -62,7 +62,7 @@ This is an MCP (Model Context Protocol) server that bridges MCP clients with DAP
 4. **Error Propagation**: DAP response `Success` field is checked; error messages from `response.Message` are wrapped in Go errors
 5. **Capability-Gated Tools**: `set-variable`, `disassemble`, and `restart` are only registered when the DAP adapter reports support
 6. **Dynamic Tool Registration**: Only `debug` is registered initially; session tools replace it after a session starts, then are removed when the session stops
-7. **Single-Reader Architecture**: Only one goroutine reads from the DAP connection at a time — concurrent tool calls that both read DAP messages will race
+7. **Serialized DAP Access**: A mutex on `debuggerSession` serializes all tool calls, preventing concurrent reads from the single DAP connection
 
 ## Development Commands
 
@@ -195,7 +195,7 @@ func TestSomething(t *testing.T) {
 2. **Frame IDs vs Thread IDs**: Frame IDs come from stack traces, thread IDs from the threads request. Delve uses frame IDs starting at 1000.
 3. **Variables References**: The `variablesReference` in scopes/variables is a DAP protocol identifier, not a simple index. Delve uses frame_id+1 for locals scope (e.g., 1001 for frame 1000).
 4. **Stopped Event Format**: Contains `Reason` field ("breakpoint", "function breakpoint", "step", "entry", "pause", etc.) and `ThreadId`
-5. **Concurrent DAP Reads**: The DAP client has a single reader — concurrent tool calls that both read from the DAP connection will race. This limits features like concurrent continue + pause.
+5. **Serialized Tool Calls**: All tool calls are serialized by a mutex. Concurrent MCP tool calls will queue rather than race. Long-running operations (continue, step) hold the lock until completion.
 6. **Capability-Gated Tools**: `set-variable`, `disassemble`, and `restart` are only available when the DAP adapter reports support via capabilities
 7. **Test Binary Paths**: Must be absolute paths for the `debug` tool in binary mode
 
