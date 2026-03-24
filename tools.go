@@ -25,7 +25,7 @@ type debuggerSession struct {
 	programArgs     []string         // command line arguments
 	coreFilePath    string           // path to core dump file (core mode only)
 	stoppedThreadID int              // thread ID from last StoppedEvent (for adapters that use non-sequential IDs)
-	lastFrameID     int              // frame ID from last getFullContext (for adapters that use non-zero frame IDs)
+	lastFrameID     int              // frame ID from last getFullContext; -1 means not set (0 is valid for GDB)
 }
 
 // defaultThreadID returns the thread ID to use when none is specified.
@@ -50,7 +50,7 @@ Choose the debugger based on the language of the program being debugged: use 'de
 // registerTools registers the debugger tools with the MCP server.
 // logWriter is used to redirect adapter stderr output; pass io.Discard to suppress.
 func registerTools(server *mcp.Server, logWriter io.Writer) *debuggerSession {
-	ds := &debuggerSession{server: server, logWriter: logWriter}
+	ds := &debuggerSession{server: server, logWriter: logWriter, lastFrameID: -1}
 
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "debug",
@@ -411,27 +411,29 @@ func (ds *debuggerSession) pauseExecution(ctx context.Context, _ *mcp.ServerSess
 
 // EvaluateParams defines the parameters for evaluating an expression.
 type EvaluateParams struct {
-	Expression string  `json:"expression" mcp:"expression to evaluate"`
-	FrameID    FlexInt `json:"frameId,omitempty" mcp:"stack frame ID for evaluation context (default: current frame)"`
-	Context    string  `json:"context,omitempty" mcp:"context for evaluation: watch, repl, hover (default: repl)"`
+	Expression string   `json:"expression" mcp:"expression to evaluate"`
+	FrameID    *FlexInt `json:"frameId,omitempty" mcp:"stack frame ID for evaluation context (default: current frame)"`
+	Context    string   `json:"context,omitempty" mcp:"context for evaluation: watch, repl, hover (default: watch)"`
 }
 
 // evaluateExpression evaluates an expression in the context of a stack frame.
 func (ds *debuggerSession) evaluateExpression(ctx context.Context, _ *mcp.ServerSession, params *mcp.CallToolParamsFor[EvaluateParams]) (*mcp.CallToolResultFor[any], error) {
-	log.Printf("evaluate: expression=%q frameID=%d", params.Arguments.Expression, params.Arguments.FrameID.Int())
 	if ds.client == nil {
 		return nil, fmt.Errorf("debugger not started")
 	}
 
 	evalContext := params.Arguments.Context
 	if evalContext == "" {
-		evalContext = "repl"
+		evalContext = "watch"
 	}
 
-	frameID := params.Arguments.FrameID.Int()
-	if frameID == 0 && ds.lastFrameID != 0 {
+	var frameID int
+	if params.Arguments.FrameID != nil {
+		frameID = params.Arguments.FrameID.Int()
+	} else if ds.lastFrameID >= 0 {
 		frameID = ds.lastFrameID
 	}
+	log.Printf("evaluate: expression=%q frameID=%d context=%q", params.Arguments.Expression, frameID, evalContext)
 
 	if err := ds.client.EvaluateRequest(params.Arguments.Expression, frameID, evalContext); err != nil {
 		return nil, err
@@ -697,7 +699,7 @@ func (ds *debuggerSession) cleanup() {
 	ds.coreFilePath = ""
 	ds.capabilities = dap.Capabilities{}
 	ds.stoppedThreadID = 0
-	ds.lastFrameID = 0
+	ds.lastFrameID = -1
 	ds.unregisterSessionTools()
 }
 

@@ -236,12 +236,24 @@ func (c *DAPClient) VariablesRequest(variablesReference int) error {
 }
 
 // EvaluateRequest sends an 'evaluate' request.
+// We build the arguments as raw JSON instead of using dap.EvaluateArguments
+// because go-dap uses omitempty on FrameId, which drops frameId=0 from the
+// wire. GDB's native DAP uses 0-based frame IDs, so omitting frameId=0
+// causes evaluation in global scope where local variables aren't visible.
 func (c *DAPClient) EvaluateRequest(expression string, frameID int, context string) error {
-	request := &dap.EvaluateRequest{Request: *c.newRequest("evaluate")}
-	request.Arguments.Expression = expression
-	request.Arguments.FrameId = frameID
-	request.Arguments.Context = context
-	return c.send(request)
+	req := c.newRequest("evaluate")
+	args := map[string]any{
+		"expression": expression,
+		"frameId":    frameID,
+	}
+	if context != "" {
+		args["context"] = context
+	}
+	msg := struct {
+		dap.Request
+		Arguments map[string]any `json:"arguments"`
+	}{Request: *req, Arguments: args}
+	return dap.WriteProtocolMessage(c.rwc, &msg)
 }
 
 // DisconnectRequest sends a 'disconnect' request.

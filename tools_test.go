@@ -997,6 +997,90 @@ func TestGDBEvaluate(t *testing.T) {
 	ts.stopDebugger(t)
 }
 
+// TestGDBEvaluateWatchContext verifies that expression evaluation uses "watch"
+// context by default, so that C expressions (pointer dereference, register
+// access, casts) are evaluated correctly by GDB's native DAP server.
+// This is a regression test for the bug where the default "repl" context
+// caused GDB to interpret expressions as GDB commands, producing
+// "Undefined command" errors.
+func TestGDBEvaluateWatchContext(t *testing.T) {
+	requireGDBDeps(t)
+
+	ts := setupMCPServerAndClient(t)
+	defer ts.cleanup()
+
+	binaryPath, cleanupBinary := compileTestCProgram(t, ts.cwd, "helloworld")
+	defer cleanupBinary()
+
+	f := filepath.Join(ts.cwd, "testdata", "c", "helloworld", "main.c")
+	result, err := ts.session.CallTool(ts.ctx, &mcp.CallToolParams{
+		Name: "debug",
+		Arguments: map[string]any{
+			"debugger": "gdb",
+			"mode":     "binary",
+			"path":     binaryPath,
+			"breakpoints": []map[string]any{
+				{"file": f, "line": 12},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Failed to start: %v", err)
+	}
+	if result.IsError {
+		t.Fatalf("Debug returned error")
+	}
+
+	tests := []struct {
+		name       string
+		expression string
+		wantSubstr string
+	}{
+		{
+			name:       "bare expression (default watch context)",
+			expression: "x + y",
+			wantSubstr: "30",
+		},
+		{
+			name:       "pointer dereference",
+			expression: "*(&x)",
+			wantSubstr: "10",
+		},
+		{
+			name:       "address-of operator",
+			expression: "&x",
+			wantSubstr: "0x",
+		},
+		{
+			name:       "cast expression",
+			expression: "(long)x",
+			wantSubstr: "10",
+		},
+		{
+			name:       "register access",
+			expression: "$rsp",
+			wantSubstr: "0x",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			text, isErr := ts.callTool(t, "evaluate", map[string]any{
+				"expression": tc.expression,
+			})
+			if isErr {
+				t.Fatalf("evaluate %q returned error: %s", tc.expression, text)
+			}
+			if !strings.Contains(text, tc.wantSubstr) {
+				t.Errorf("evaluate %q: expected result to contain %q, got: %s", tc.expression, tc.wantSubstr, text)
+			}
+			t.Logf("evaluate %q = %s", tc.expression, text)
+		})
+	}
+
+	ts.stopDebugger(t)
+}
+
 // callTool is a test helper that calls an MCP tool and returns the text content.
 // It fatals on transport errors and returns (text, isError) for tool-level results.
 func (ts *testSetup) callTool(t *testing.T, name string, args map[string]any) (string, bool) {
