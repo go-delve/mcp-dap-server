@@ -930,7 +930,7 @@ func (ds *debuggerSession) debug(ctx context.Context, _ *mcp.ServerSession, para
 	// Delve: stops at entry point first (reason="entry"), then requires
 	// ContinueRequest to proceed to the breakpoint.
 	//
-	// GDB native DAP: with stopAtEntry=false, may run directly to breakpoint
+	// GDB native DAP: with stopAtBeginningOfMainSubprogram=false, may run directly to breakpoint
 	// without stopping at entry first.
 	//
 	// We handle both by reading the first StoppedEvent. If it's an entry stop,

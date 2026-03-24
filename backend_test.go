@@ -126,8 +126,8 @@ func TestGDBBackendLaunchArgs(t *testing.T) {
 	if args["program"] != "/path/to/prog" {
 		t.Errorf("expected program=/path/to/prog, got: %v", args["program"])
 	}
-	if args["stopAtEntry"] != false {
-		t.Errorf("expected stopAtEntry=false, got: %v", args["stopAtEntry"])
+	if args["stopAtBeginningOfMainSubprogram"] != false {
+		t.Errorf("expected stopAtBeginningOfMainSubprogram=false, got: %v", args["stopAtBeginningOfMainSubprogram"])
 	}
 	if _, ok := args["cwd"]; !ok {
 		t.Error("expected cwd to be set")
