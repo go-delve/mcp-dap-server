@@ -8,12 +8,14 @@ import (
 	"log"
 	"os/exec"
 	"strings"
+	"sync"
 
 	"github.com/google/go-dap"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
 type debuggerSession struct {
+	mu              sync.Mutex       // serializes DAP requests to prevent concurrent read races
 	cmd             *exec.Cmd
 	client          *DAPClient
 	server          *mcp.Server      // MCP server for dynamic tool registration
@@ -300,6 +302,8 @@ type StopParams struct {
 
 // clearBreakpoints removes breakpoints.
 func (ds *debuggerSession) clearBreakpoints(ctx context.Context, _ *mcp.ServerSession, params *mcp.CallToolParamsFor[ClearBreakpointsParams]) (*mcp.CallToolResultFor[any], error) {
+	ds.mu.Lock()
+	defer ds.mu.Unlock()
 	if ds.client == nil {
 		return nil, fmt.Errorf("debugger not started")
 	}
@@ -341,6 +345,8 @@ type ContinueParams struct {
 
 // continueExecution continues execution and returns full context when stopped.
 func (ds *debuggerSession) continueExecution(ctx context.Context, _ *mcp.ServerSession, params *mcp.CallToolParamsFor[ContinueParams]) (*mcp.CallToolResultFor[any], error) {
+	ds.mu.Lock()
+	defer ds.mu.Unlock()
 	if ds.client == nil {
 		return nil, fmt.Errorf("debugger not started")
 	}
@@ -398,6 +404,8 @@ type PauseParams struct {
 
 // pauseExecution pauses execution of a thread.
 func (ds *debuggerSession) pauseExecution(ctx context.Context, _ *mcp.ServerSession, params *mcp.CallToolParamsFor[PauseParams]) (*mcp.CallToolResultFor[any], error) {
+	ds.mu.Lock()
+	defer ds.mu.Unlock()
 	if ds.client == nil {
 		return nil, fmt.Errorf("debugger not started")
 	}
@@ -422,6 +430,8 @@ type EvaluateParams struct {
 
 // evaluateExpression evaluates an expression in the context of a stack frame.
 func (ds *debuggerSession) evaluateExpression(ctx context.Context, _ *mcp.ServerSession, params *mcp.CallToolParamsFor[EvaluateParams]) (*mcp.CallToolResultFor[any], error) {
+	ds.mu.Lock()
+	defer ds.mu.Unlock()
 	if ds.client == nil {
 		return nil, fmt.Errorf("debugger not started")
 	}
@@ -484,6 +494,8 @@ type SetVariableParams struct {
 
 // setVariable sets the value of a variable in the debugged program.
 func (ds *debuggerSession) setVariable(ctx context.Context, _ *mcp.ServerSession, params *mcp.CallToolParamsFor[SetVariableParams]) (*mcp.CallToolResultFor[any], error) {
+	ds.mu.Lock()
+	defer ds.mu.Unlock()
 	if ds.client == nil {
 		return nil, fmt.Errorf("debugger not started")
 	}
@@ -505,6 +517,8 @@ type RestartParams struct {
 
 // restartDebugger restarts the debugging session.
 func (ds *debuggerSession) restartDebugger(ctx context.Context, _ *mcp.ServerSession, params *mcp.CallToolParamsFor[RestartParams]) (*mcp.CallToolResultFor[any], error) {
+	ds.mu.Lock()
+	defer ds.mu.Unlock()
 	if ds.client == nil {
 		return nil, fmt.Errorf("debugger not started")
 	}
@@ -530,6 +544,8 @@ func (ds *debuggerSession) restartDebugger(ctx context.Context, _ *mcp.ServerSes
 
 // info returns program metadata.
 func (ds *debuggerSession) info(ctx context.Context, _ *mcp.ServerSession, params *mcp.CallToolParamsFor[InfoParams]) (*mcp.CallToolResultFor[any], error) {
+	ds.mu.Lock()
+	defer ds.mu.Unlock()
 	if ds.client == nil {
 		return nil, fmt.Errorf("debugger not started")
 	}
@@ -615,6 +631,8 @@ type DisassembleParams struct {
 
 // disassembleCode disassembles code at a memory reference.
 func (ds *debuggerSession) disassembleCode(ctx context.Context, _ *mcp.ServerSession, params *mcp.CallToolParamsFor[DisassembleParams]) (*mcp.CallToolResultFor[any], error) {
+	ds.mu.Lock()
+	defer ds.mu.Unlock()
 	log.Printf("disassemble: address=%s offset=%d", params.Arguments.Address, params.Arguments.Offset.Int())
 	if ds.client == nil {
 		return nil, fmt.Errorf("debugger not started")
@@ -650,6 +668,8 @@ func (ds *debuggerSession) disassembleCode(ctx context.Context, _ *mcp.ServerSes
 // If params.Detach is true, a DAP disconnect request is sent with terminateDebuggee=false
 // so the debuggee keeps running after the adapter disconnects.
 func (ds *debuggerSession) stop(ctx context.Context, _ *mcp.ServerSession, params *mcp.CallToolParamsFor[StopParams]) (*mcp.CallToolResultFor[any], error) {
+	ds.mu.Lock()
+	defer ds.mu.Unlock()
 	log.Printf("stop")
 	if ds.cmd == nil && ds.client == nil {
 		return &mcp.CallToolResultFor[any]{
@@ -710,6 +730,8 @@ func (ds *debuggerSession) cleanup() {
 // debug starts a complete debugging session.
 // It starts the debugger, loads the program, sets initial breakpoints, and runs to the first breakpoint.
 func (ds *debuggerSession) debug(ctx context.Context, _ *mcp.ServerSession, params *mcp.CallToolParamsFor[DebugParams]) (*mcp.CallToolResultFor[any], error) {
+	ds.mu.Lock()
+	defer ds.mu.Unlock()
 	// Clean up any existing session before starting a new one
 	ds.cleanup()
 
@@ -975,6 +997,8 @@ func (ds *debuggerSession) debug(ctx context.Context, _ *mcp.ServerSession, para
 
 // context returns the full debugging context at the current location.
 func (ds *debuggerSession) context(ctx context.Context, _ *mcp.ServerSession, params *mcp.CallToolParamsFor[ContextParams]) (*mcp.CallToolResultFor[any], error) {
+	ds.mu.Lock()
+	defer ds.mu.Unlock()
 	threadID := params.Arguments.ThreadID.Int()
 	if threadID == 0 {
 		threadID = ds.defaultThreadID()
@@ -1018,6 +1042,8 @@ func (ds *debuggerSession) getThreadList() string {
 
 // step executes a step command and returns the full context at the new location.
 func (ds *debuggerSession) step(ctx context.Context, _ *mcp.ServerSession, params *mcp.CallToolParamsFor[StepParams]) (*mcp.CallToolResultFor[any], error) {
+	ds.mu.Lock()
+	defer ds.mu.Unlock()
 	if ds.client == nil {
 		return nil, fmt.Errorf("debugger not started")
 	}
@@ -1172,6 +1198,8 @@ func (ds *debuggerSession) writeScopesAndVariables(result *strings.Builder, fram
 
 // breakpoint sets a breakpoint at the specified location.
 func (ds *debuggerSession) breakpoint(ctx context.Context, _ *mcp.ServerSession, params *mcp.CallToolParamsFor[BreakpointToolParams]) (*mcp.CallToolResultFor[any], error) {
+	ds.mu.Lock()
+	defer ds.mu.Unlock()
 	if ds.client == nil {
 		return nil, fmt.Errorf("debugger not started")
 	}
