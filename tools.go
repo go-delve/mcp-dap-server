@@ -136,7 +136,11 @@ Call with {} (no arguments) to use the current thread and top frame. Only three 
 		Name: "evaluate",
 		Description: `Evaluate an expression in the debugged program's context. Returns the result value and type. All parameters except 'expression' are optional.
 
-Examples: {"expression": "len(items)"}, {"expression": "user.Name"}, {"expression": "x + y"}`,
+The default context is 'watch', which evaluates language expressions (C, C++, Go). Use valid language syntax, not debugger commands.
+
+Examples: {"expression": "x + y"}, {"expression": "*ptr"}, {"expression": "$rsp"}, {"expression": "(int)value"}
+
+For GDB commands (e.g. print/x), use context 'repl': {"expression": "print/x var", "context": "repl"}`,
 	}, ds.evaluateExpression)
 
 	// Info tool with dynamic description based on adapter capabilities
