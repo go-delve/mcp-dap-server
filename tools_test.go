@@ -1084,7 +1084,7 @@ func TestGDBEvaluateWatchContext(t *testing.T) {
 // TestGDBFullFlow exercises a realistic multi-step debugging session with GDB:
 // start with breakpoint → context → set another breakpoint → continue → context
 // → step → context → evaluate → info → continue to end.
-// This is a regression test for DAP response ordering issues where stale
+// This is a regression test for DAP response ordering issues where out-of-order
 // responses (e.g. ContinueResponse arriving after StoppedEvent) caused
 // subsequent tools (context, evaluate) to fail with type mismatch errors
 // like "expected *dap.StackTraceResponse, got *dap.ContinueResponse".
@@ -1131,11 +1131,11 @@ func TestGDBFullFlow(t *testing.T) {
 	// Set a new breakpoint at line 12 (printf) and continue to it.
 	// This exercises: breakpoint response → continue → ContinueResponse + StoppedEvent
 	// → getFullContext (stackTrace + scopes + variables).
-	// The stale ContinueResponse can arrive after StoppedEvent, so getFullContext
-	// must skip it when reading the StackTraceResponse.
+	// The ContinueResponse can arrive after StoppedEvent (out of order), so
+	// getFullContext must skip it when reading the StackTraceResponse.
 	ts.setBreakpointAndContinue(t, f, 12)
 
-	// Get context — this is where stale ContinueResponse would cause
+	// Get context — this is where an out-of-order ContinueResponse would cause
 	// "expected *dap.StackTraceResponse, got *dap.ContinueResponse"
 	contextStr2 := ts.getContextContent(t)
 	t.Logf("Context at second breakpoint:\n%s", contextStr2)

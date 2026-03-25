@@ -242,8 +242,8 @@ type BreakpointToolParams struct {
 }
 
 // readAndValidateResponse reads DAP messages until it receives the response
-// matching requestSeq. Stale responses (different request_seq) and events
-// are skipped. Returns an error if the matched response indicates failure.
+// matching requestSeq. Out-of-order responses (different request_seq) and
+// events are skipped. Returns an error if the matched response indicates failure.
 func readAndValidateResponse(client *DAPClient, requestSeq int, errorPrefix string) error {
 	for {
 		msg, err := client.ReadMessage()
@@ -254,7 +254,7 @@ func readAndValidateResponse(client *DAPClient, requestSeq int, errorPrefix stri
 		case dap.ResponseMessage:
 			r := resp.GetResponse()
 			if r.RequestSeq != requestSeq {
-				log.Printf("readAndValidateResponse: skipping stale response (request_seq=%d, waiting for %d)",
+				log.Printf("readAndValidateResponse: skipping out-of-order response (request_seq=%d, waiting for %d)",
 					r.RequestSeq, requestSeq)
 				continue
 			}
@@ -269,8 +269,8 @@ func readAndValidateResponse(client *DAPClient, requestSeq int, errorPrefix stri
 }
 
 // readTypedResponse reads DAP messages until it receives a response of type T
-// matching requestSeq. Stale responses (different request_seq) and events are
-// skipped. Returns an error if the matched response indicates failure.
+// matching requestSeq. Out-of-order responses (different request_seq) and
+// events are skipped. Returns an error if the matched response indicates failure.
 //
 // go-dap decodes all failed responses as *dap.ErrorResponse regardless of
 // command, so we match by request_seq rather than Go type alone.
@@ -285,7 +285,7 @@ func readTypedResponse[T dap.ResponseMessage](client *DAPClient, requestSeq int)
 		case T:
 			r := resp.GetResponse()
 			if r.RequestSeq != requestSeq {
-				log.Printf("readTypedResponse: skipping stale %T (request_seq=%d, waiting for %d)",
+				log.Printf("readTypedResponse: skipping out-of-order %T (request_seq=%d, waiting for %d)",
 					resp, r.RequestSeq, requestSeq)
 				continue
 			}
@@ -296,7 +296,7 @@ func readTypedResponse[T dap.ResponseMessage](client *DAPClient, requestSeq int)
 		case dap.ResponseMessage:
 			r := resp.GetResponse()
 			if r.RequestSeq != requestSeq {
-				log.Printf("readTypedResponse: skipping stale %T (request_seq=%d, waiting for %d)",
+				log.Printf("readTypedResponse: skipping out-of-order %T (request_seq=%d, waiting for %d)",
 					resp, r.RequestSeq, requestSeq)
 				continue
 			}
@@ -410,7 +410,7 @@ func (ds *debuggerSession) continueExecution(ctx context.Context, _ *mcp.ServerS
 		case dap.ResponseMessage:
 			r := resp.GetResponse()
 			if r.RequestSeq != continueSeq {
-				log.Printf("continueExecution: skipping stale response (request_seq=%d, waiting for %d)", r.RequestSeq, continueSeq)
+				log.Printf("continueExecution: skipping out-of-order response (request_seq=%d, waiting for %d)", r.RequestSeq, continueSeq)
 				continue
 			}
 			if !r.Success {
@@ -509,7 +509,7 @@ func (ds *debuggerSession) evaluateExpression(ctx context.Context, _ *mcp.Server
 					return nil, fmt.Errorf("unable to evaluate expression: %s", r.Message)
 				}
 			}
-			log.Printf("evaluate: skipping stale %T response (request_seq=%d, waiting for %d)",
+			log.Printf("evaluate: skipping out-of-order %T response (request_seq=%d, waiting for %d)",
 				resp, r.RequestSeq, evalSeq)
 			continue
 		case dap.EventMessage:
@@ -913,7 +913,7 @@ func (ds *debuggerSession) debug(ctx context.Context, _ *mcp.ServerSession, para
 	// We unify both by reading messages until we see the initialized event.
 	// The launch response may arrive before or after — if it arrives here,
 	// we consume it. If it arrives later, it will be automatically skipped
-	// as a stale response by subsequent seq-based readers.
+	// as an out-of-order response by subsequent seq-based readers.
 	for {
 		msg, err := ds.client.ReadMessage()
 		if err != nil {
@@ -963,7 +963,7 @@ initialized:
 	}
 
 	// If the launch response was deferred (arrived after the initialized event),
-	// it will be automatically consumed and skipped as a stale response by
+	// it will be automatically consumed and skipped as an out-of-order response by
 	// subsequent readAndValidateResponse/readTypedResponse calls, which match
 	// by request_seq.
 
