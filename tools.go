@@ -874,7 +874,7 @@ func (ds *debuggerSession) debug(ctx context.Context, _ *mcp.ServerSession, para
 		if err != nil {
 			return nil, err
 		}
-		req, _ := ds.client.newRequest("launch")
+		req := ds.client.newRequest("launch")
 		request := &dap.LaunchRequest{Request: *req}
 		request.Arguments = toRawMessage(launchArgs)
 		if err := ds.client.send(request); err != nil {
@@ -885,7 +885,7 @@ func (ds *debuggerSession) debug(ctx context.Context, _ *mcp.ServerSession, para
 		if err != nil {
 			return nil, err
 		}
-		req, _ := ds.client.newRequest("launch")
+		req := ds.client.newRequest("launch")
 		request := &dap.LaunchRequest{Request: *req}
 		request.Arguments = toRawMessage(coreArgs)
 		if err := ds.client.send(request); err != nil {
@@ -896,7 +896,7 @@ func (ds *debuggerSession) debug(ctx context.Context, _ *mcp.ServerSession, para
 		if err != nil {
 			return nil, err
 		}
-		req, _ := ds.client.newRequest("attach")
+		req := ds.client.newRequest("attach")
 		request := &dap.AttachRequest{Request: *req}
 		request.Arguments = toRawMessage(attachArgs)
 		if err := ds.client.send(request); err != nil {
