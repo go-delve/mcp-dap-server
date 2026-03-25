@@ -203,9 +203,12 @@ func (g *gdbBackend) LaunchArgs(mode, programPath string, stopOnEntry bool, prog
 
 	cwd, _ := os.Getwd()
 	args := map[string]any{
-		"program":     programPath,
-		"cwd":         cwd,
-		"stopAtEntry": stopOnEntry,
+		"program": programPath,
+		"cwd":     cwd,
+		// GDB's native DAP distinguishes stopOnEntry (starti, first instruction)
+		// from stopAtBeginningOfMainSubprogram (start, main function).
+		// We use the latter since stopping at main is almost always the intent.
+		"stopAtBeginningOfMainSubprogram": stopOnEntry,
 	}
 	if len(programArgs) > 0 {
 		args["args"] = programArgs

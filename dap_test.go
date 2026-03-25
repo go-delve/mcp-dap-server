@@ -26,8 +26,9 @@ func TestNewDAPClientFromRWC(t *testing.T) {
 
 	// Send an initialize request through the client
 	go func() {
+		req := client.newRequest("initialize")
 		_ = client.send(&dap.InitializeRequest{
-			Request: *client.newRequest("initialize"),
+			Request: *req,
 		})
 	}()
 

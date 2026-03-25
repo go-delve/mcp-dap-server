@@ -997,6 +997,197 @@ func TestGDBEvaluate(t *testing.T) {
 	ts.stopDebugger(t)
 }
 
+// TestGDBEvaluateWatchContext verifies that expression evaluation uses "watch"
+// context by default, so that C expressions (pointer dereference, register
+// access, casts) are evaluated correctly by GDB's native DAP server.
+// This is a regression test for the bug where the default "repl" context
+// caused GDB to interpret expressions as GDB commands, producing
+// "Undefined command" errors.
+func TestGDBEvaluateWatchContext(t *testing.T) {
+	requireGDBDeps(t)
+
+	ts := setupMCPServerAndClient(t)
+	defer ts.cleanup()
+
+	binaryPath, cleanupBinary := compileTestCProgram(t, ts.cwd, "helloworld")
+	defer cleanupBinary()
+
+	f := filepath.Join(ts.cwd, "testdata", "c", "helloworld", "main.c")
+	result, err := ts.session.CallTool(ts.ctx, &mcp.CallToolParams{
+		Name: "debug",
+		Arguments: map[string]any{
+			"debugger": "gdb",
+			"mode":     "binary",
+			"path":     binaryPath,
+			"breakpoints": []map[string]any{
+				{"file": f, "line": 12},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Failed to start: %v", err)
+	}
+	if result.IsError {
+		t.Fatalf("Debug returned error")
+	}
+
+	tests := []struct {
+		name       string
+		expression string
+		wantSubstr string
+	}{
+		{
+			name:       "bare expression (default watch context)",
+			expression: "x + y",
+			wantSubstr: "30",
+		},
+		{
+			name:       "pointer dereference",
+			expression: "*(&x)",
+			wantSubstr: "10",
+		},
+		{
+			name:       "address-of operator",
+			expression: "&x",
+			wantSubstr: "0x",
+		},
+		{
+			name:       "cast expression",
+			expression: "(long)x",
+			wantSubstr: "10",
+		},
+		{
+			name:       "register access",
+			expression: "$rsp",
+			wantSubstr: "0x",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			text, isErr := ts.callTool(t, "evaluate", map[string]any{
+				"expression": tc.expression,
+			})
+			if isErr {
+				t.Fatalf("evaluate %q returned error: %s", tc.expression, text)
+			}
+			if !strings.Contains(text, tc.wantSubstr) {
+				t.Errorf("evaluate %q: expected result to contain %q, got: %s", tc.expression, tc.wantSubstr, text)
+			}
+			t.Logf("evaluate %q = %s", tc.expression, text)
+		})
+	}
+
+	ts.stopDebugger(t)
+}
+
+// TestGDBFullFlow exercises a realistic multi-step debugging session with GDB:
+// start with breakpoint → context → set another breakpoint → continue → context
+// → step → context → evaluate → info → continue to end.
+// This is a regression test for DAP response ordering issues where out-of-order
+// responses (e.g. ContinueResponse arriving after StoppedEvent) caused
+// subsequent tools (context, evaluate) to fail with type mismatch errors
+// like "expected *dap.StackTraceResponse, got *dap.ContinueResponse".
+func TestGDBFullFlow(t *testing.T) {
+	requireGDBDeps(t)
+
+	ts := setupMCPServerAndClient(t)
+	defer ts.cleanup()
+
+	binaryPath, cleanupBinary := compileTestCProgram(t, ts.cwd, "helloworld")
+	defer cleanupBinary()
+
+	f := filepath.Join(ts.cwd, "testdata", "c", "helloworld", "main.c")
+
+	// Start GDB debug session with a breakpoint at line 9 (int x = 10).
+	// The debug tool runs to the breakpoint and returns context.
+	result, err := ts.session.CallTool(ts.ctx, &mcp.CallToolParams{
+		Name: "debug",
+		Arguments: map[string]any{
+			"debugger": "gdb",
+			"mode":     "binary",
+			"path":     binaryPath,
+			"breakpoints": []map[string]any{
+				{"file": f, "line": 9},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Failed to start GDB debug session: %v", err)
+	}
+	if result.IsError {
+		t.Fatalf("GDB debug session returned error")
+	}
+	t.Log("Session started, stopped at initial breakpoint")
+
+	// Get context at initial breakpoint
+	contextStr := ts.getContextContent(t)
+	t.Logf("Context at initial breakpoint:\n%s", contextStr)
+
+	if !strings.Contains(contextStr, "main") {
+		t.Errorf("Expected context to contain 'main', got: %s", contextStr)
+	}
+
+	// Set a new breakpoint at line 12 (printf) and continue to it.
+	// This exercises: breakpoint response → continue → ContinueResponse + StoppedEvent
+	// → getFullContext (stackTrace + scopes + variables).
+	// The ContinueResponse can arrive after StoppedEvent (out of order), so
+	// getFullContext must skip it when reading the StackTraceResponse.
+	ts.setBreakpointAndContinue(t, f, 12)
+
+	// Get context — this is where an out-of-order ContinueResponse would cause
+	// "expected *dap.StackTraceResponse, got *dap.ContinueResponse"
+	contextStr2 := ts.getContextContent(t)
+	t.Logf("Context at second breakpoint:\n%s", contextStr2)
+
+	if !strings.Contains(contextStr2, "sum") {
+		t.Errorf("Expected context to contain variable 'sum', got: %s", contextStr2)
+	}
+
+	// Evaluate expression in watch context (default)
+	evalResult, evalErr := ts.callTool(t, "evaluate", map[string]any{
+		"expression": "x + y",
+	})
+	if evalErr {
+		t.Fatalf("Evaluate returned error: %s", evalResult)
+	}
+	if !strings.Contains(evalResult, "30") {
+		t.Errorf("Expected evaluation of 'x + y' to contain '30', got: %s", evalResult)
+	}
+	t.Logf("Evaluate x + y = %s", evalResult)
+
+	// Evaluate with pointer dereference
+	evalResult2, evalErr2 := ts.callTool(t, "evaluate", map[string]any{
+		"expression": "*(&sum)",
+	})
+	if evalErr2 {
+		t.Fatalf("Evaluate *(&sum) returned error: %s", evalResult2)
+	}
+	if !strings.Contains(evalResult2, "30") {
+		t.Errorf("Expected evaluation of '*(&sum)' to contain '30', got: %s", evalResult2)
+	}
+	t.Logf("Evaluate *(&sum) = %s", evalResult2)
+
+	// Get info threads — exercises another typed response read
+	threadsResult, threadsErr := ts.callTool(t, "info", map[string]any{"type": "threads"})
+	if threadsErr {
+		t.Fatalf("Info threads returned error: %s", threadsResult)
+	}
+	if !strings.Contains(threadsResult, "Thread") {
+		t.Errorf("Expected threads info to contain 'Thread', got: %s", threadsResult)
+	}
+	t.Logf("Threads: %s", threadsResult)
+
+	// Continue to end — program should terminate
+	continueResult, contErr := ts.callTool(t, "continue", map[string]any{})
+	if contErr {
+		t.Fatalf("Continue returned error: %s", continueResult)
+	}
+	t.Logf("Continue to end: %s", continueResult)
+
+	ts.stopDebugger(t)
+}
+
 // callTool is a test helper that calls an MCP tool and returns the text content.
 // It fatals on transport errors and returns (text, isError) for tool-level results.
 func (ts *testSetup) callTool(t *testing.T, name string, args map[string]any) (string, bool) {

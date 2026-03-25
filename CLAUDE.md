@@ -25,15 +25,15 @@ This is an MCP (Model Context Protocol) server that bridges MCP clients with DAP
 - All MCP tools are methods on `debuggerSession` struct
 - Each tool method signature: `func (ds *debuggerSession) toolName(ctx context.Context, _ *mcp.ServerSession, params *mcp.CallToolParamsFor[ParamsType]) (*mcp.CallToolResultFor[any], error)`
 - Tools send DAP requests via `ds.client` and read/parse responses
-- `readAndValidateResponse()` is a common pattern for simple request/response flows
-- `readTypedResponse[T]()` for responses that need type-specific handling
+- `readAndValidateResponse(client, requestSeq, errorPrefix)` matches responses by `request_seq`, skipping unrelated responses
+- `readTypedResponse[T](client, requestSeq)` matches typed responses by `request_seq`, skipping unrelated responses
 - Tools that wait for stopped/terminated events loop on `ReadMessage()` until they receive the expected event
 
 **dap.go**: DAP client implementation
 - `DAPClient` manages TCP or stdio connection to DAP server
 - Wraps `github.com/google/go-dap` protocol messages
-- All DAP requests are synchronous: send request, read response
-- Maintains sequence numbers for protocol compliance
+- All DAP request methods return `(int, error)` where `int` is the request sequence number
+- Sequence numbers are used to match responses to requests via `request_seq` field
 
 **backend.go**: Debugger backend abstraction
 - `DebuggerBackend` interface abstracts debugger-specific behavior (spawning, launch args, transport)
@@ -57,12 +57,12 @@ This is an MCP (Model Context Protocol) server that bridges MCP clients with DAP
 ### Key Patterns
 
 1. **Tool Parameter Structs**: Each tool has a corresponding `*Params` struct with JSON/MCP tags
-2. **DAP Message Handling**: Response reading uses type switches on `dap.Message` interfaces
+2. **DAP Message Handling**: Response reading matches by `request_seq` (from the DAP protocol), skipping unrelated responses from other requests. go-dap decodes all failed responses as `*dap.ErrorResponse`, so matching by Go type alone is insufficient
 3. **Event vs Response**: Some operations (continue, step, etc.) wait for `StoppedEvent` or `TerminatedEvent` rather than just response messages
 4. **Error Propagation**: DAP response `Success` field is checked; error messages from `response.Message` are wrapped in Go errors
 5. **Capability-Gated Tools**: `set-variable`, `disassemble`, and `restart` are only registered when the DAP adapter reports support
 6. **Dynamic Tool Registration**: Only `debug` is registered initially; session tools replace it after a session starts, then are removed when the session stops
-7. **Single-Reader Architecture**: Only one goroutine reads from the DAP connection at a time — concurrent tool calls that both read DAP messages will race
+7. **Serialized DAP Access**: A mutex on `debuggerSession` serializes all tool calls, preventing concurrent reads from the single DAP connection
 
 ## Development Commands
 
@@ -195,9 +195,12 @@ func TestSomething(t *testing.T) {
 2. **Frame IDs vs Thread IDs**: Frame IDs come from stack traces, thread IDs from the threads request. Delve uses frame IDs starting at 1000.
 3. **Variables References**: The `variablesReference` in scopes/variables is a DAP protocol identifier, not a simple index. Delve uses frame_id+1 for locals scope (e.g., 1001 for frame 1000).
 4. **Stopped Event Format**: Contains `Reason` field ("breakpoint", "function breakpoint", "step", "entry", "pause", etc.) and `ThreadId`
-5. **Concurrent DAP Reads**: The DAP client has a single reader — concurrent tool calls that both read from the DAP connection will race. This limits features like concurrent continue + pause.
+5. **Serialized Tool Calls**: All tool calls are serialized by a mutex. Concurrent MCP tool calls will queue rather than race. Long-running operations (continue, step) hold the lock until completion.
 6. **Capability-Gated Tools**: `set-variable`, `disassemble`, and `restart` are only available when the DAP adapter reports support via capabilities
 7. **Test Binary Paths**: Must be absolute paths for the `debug` tool in binary mode
+8. **go-dap ErrorResponse Decoding**: go-dap decodes ALL failed responses (`success: false`) as `*dap.ErrorResponse` regardless of command. Response matching must use `request_seq`, not Go type
+9. **DAP Response Ordering**: GDB native DAP may send responses out of order (e.g., `StoppedEvent` before `ContinueResponse`). Out-of-order responses are skipped by `request_seq` matching
+10. **go-dap `omitempty` on FrameId**: `EvaluateArguments.FrameId` has `omitempty`, so `frameId=0` is silently dropped. `EvaluateRequest` uses raw JSON map to work around this
 
 ## Dependencies
 
