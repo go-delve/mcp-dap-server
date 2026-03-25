@@ -241,10 +241,10 @@ type BreakpointToolParams struct {
 	Function string  `json:"function,omitempty" mcp:"function name (alternative to file+line)"`
 }
 
-// readAndValidateResponse reads DAP messages, skipping events, until it
-// receives a ResponseMessage. It returns an error if the response indicates
-// failure or if the read itself fails.
-func readAndValidateResponse(client *DAPClient, errorPrefix string) error {
+// readAndValidateResponse reads DAP messages until it receives the response
+// matching requestSeq. Stale responses (different request_seq) and events
+// are skipped. Returns an error if the matched response indicates failure.
+func readAndValidateResponse(client *DAPClient, requestSeq int, errorPrefix string) error {
 	for {
 		msg, err := client.ReadMessage()
 		if err != nil {
@@ -252,8 +252,14 @@ func readAndValidateResponse(client *DAPClient, errorPrefix string) error {
 		}
 		switch resp := msg.(type) {
 		case dap.ResponseMessage:
-			if !resp.GetResponse().Success {
-				return fmt.Errorf("%s: %s", errorPrefix, resp.GetResponse().Message)
+			r := resp.GetResponse()
+			if r.RequestSeq != requestSeq {
+				log.Printf("readAndValidateResponse: skipping stale response (request_seq=%d, waiting for %d)",
+					r.RequestSeq, requestSeq)
+				continue
+			}
+			if !r.Success {
+				return fmt.Errorf("%s: %s", errorPrefix, r.Message)
 			}
 			return nil
 		case dap.EventMessage:
@@ -262,10 +268,13 @@ func readAndValidateResponse(client *DAPClient, errorPrefix string) error {
 	}
 }
 
-// readTypedResponse reads DAP messages, skipping events, until it receives a
-// response of the expected type T. Returns an error if the response indicates
-// failure or if an unexpected response type is received.
-func readTypedResponse[T dap.ResponseMessage](client *DAPClient) (T, error) {
+// readTypedResponse reads DAP messages until it receives a response of type T
+// matching requestSeq. Stale responses (different request_seq) and events are
+// skipped. Returns an error if the matched response indicates failure.
+//
+// go-dap decodes all failed responses as *dap.ErrorResponse regardless of
+// command, so we match by request_seq rather than Go type alone.
+func readTypedResponse[T dap.ResponseMessage](client *DAPClient, requestSeq int) (T, error) {
 	var zero T
 	for {
 		msg, err := client.ReadMessage()
@@ -274,15 +283,28 @@ func readTypedResponse[T dap.ResponseMessage](client *DAPClient) (T, error) {
 		}
 		switch resp := msg.(type) {
 		case T:
-			if !resp.GetResponse().Success {
-				return zero, errors.New(resp.GetResponse().Message)
+			r := resp.GetResponse()
+			if r.RequestSeq != requestSeq {
+				log.Printf("readTypedResponse: skipping stale %T (request_seq=%d, waiting for %d)",
+					resp, r.RequestSeq, requestSeq)
+				continue
+			}
+			if !r.Success {
+				return zero, errors.New(r.Message)
 			}
 			return resp, nil
 		case dap.ResponseMessage:
-			if !resp.GetResponse().Success {
-				return zero, errors.New(resp.GetResponse().Message)
+			r := resp.GetResponse()
+			if r.RequestSeq != requestSeq {
+				log.Printf("readTypedResponse: skipping stale %T (request_seq=%d, waiting for %d)",
+					resp, r.RequestSeq, requestSeq)
+				continue
 			}
-			return zero, fmt.Errorf("expected %T, got %T", zero, msg)
+			// Matched request_seq but different Go type (e.g. *dap.ErrorResponse).
+			if !r.Success {
+				return zero, errors.New(r.Message)
+			}
+			return zero, fmt.Errorf("expected %T, got %T (request_seq=%d)", zero, resp, requestSeq)
 		case dap.EventMessage:
 			continue
 		}
@@ -310,10 +332,11 @@ func (ds *debuggerSession) clearBreakpoints(ctx context.Context, _ *mcp.ServerSe
 
 	if params.Arguments.All {
 		// Clear all function breakpoints
-		if err := ds.client.SetFunctionBreakpointsRequest([]string{}); err != nil {
+		seq, err := ds.client.SetFunctionBreakpointsRequest([]string{})
+		if err != nil {
 			return nil, err
 		}
-		if err := readAndValidateResponse(ds.client, "unable to clear breakpoints"); err != nil {
+		if err := readAndValidateResponse(ds.client, seq, "unable to clear breakpoints"); err != nil {
 			return nil, err
 		}
 		return &mcp.CallToolResultFor[any]{
@@ -323,10 +346,11 @@ func (ds *debuggerSession) clearBreakpoints(ctx context.Context, _ *mcp.ServerSe
 
 	if params.Arguments.File != "" {
 		// Clear breakpoints in specific file by setting empty list
-		if err := ds.client.SetBreakpointsRequest(params.Arguments.File, []int{}); err != nil {
+		seq, err := ds.client.SetBreakpointsRequest(params.Arguments.File, []int{})
+		if err != nil {
 			return nil, err
 		}
-		if err := readAndValidateResponse(ds.client, "unable to clear breakpoints"); err != nil {
+		if err := readAndValidateResponse(ds.client, seq, "unable to clear breakpoints"); err != nil {
 			return nil, err
 		}
 		return &mcp.CallToolResultFor[any]{
@@ -355,11 +379,11 @@ func (ds *debuggerSession) continueExecution(ctx context.Context, _ *mcp.ServerS
 	if params.Arguments.To != nil {
 		to := params.Arguments.To
 		if to.Function != "" {
-			if err := ds.client.SetFunctionBreakpointsRequest([]string{to.Function}); err != nil {
+			if _, err := ds.client.SetFunctionBreakpointsRequest([]string{to.Function}); err != nil {
 				return nil, err
 			}
 		} else if to.File != "" && to.Line > 0 {
-			if err := ds.client.SetBreakpointsRequest(to.File, []int{to.Line}); err != nil {
+			if _, err := ds.client.SetBreakpointsRequest(to.File, []int{to.Line}); err != nil {
 				return nil, err
 			}
 		}
@@ -372,7 +396,8 @@ func (ds *debuggerSession) continueExecution(ctx context.Context, _ *mcp.ServerS
 	if threadID == 0 {
 		threadID = ds.defaultThreadID()
 	}
-	if err := ds.client.ContinueRequest(threadID); err != nil {
+	continueSeq, err := ds.client.ContinueRequest(threadID)
+	if err != nil {
 		return nil, err
 	}
 
@@ -383,8 +408,13 @@ func (ds *debuggerSession) continueExecution(ctx context.Context, _ *mcp.ServerS
 		}
 		switch resp := msg.(type) {
 		case dap.ResponseMessage:
-			if !resp.GetResponse().Success {
-				return nil, fmt.Errorf("continue failed: %s", resp.GetResponse().Message)
+			r := resp.GetResponse()
+			if r.RequestSeq != continueSeq {
+				log.Printf("continueExecution: skipping stale response (request_seq=%d, waiting for %d)", r.RequestSeq, continueSeq)
+				continue
+			}
+			if !r.Success {
+				return nil, fmt.Errorf("continue failed: %s", r.Message)
 			}
 		case *dap.StoppedEvent:
 			ds.stoppedThreadID = resp.Body.ThreadId
@@ -409,10 +439,11 @@ func (ds *debuggerSession) pauseExecution(ctx context.Context, _ *mcp.ServerSess
 	if ds.client == nil {
 		return nil, fmt.Errorf("debugger not started")
 	}
-	if err := ds.client.PauseRequest(params.Arguments.ThreadID.Int()); err != nil {
+	seq, err := ds.client.PauseRequest(params.Arguments.ThreadID.Int())
+	if err != nil {
 		return nil, err
 	}
-	if err := readAndValidateResponse(ds.client, "unable to pause execution"); err != nil {
+	if err := readAndValidateResponse(ds.client, seq, "unable to pause execution"); err != nil {
 		return nil, err
 	}
 
@@ -449,7 +480,8 @@ func (ds *debuggerSession) evaluateExpression(ctx context.Context, _ *mcp.Server
 	}
 	log.Printf("evaluate: expression=%q frameID=%d context=%q", params.Arguments.Expression, frameID, evalContext)
 
-	if err := ds.client.EvaluateRequest(params.Arguments.Expression, frameID, evalContext); err != nil {
+	evalSeq, err := ds.client.EvaluateRequest(params.Arguments.Expression, frameID, evalContext)
+	if err != nil {
 		return nil, err
 	}
 
@@ -471,16 +503,17 @@ func (ds *debuggerSession) evaluateExpression(ctx context.Context, _ *mcp.Server
 				Content: []mcp.Content{&mcp.TextContent{Text: result}},
 			}, nil
 		case dap.ResponseMessage:
-			if !resp.GetResponse().Success {
-				return nil, fmt.Errorf("unable to evaluate expression: %s", resp.GetResponse().Message)
+			r := resp.GetResponse()
+			if r.RequestSeq == evalSeq {
+				if !r.Success {
+					return nil, fmt.Errorf("unable to evaluate expression: %s", r.Message)
+				}
 			}
-			return &mcp.CallToolResultFor[any]{
-				Content: []mcp.Content{&mcp.TextContent{Text: "(no result)"}},
-			}, nil
+			log.Printf("evaluate: skipping stale %T response (request_seq=%d, waiting for %d)",
+				resp, r.RequestSeq, evalSeq)
+			continue
 		case dap.EventMessage:
 			continue
-		default:
-			return nil, fmt.Errorf("unexpected response type: %T", msg)
 		}
 	}
 }
@@ -499,10 +532,11 @@ func (ds *debuggerSession) setVariable(ctx context.Context, _ *mcp.ServerSession
 	if ds.client == nil {
 		return nil, fmt.Errorf("debugger not started")
 	}
-	if err := ds.client.SetVariableRequest(params.Arguments.VariablesReference.Int(), params.Arguments.Name, params.Arguments.Value); err != nil {
+	seq, err := ds.client.SetVariableRequest(params.Arguments.VariablesReference.Int(), params.Arguments.Name, params.Arguments.Value)
+	if err != nil {
 		return nil, err
 	}
-	if err := readAndValidateResponse(ds.client, "unable to set variable"); err != nil {
+	if err := readAndValidateResponse(ds.client, seq, "unable to set variable"); err != nil {
 		return nil, err
 	}
 	return &mcp.CallToolResultFor[any]{
@@ -522,7 +556,7 @@ func (ds *debuggerSession) restartDebugger(ctx context.Context, _ *mcp.ServerSes
 	if ds.client == nil {
 		return nil, fmt.Errorf("debugger not started")
 	}
-	if err := ds.client.RestartRequest(map[string]any{
+	seq, err := ds.client.RestartRequest(map[string]any{
 		"arguments": map[string]any{
 			"request":     "launch",
 			"mode":        "exec",
@@ -530,10 +564,11 @@ func (ds *debuggerSession) restartDebugger(ctx context.Context, _ *mcp.ServerSes
 			"args":        params.Arguments.Args,
 			"rebuild":     false,
 		},
-	}); err != nil {
+	})
+	if err != nil {
 		return nil, err
 	}
-	if err := readAndValidateResponse(ds.client, "unable to restart debugger"); err != nil {
+	if err := readAndValidateResponse(ds.client, seq, "unable to restart debugger"); err != nil {
 		return nil, err
 	}
 
@@ -561,10 +596,11 @@ func (ds *debuggerSession) info(ctx context.Context, _ *mcp.ServerSession, param
 
 	switch infoType {
 	case "threads":
-		if err := ds.client.ThreadsRequest(); err != nil {
+		seq, err := ds.client.ThreadsRequest()
+		if err != nil {
 			return nil, err
 		}
-		resp, err := readTypedResponse[*dap.ThreadsResponse](ds.client)
+		resp, err := readTypedResponse[*dap.ThreadsResponse](ds.client, seq)
 		if err != nil {
 			return nil, fmt.Errorf("failed to get threads: %w", err)
 		}
@@ -581,10 +617,11 @@ func (ds *debuggerSession) info(ctx context.Context, _ *mcp.ServerSession, param
 		if !ds.capabilities.SupportsLoadedSourcesRequest {
 			return nil, fmt.Errorf("loaded sources not supported by this debug adapter")
 		}
-		if err := ds.client.LoadedSourcesRequest(); err != nil {
+		seq, err := ds.client.LoadedSourcesRequest()
+		if err != nil {
 			return nil, err
 		}
-		resp, err := readTypedResponse[*dap.LoadedSourcesResponse](ds.client)
+		resp, err := readTypedResponse[*dap.LoadedSourcesResponse](ds.client, seq)
 		if err != nil {
 			return nil, fmt.Errorf("failed to get loaded sources: %w", err)
 		}
@@ -601,10 +638,11 @@ func (ds *debuggerSession) info(ctx context.Context, _ *mcp.ServerSession, param
 		if !ds.capabilities.SupportsModulesRequest {
 			return nil, fmt.Errorf("modules not supported by this debug adapter")
 		}
-		if err := ds.client.ModulesRequest(); err != nil {
+		seq, err := ds.client.ModulesRequest()
+		if err != nil {
 			return nil, err
 		}
-		resp, err := readTypedResponse[*dap.ModulesResponse](ds.client)
+		resp, err := readTypedResponse[*dap.ModulesResponse](ds.client, seq)
 		if err != nil {
 			return nil, fmt.Errorf("failed to get modules: %w", err)
 		}
@@ -641,11 +679,12 @@ func (ds *debuggerSession) disassembleCode(ctx context.Context, _ *mcp.ServerSes
 	if count == 0 {
 		count = 20
 	}
-	if err := ds.client.DisassembleRequest(params.Arguments.Address, params.Arguments.Offset.Int(), count); err != nil {
+	seq, err := ds.client.DisassembleRequest(params.Arguments.Address, params.Arguments.Offset.Int(), count)
+	if err != nil {
 		return nil, err
 	}
 
-	disResp, err := readTypedResponse[*dap.DisassembleResponse](ds.client)
+	disResp, err := readTypedResponse[*dap.DisassembleResponse](ds.client, seq)
 	if err != nil {
 		return nil, fmt.Errorf("unable to disassemble: %w", err)
 	}
@@ -679,10 +718,11 @@ func (ds *debuggerSession) stop(ctx context.Context, _ *mcp.ServerSession, param
 
 	if params.Arguments.Detach && ds.client != nil {
 		// Send disconnect with terminateDebuggee=false so the debuggee keeps running.
-		if err := ds.client.DisconnectRequest(false); err != nil {
+		seq, err := ds.client.DisconnectRequest(false)
+		if err != nil {
 			log.Printf("stop: disconnect request failed: %v", err)
 		} else {
-			if err := readAndValidateResponse(ds.client, "disconnect"); err != nil {
+			if err := readAndValidateResponse(ds.client, seq, "disconnect"); err != nil {
 				log.Printf("stop: disconnect response error: %v", err)
 			}
 		}
@@ -834,7 +874,8 @@ func (ds *debuggerSession) debug(ctx context.Context, _ *mcp.ServerSession, para
 		if err != nil {
 			return nil, err
 		}
-		request := &dap.LaunchRequest{Request: *ds.client.newRequest("launch")}
+		req, _ := ds.client.newRequest("launch")
+		request := &dap.LaunchRequest{Request: *req}
 		request.Arguments = toRawMessage(launchArgs)
 		if err := ds.client.send(request); err != nil {
 			return nil, err
@@ -844,7 +885,8 @@ func (ds *debuggerSession) debug(ctx context.Context, _ *mcp.ServerSession, para
 		if err != nil {
 			return nil, err
 		}
-		request := &dap.LaunchRequest{Request: *ds.client.newRequest("launch")}
+		req, _ := ds.client.newRequest("launch")
+		request := &dap.LaunchRequest{Request: *req}
 		request.Arguments = toRawMessage(coreArgs)
 		if err := ds.client.send(request); err != nil {
 			return nil, err
@@ -854,7 +896,8 @@ func (ds *debuggerSession) debug(ctx context.Context, _ *mcp.ServerSession, para
 		if err != nil {
 			return nil, err
 		}
-		request := &dap.AttachRequest{Request: *ds.client.newRequest("attach")}
+		req, _ := ds.client.newRequest("attach")
+		request := &dap.AttachRequest{Request: *req}
 		request.Arguments = toRawMessage(attachArgs)
 		if err := ds.client.send(request); err != nil {
 			return nil, err
@@ -867,11 +910,11 @@ func (ds *debuggerSession) debug(ctx context.Context, _ *mcp.ServerSession, para
 	// GDB native DAP: may send an "initialized" event before or after the
 	// launch response.
 	//
-	// We unify both by reading messages until we see the initialized event,
-	// noting whether the launch response has also arrived.
-	launchResponseReceived := false
-	initializedReceived := false
-	for !initializedReceived {
+	// We unify both by reading messages until we see the initialized event.
+	// The launch response may arrive before or after — if it arrives here,
+	// we consume it. If it arrives later, it will be automatically skipped
+	// as a stale response by subsequent seq-based readers.
+	for {
 		msg, err := ds.client.ReadMessage()
 		if err != nil {
 			return nil, err
@@ -881,46 +924,48 @@ func (ds *debuggerSession) debug(ctx context.Context, _ *mcp.ServerSession, para
 			if !resp.GetResponse().Success {
 				return nil, fmt.Errorf("unable to start debug session: %s", resp.GetResponse().Message)
 			}
-			launchResponseReceived = true
+			// Launch response consumed; continue reading for initialized event
 		case *dap.InitializedEvent:
-			initializedReceived = true
+			_ = resp
+			goto initialized
 		}
 	}
+initialized:
 
 	// Set breakpoints
 	for _, bp := range params.Arguments.Breakpoints {
 		if bp.Function != "" {
-			if err := ds.client.SetFunctionBreakpointsRequest([]string{bp.Function}); err != nil {
+			seq, err := ds.client.SetFunctionBreakpointsRequest([]string{bp.Function})
+			if err != nil {
 				return nil, err
 			}
-			if err := readAndValidateResponse(ds.client, "unable to set function breakpoint"); err != nil {
+			if err := readAndValidateResponse(ds.client, seq, "unable to set function breakpoint"); err != nil {
 				return nil, err
 			}
 		} else if bp.File != "" && bp.Line > 0 {
-			if err := ds.client.SetBreakpointsRequest(bp.File, []int{bp.Line}); err != nil {
+			seq, err := ds.client.SetBreakpointsRequest(bp.File, []int{bp.Line})
+			if err != nil {
 				return nil, err
 			}
-			if err := readAndValidateResponse(ds.client, "unable to set breakpoint"); err != nil {
+			if err := readAndValidateResponse(ds.client, seq, "unable to set breakpoint"); err != nil {
 				return nil, err
 			}
 		}
 	}
 
 	// Configuration done
-	if err := ds.client.ConfigurationDoneRequest(); err != nil {
+	configSeq, err := ds.client.ConfigurationDoneRequest()
+	if err != nil {
 		return nil, err
 	}
-	if err := readAndValidateResponse(ds.client, "unable to complete configuration"); err != nil {
+	if err := readAndValidateResponse(ds.client, configSeq, "unable to complete configuration"); err != nil {
 		return nil, err
 	}
 
-	// For adapters that defer the launch response,
-	// read the deferred launch response now.
-	if !launchResponseReceived {
-		if err := readAndValidateResponse(ds.client, "unable to start debug session"); err != nil {
-			return nil, err
-		}
-	}
+	// If the launch response was deferred (arrived after the initialized event),
+	// it will be automatically consumed and skipped as a stale response by
+	// subsequent readAndValidateResponse/readTypedResponse calls, which match
+	// by request_seq.
 
 	// Register session-specific tools based on capabilities
 	ds.registerSessionTools()
@@ -968,7 +1013,7 @@ func (ds *debuggerSession) debug(ctx context.Context, _ *mcp.ServerSession, para
 			case *dap.StoppedEvent:
 				if ev.Body.Reason == "entry" {
 					// Stopped at entry — send continue to reach the breakpoint
-					if err := ds.client.ContinueRequest(ev.Body.ThreadId); err != nil {
+					if _, err := ds.client.ContinueRequest(ev.Body.ThreadId); err != nil {
 						return nil, err
 					}
 					continue
@@ -988,8 +1033,9 @@ func (ds *debuggerSession) debug(ctx context.Context, _ *mcp.ServerSession, para
 		return ds.getFullContext(stoppedThreadID, 0, 20)
 	}
 
-	// Return simple success message when stopped on entry
-	// (at entry point, stack trace may not be available yet)
+	// Return simple success message when stopped on entry.
+	// The StoppedEvent from the adapter (if any) will be consumed by the
+	// next readTypedResponse call, which skips EventMessages.
 	return &mcp.CallToolResultFor[any]{
 		Content: []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf("Debug session started for %s. Use 'breakpoint' to set breakpoints and 'continue' to run.", params.Arguments.Path)}},
 	}, nil
@@ -1026,10 +1072,11 @@ func (ds *debuggerSession) getThreadList() string {
 	if ds.client == nil {
 		return ""
 	}
-	if err := ds.client.ThreadsRequest(); err != nil {
+	seq, err := ds.client.ThreadsRequest()
+	if err != nil {
 		return ""
 	}
-	resp, err := readTypedResponse[*dap.ThreadsResponse](ds.client)
+	resp, err := readTypedResponse[*dap.ThreadsResponse](ds.client, seq)
 	if err != nil {
 		return ""
 	}
@@ -1056,17 +1103,23 @@ func (ds *debuggerSession) step(ctx context.Context, _ *mcp.ServerSession, param
 	// Execute the appropriate step command
 	switch params.Arguments.Mode {
 	case "over":
-		if err := ds.client.NextRequest(threadID); err != nil {
+		stepSeq, err := ds.client.NextRequest(threadID)
+		if err != nil {
 			return nil, err
 		}
+		_ = stepSeq
 	case "in":
-		if err := ds.client.StepInRequest(threadID); err != nil {
+		stepSeq, err := ds.client.StepInRequest(threadID)
+		if err != nil {
 			return nil, err
 		}
+		_ = stepSeq
 	case "out":
-		if err := ds.client.StepOutRequest(threadID); err != nil {
+		stepSeq, err := ds.client.StepOutRequest(threadID)
+		if err != nil {
 			return nil, err
 		}
+		_ = stepSeq
 	default:
 		return nil, fmt.Errorf("invalid step mode: %s (must be 'over', 'in', or 'out')", params.Arguments.Mode)
 	}
@@ -1102,10 +1155,11 @@ func (ds *debuggerSession) getFullContext(threadID, frameID, maxFrames int) (*mc
 	var result strings.Builder
 
 	// Get stack trace
-	if err := ds.client.StackTraceRequest(threadID, 0, maxFrames); err != nil {
+	stSeq, err := ds.client.StackTraceRequest(threadID, 0, maxFrames)
+	if err != nil {
 		return nil, err
 	}
-	stResp, err := readTypedResponse[*dap.StackTraceResponse](ds.client)
+	stResp, err := readTypedResponse[*dap.StackTraceResponse](ds.client, stSeq)
 	if err != nil {
 		return nil, fmt.Errorf("unable to get stack trace: %w", err)
 	}
@@ -1155,12 +1209,13 @@ func (ds *debuggerSession) getFullContext(threadID, frameID, maxFrames int) (*mc
 // frame and writes them to the result builder. Errors are written inline
 // rather than propagated, since partial context is better than none.
 func (ds *debuggerSession) writeScopesAndVariables(result *strings.Builder, frameID int) {
-	if err := ds.client.ScopesRequest(frameID); err != nil {
+	scopesSeq, err := ds.client.ScopesRequest(frameID)
+	if err != nil {
 		result.WriteString("## Variables\n(unable to retrieve scopes)\n")
 		return
 	}
 
-	scopesResp, err := readTypedResponse[*dap.ScopesResponse](ds.client)
+	scopesResp, err := readTypedResponse[*dap.ScopesResponse](ds.client, scopesSeq)
 	if err != nil {
 		result.WriteString("## Variables\n(unable to retrieve scopes)\n")
 		return
@@ -1177,11 +1232,12 @@ func (ds *debuggerSession) writeScopesAndVariables(result *strings.Builder, fram
 		if scope.VariablesReference <= 0 {
 			continue
 		}
-		if err := ds.client.VariablesRequest(scope.VariablesReference); err != nil {
+		varSeq, err := ds.client.VariablesRequest(scope.VariablesReference)
+		if err != nil {
 			result.WriteString("  (unable to retrieve variables)\n")
 			continue
 		}
-		varResp, err := readTypedResponse[*dap.VariablesResponse](ds.client)
+		varResp, err := readTypedResponse[*dap.VariablesResponse](ds.client, varSeq)
 		if err != nil {
 			result.WriteString("  (unable to retrieve variables)\n")
 			continue
@@ -1205,10 +1261,11 @@ func (ds *debuggerSession) breakpoint(ctx context.Context, _ *mcp.ServerSession,
 	}
 
 	if params.Arguments.Function != "" {
-		if err := ds.client.SetFunctionBreakpointsRequest([]string{params.Arguments.Function}); err != nil {
+		seq, err := ds.client.SetFunctionBreakpointsRequest([]string{params.Arguments.Function})
+		if err != nil {
 			return nil, err
 		}
-		if err := readAndValidateResponse(ds.client, "unable to set function breakpoint"); err != nil {
+		if err := readAndValidateResponse(ds.client, seq, "unable to set function breakpoint"); err != nil {
 			return nil, err
 		}
 		return &mcp.CallToolResultFor[any]{
@@ -1220,11 +1277,12 @@ func (ds *debuggerSession) breakpoint(ctx context.Context, _ *mcp.ServerSession,
 		return nil, fmt.Errorf("either function or file+line is required")
 	}
 
-	if err := ds.client.SetBreakpointsRequest(params.Arguments.File, []int{params.Arguments.Line.Int()}); err != nil {
+	bpSeq, err := ds.client.SetBreakpointsRequest(params.Arguments.File, []int{params.Arguments.Line.Int()})
+	if err != nil {
 		return nil, err
 	}
 
-	resp, err := readTypedResponse[*dap.SetBreakpointsResponse](ds.client)
+	resp, err := readTypedResponse[*dap.SetBreakpointsResponse](ds.client, bpSeq)
 	if err != nil {
 		return nil, fmt.Errorf("unable to set breakpoint: %w", err)
 	}
