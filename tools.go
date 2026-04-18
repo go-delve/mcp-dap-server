@@ -871,7 +871,12 @@ func (ds *debuggerSession) debug(ctx context.Context, _ *mcp.ServerSession, para
 	// Connect DAP client based on transport mode
 	switch ds.backend.TransportMode() {
 	case "tcp":
-		client, err := newDAPClient(listenAddr)
+		// Pass backend if it implements Redialer (ConnectBackend does; delve doesn't).
+		var redialer Redialer
+		if r, ok := ds.backend.(Redialer); ok {
+			redialer = r
+		}
+		client, err := newDAPClient(listenAddr, redialer)
 		if err != nil {
 			return nil, err
 		}
