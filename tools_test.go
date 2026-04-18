@@ -70,7 +70,7 @@ func setupMCPServerAndClient(t *testing.T) *testSetup {
 		Version: "v1.0.0",
 	}
 	server := mcp.NewServer(&implementation, nil)
-	registerTools(server, io.Discard)
+	registerTools(server, io.Discard, "")
 
 	// Create httptest server
 	getServer := func(request *http.Request) *mcp.Server {

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"flag"
 	"io"
 	"log"
 	"os"
@@ -13,6 +14,16 @@ import (
 var version = "dev"
 
 func main() {
+	// CLI flag parsing
+	connectAddr := flag.String("connect", "", "TCP address of existing dlv --headless DAP server (e.g. localhost:24010 after kubectl port-forward)")
+	flag.Parse()
+
+	// Env fallback (ADR-9: CLI has precedence over env)
+	addr := *connectAddr
+	if addr == "" {
+		addr = os.Getenv("DAP_CONNECT_ADDR")
+	}
+
 	// Log only to a file — never to stderr. With MCP stdio transport,
 	// stderr is a pipe to the MCP client. If the pipe buffer fills
 	// (from our logs or the DAP adapter's stderr), any write blocks
@@ -30,7 +41,7 @@ func main() {
 		defer logFile.Close()
 	}
 
-	log.Printf("mcp-dap-server starting (log file: %s)", logPath)
+	log.Printf("mcp-dap-server starting (log file: %s, connect: %q)", logPath, addr)
 
 	// Create MCP server
 	implementation := mcp.Implementation{
@@ -39,7 +50,7 @@ func main() {
 	}
 	server := mcp.NewServer(&implementation, nil)
 
-	ds := registerTools(server, logWriter)
+	ds := registerTools(server, logWriter, addr)
 	defer ds.cleanup()
 
 	registerPrompts(server)

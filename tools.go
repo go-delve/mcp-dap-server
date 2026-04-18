@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/google/go-dap"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -51,8 +52,19 @@ Choose the debugger based on the language of the program being debugged: use 'de
 
 // registerTools registers the debugger tools with the MCP server.
 // logWriter is used to redirect adapter stderr output; pass io.Discard to suppress.
-func registerTools(server *mcp.Server, logWriter io.Writer) *debuggerSession {
+// connectAddr, if non-empty, pre-creates a ConnectBackend targeting that TCP address
+// (set via --connect flag or DAP_CONNECT_ADDR env; CLI takes precedence per ADR-9).
+func registerTools(server *mcp.Server, logWriter io.Writer, connectAddr string) *debuggerSession {
 	ds := &debuggerSession{server: server, logWriter: logWriter, lastFrameID: -1}
+
+	// Pre-create ConnectBackend if --connect / DAP_CONNECT_ADDR provided.
+	if connectAddr != "" {
+		ds.backend = &ConnectBackend{
+			Addr:        connectAddr,
+			DialTimeout: 5 * time.Second,
+		}
+		log.Printf("registerTools: ConnectBackend mode, target %s", connectAddr)
+	}
 
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "debug",
@@ -786,17 +798,33 @@ func (ds *debuggerSession) debug(ctx context.Context, _ *mcp.ServerSession, para
 
 	// Validate mode
 	mode := params.Arguments.Mode
-	switch mode {
-	case "source", "binary", "core", "attach":
-		// valid
-	default:
-		return nil, fmt.Errorf("invalid mode: %s (must be 'source', 'binary', 'core', or 'attach')", mode)
+
+	// ConnectBackend is pre-set by registerTools when --connect / DAP_CONNECT_ADDR
+	// is provided. In that case accept "remote-attach" (or omitted) as mode and
+	// normalize to "attach" for the rest of the session flow. Any other mode is
+	// logged as a warning and overridden — ConnectBackend only supports attach.
+	_, isConnectBackend := ds.backend.(*ConnectBackend)
+	if isConnectBackend {
+		if mode != "" && mode != "remote-attach" && mode != "attach" {
+			log.Printf("debug: ConnectBackend active, ignoring mode=%q, using attach (remote-attach)", mode)
+		}
+		mode = "attach"
+	} else {
+		switch mode {
+		case "source", "binary", "core", "attach":
+			// valid
+		default:
+			return nil, fmt.Errorf("invalid mode: %s (must be 'source', 'binary', 'core', or 'attach')", mode)
+		}
 	}
 
 	// Validate required parameters
 	if mode == "attach" {
-		if params.Arguments.ProcessID == 0 {
-			return nil, fmt.Errorf("processId is required for attach mode")
+		// processId is not required for ConnectBackend (remote-attach ignores PID)
+		if !isConnectBackend {
+			if params.Arguments.ProcessID == 0 {
+				return nil, fmt.Errorf("processId is required for attach mode")
+			}
 		}
 	} else {
 		if params.Arguments.Path == "" {
@@ -807,26 +835,30 @@ func (ds *debuggerSession) debug(ctx context.Context, _ *mcp.ServerSession, para
 		return nil, fmt.Errorf("coreFilePath is required for core mode")
 	}
 
-	// Select debugger backend
-	debugger := params.Arguments.Debugger
-	if debugger == "" {
-		debugger = "delve"
-	}
-	switch debugger {
-	case "delve":
-		ds.backend = &delveBackend{}
-	case "gdb":
-		gdbPath := params.Arguments.GDBPath
-		if gdbPath == "" {
-			var err error
-			gdbPath, err = exec.LookPath("gdb")
-			if err != nil {
-				return nil, fmt.Errorf("GDB not found in PATH. Install GDB 14+ or set the gdbPath parameter")
-			}
+	// Select debugger backend.
+	// If ConnectBackend is already pre-set (via --connect / DAP_CONNECT_ADDR),
+	// skip backend selection — use the pre-created instance.
+	if !isConnectBackend {
+		debugger := params.Arguments.Debugger
+		if debugger == "" {
+			debugger = "delve"
 		}
-		ds.backend = &gdbBackend{gdbPath: gdbPath}
-	default:
-		return nil, fmt.Errorf("unsupported debugger: %s (must be 'delve' or 'gdb')", debugger)
+		switch debugger {
+		case "delve":
+			ds.backend = &delveBackend{}
+		case "gdb":
+			gdbPath := params.Arguments.GDBPath
+			if gdbPath == "" {
+				var err error
+				gdbPath, err = exec.LookPath("gdb")
+				if err != nil {
+					return nil, fmt.Errorf("GDB not found in PATH. Install GDB 14+ or set the gdbPath parameter")
+				}
+			}
+			ds.backend = &gdbBackend{gdbPath: gdbPath}
+		default:
+			return nil, fmt.Errorf("unsupported debugger: %s (must be 'delve' or 'gdb')", debugger)
+		}
 	}
 
 	// Spawn DAP server via backend
