@@ -3,3 +3,4 @@ bin/
 .serena/
 mcp-dap-server
 dist/
+.claude/
