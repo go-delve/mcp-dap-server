@@ -281,73 +281,84 @@ type ReconnectParams struct {
 	WaitTimeoutSec FlexInt `json:"wait_timeout_sec,omitempty" mcp:"maximum seconds to wait for healthy state (default 30, max 300)"`
 }
 
-// readAndValidateResponse reads DAP messages until it receives the response
-// matching requestSeq. Out-of-order responses (different request_seq) and
-// events are skipped. Returns an error if the matched response indicates failure.
-func readAndValidateResponse(client *DAPClient, requestSeq int, errorPrefix string) error {
-	for {
-		msg, err := client.ReadMessage()
-		if err != nil {
-			return err
-		}
-		switch resp := msg.(type) {
-		case dap.ResponseMessage:
-			r := resp.GetResponse()
-			if r.RequestSeq != requestSeq {
-				log.Printf("readAndValidateResponse: skipping out-of-order response (request_seq=%d, waiting for %d)",
-					r.RequestSeq, requestSeq)
-				continue
-			}
-			if !r.Success {
-				return fmt.Errorf("%s: %s", errorPrefix, r.Message)
-			}
-			return nil
-		case dap.EventMessage:
-			continue
-		}
+// awaitResponseValidate waits for the response matching seq via the pump and
+// checks its Success flag. Returns an error if the response indicates failure
+// or if the context is cancelled.
+//
+// Replaces the Phase 1 readAndValidateResponse (which manually skipped
+// out-of-order responses and events). The pump registry now routes responses
+// by request_seq automatically; events go to the event bus.
+func awaitResponseValidate(ctx context.Context, c *DAPClient, seq int, errorPrefix string) error {
+	msg, err := c.AwaitResponse(ctx, seq)
+	if err != nil {
+		return err
 	}
+	resp, ok := msg.(dap.ResponseMessage)
+	if !ok {
+		return fmt.Errorf("%s: expected response, got %T", errorPrefix, msg)
+	}
+	r := resp.GetResponse()
+	if !r.Success {
+		return fmt.Errorf("%s: %s", errorPrefix, r.Message)
+	}
+	return nil
 }
 
-// readTypedResponse reads DAP messages until it receives a response of type T
-// matching requestSeq. Out-of-order responses (different request_seq) and
-// events are skipped. Returns an error if the matched response indicates failure.
+// awaitResponseTyped waits for the response matching seq via the pump and
+// type-asserts to T. If the DAP server returned a failure (which go-dap
+// decodes as *dap.ErrorResponse regardless of the original command), the
+// response's Message is returned as an error.
 //
-// go-dap decodes all failed responses as *dap.ErrorResponse regardless of
-// command, so we match by request_seq rather than Go type alone.
-func readTypedResponse[T dap.ResponseMessage](client *DAPClient, requestSeq int) (T, error) {
+// Replaces the Phase 1 readTypedResponse.
+func awaitResponseTyped[T dap.ResponseMessage](ctx context.Context, c *DAPClient, seq int) (T, error) {
 	var zero T
-	for {
-		msg, err := client.ReadMessage()
-		if err != nil {
-			return zero, err
+	msg, err := c.AwaitResponse(ctx, seq)
+	if err != nil {
+		return zero, err
+	}
+	if typed, ok := msg.(T); ok {
+		r := typed.GetResponse()
+		if !r.Success {
+			return zero, errors.New(r.Message)
 		}
-		switch resp := msg.(type) {
-		case T:
-			r := resp.GetResponse()
-			if r.RequestSeq != requestSeq {
-				log.Printf("readTypedResponse: skipping out-of-order %T (request_seq=%d, waiting for %d)",
-					resp, r.RequestSeq, requestSeq)
-				continue
-			}
-			if !r.Success {
-				return zero, errors.New(r.Message)
-			}
-			return resp, nil
-		case dap.ResponseMessage:
-			r := resp.GetResponse()
-			if r.RequestSeq != requestSeq {
-				log.Printf("readTypedResponse: skipping out-of-order %T (request_seq=%d, waiting for %d)",
-					resp, r.RequestSeq, requestSeq)
-				continue
-			}
-			// Matched request_seq but different Go type (e.g. *dap.ErrorResponse).
-			if !r.Success {
-				return zero, errors.New(r.Message)
-			}
-			return zero, fmt.Errorf("expected %T, got %T (request_seq=%d)", zero, resp, requestSeq)
-		case dap.EventMessage:
-			continue
+		return typed, nil
+	}
+	// Matched seq but unexpected Go type (typically *dap.ErrorResponse for failures).
+	if resp, ok := msg.(dap.ResponseMessage); ok {
+		r := resp.GetResponse()
+		if !r.Success {
+			return zero, errors.New(r.Message)
 		}
+		return zero, fmt.Errorf("expected %T, got %T (seq=%d)", zero, resp, seq)
+	}
+	return zero, fmt.Errorf("expected response, got %T (seq=%d)", msg, seq)
+}
+
+// awaitStopOrTerminate subscribes to StoppedEvent and TerminatedEvent with the
+// given since time, then waits for whichever arrives first (or ctx cancellation).
+// since MUST be captured BEFORE sending the request that may trigger the events,
+// so the pump's replay ring covers any event that arrives between send and
+// subscription.
+//
+// Returns (stopped, nil, nil), (nil, terminated, nil), or (nil, nil, err).
+func awaitStopOrTerminate(ctx context.Context, c *DAPClient, since time.Time) (*dap.StoppedEvent, *dap.TerminatedEvent, error) {
+	stopSub, stopCancel := Subscribe[*dap.StoppedEvent](c, since)
+	defer stopCancel()
+	termSub, termCancel := Subscribe[*dap.TerminatedEvent](c, since)
+	defer termCancel()
+	select {
+	case s, ok := <-stopSub:
+		if !ok {
+			return nil, nil, ErrConnectionStale
+		}
+		return s, nil, nil
+	case t, ok := <-termSub:
+		if !ok {
+			return nil, nil, ErrConnectionStale
+		}
+		return nil, t, nil
+	case <-ctx.Done():
+		return nil, nil, ctx.Err()
 	}
 }
 
@@ -377,7 +388,7 @@ func (ds *debuggerSession) clearBreakpoints(ctx context.Context, _ *mcp.ServerSe
 			if err != nil {
 				return nil, err
 			}
-			if err := readAndValidateResponse(ds.client, seq, "unable to clear breakpoints"); err != nil {
+			if err := awaitResponseValidate(ctx, ds.client, seq, "unable to clear breakpoints"); err != nil {
 				return nil, err
 			}
 		}
@@ -386,7 +397,7 @@ func (ds *debuggerSession) clearBreakpoints(ctx context.Context, _ *mcp.ServerSe
 		if err != nil {
 			return nil, err
 		}
-		if err := readAndValidateResponse(ds.client, seq, "unable to clear breakpoints"); err != nil {
+		if err := awaitResponseValidate(ctx, ds.client, seq, "unable to clear breakpoints"); err != nil {
 			return nil, err
 		}
 		ds.breakpoints = make(map[string][]dap.SourceBreakpoint)
@@ -402,7 +413,7 @@ func (ds *debuggerSession) clearBreakpoints(ctx context.Context, _ *mcp.ServerSe
 		if err != nil {
 			return nil, err
 		}
-		if err := readAndValidateResponse(ds.client, seq, "unable to clear breakpoints"); err != nil {
+		if err := awaitResponseValidate(ctx, ds.client, seq, "unable to clear breakpoints"); err != nil {
 			return nil, err
 		}
 		delete(ds.breakpoints, params.Arguments.File)
@@ -428,20 +439,24 @@ func (ds *debuggerSession) continueExecution(ctx context.Context, _ *mcp.ServerS
 		return nil, fmt.Errorf("debugger not started")
 	}
 
-	// If "to" is specified, set a temporary breakpoint
+	// If "to" is specified, set a temporary breakpoint before continuing.
 	if params.Arguments.To != nil {
 		to := params.Arguments.To
-		if to.Function != "" {
-			if _, err := ds.client.SetFunctionBreakpointsRequest([]string{to.Function}); err != nil {
-				return nil, err
-			}
-		} else if to.File != "" && to.Line > 0 {
-			if _, err := ds.client.SetBreakpointsRequest(to.File, []int{to.Line}); err != nil {
-				return nil, err
-			}
+		var toSeq int
+		var err error
+		switch {
+		case to.Function != "":
+			toSeq, err = ds.client.SetFunctionBreakpointsRequest([]string{to.Function})
+		case to.File != "" && to.Line > 0:
+			toSeq, err = ds.client.SetBreakpointsRequest(to.File, []int{to.Line})
 		}
-		if _, err := ds.client.ReadMessage(); err != nil {
+		if err != nil {
 			return nil, err
+		}
+		if toSeq != 0 {
+			if err := awaitResponseValidate(ctx, ds.client, toSeq, "unable to set run-to-cursor breakpoint"); err != nil {
+				return nil, err
+			}
 		}
 	}
 
@@ -449,35 +464,31 @@ func (ds *debuggerSession) continueExecution(ctx context.Context, _ *mcp.ServerS
 	if threadID == 0 {
 		threadID = ds.defaultThreadID()
 	}
+
+	// Capture since BEFORE sending so the pump's replay ring covers any
+	// stopped/terminated event that arrives between send and Subscribe.
+	since := time.Now()
 	continueSeq, err := ds.client.ContinueRequest(threadID)
 	if err != nil {
 		return nil, err
 	}
-
-	for {
-		msg, err := ds.client.ReadMessage()
-		if err != nil {
-			return nil, err
-		}
-		switch resp := msg.(type) {
-		case dap.ResponseMessage:
-			r := resp.GetResponse()
-			if r.RequestSeq != continueSeq {
-				log.Printf("continueExecution: skipping out-of-order response (request_seq=%d, waiting for %d)", r.RequestSeq, continueSeq)
-				continue
-			}
-			if !r.Success {
-				return nil, fmt.Errorf("continue failed: %s", r.Message)
-			}
-		case *dap.StoppedEvent:
-			ds.stoppedThreadID = resp.Body.ThreadId
-			return ds.getFullContext(resp.Body.ThreadId, 0, 20)
-		case *dap.TerminatedEvent:
-			return &mcp.CallToolResultFor[any]{
-				Content: []mcp.Content{&mcp.TextContent{Text: "Program terminated"}},
-			}, nil
-		}
+	if err := awaitResponseValidate(ctx, ds.client, continueSeq, "continue failed"); err != nil {
+		return nil, err
 	}
+
+	// Phase 2 preserves blocking semantics: wait for stop or termination via
+	// event subscriptions. Phase 3 will split this into a separate wait-for-stop tool.
+	stopped, terminated, err := awaitStopOrTerminate(ctx, ds.client, since)
+	if err != nil {
+		return nil, err
+	}
+	if terminated != nil {
+		return &mcp.CallToolResultFor[any]{
+			Content: []mcp.Content{&mcp.TextContent{Text: "Program terminated"}},
+		}, nil
+	}
+	ds.stoppedThreadID = stopped.Body.ThreadId
+	return ds.getFullContext(ctx, stopped.Body.ThreadId, 0, 20)
 }
 
 // PauseParams defines the parameters for pausing execution.
@@ -496,7 +507,7 @@ func (ds *debuggerSession) pauseExecution(ctx context.Context, _ *mcp.ServerSess
 	if err != nil {
 		return nil, err
 	}
-	if err := readAndValidateResponse(ds.client, seq, "unable to pause execution"); err != nil {
+	if err := awaitResponseValidate(ctx, ds.client, seq, "unable to pause execution"); err != nil {
 		return nil, err
 	}
 
@@ -538,37 +549,17 @@ func (ds *debuggerSession) evaluateExpression(ctx context.Context, _ *mcp.Server
 		return nil, err
 	}
 
-	for {
-		msg, err := ds.client.ReadMessage()
-		if err != nil {
-			return nil, err
-		}
-		switch resp := msg.(type) {
-		case *dap.EvaluateResponse:
-			if !resp.Success {
-				return nil, fmt.Errorf("unable to evaluate expression: %s", resp.Message)
-			}
-			result := resp.Body.Result
-			if resp.Body.Type != "" {
-				result = fmt.Sprintf("%s (type: %s)", resp.Body.Result, resp.Body.Type)
-			}
-			return &mcp.CallToolResultFor[any]{
-				Content: []mcp.Content{&mcp.TextContent{Text: result}},
-			}, nil
-		case dap.ResponseMessage:
-			r := resp.GetResponse()
-			if r.RequestSeq == evalSeq {
-				if !r.Success {
-					return nil, fmt.Errorf("unable to evaluate expression: %s", r.Message)
-				}
-			}
-			log.Printf("evaluate: skipping out-of-order %T response (request_seq=%d, waiting for %d)",
-				resp, r.RequestSeq, evalSeq)
-			continue
-		case dap.EventMessage:
-			continue
-		}
+	resp, err := awaitResponseTyped[*dap.EvaluateResponse](ctx, ds.client, evalSeq)
+	if err != nil {
+		return nil, fmt.Errorf("unable to evaluate expression: %w", err)
 	}
+	result := resp.Body.Result
+	if resp.Body.Type != "" {
+		result = fmt.Sprintf("%s (type: %s)", resp.Body.Result, resp.Body.Type)
+	}
+	return &mcp.CallToolResultFor[any]{
+		Content: []mcp.Content{&mcp.TextContent{Text: result}},
+	}, nil
 }
 
 // SetVariableParams defines the parameters for setting a variable.
@@ -589,7 +580,7 @@ func (ds *debuggerSession) setVariable(ctx context.Context, _ *mcp.ServerSession
 	if err != nil {
 		return nil, err
 	}
-	if err := readAndValidateResponse(ds.client, seq, "unable to set variable"); err != nil {
+	if err := awaitResponseValidate(ctx, ds.client, seq, "unable to set variable"); err != nil {
 		return nil, err
 	}
 	return &mcp.CallToolResultFor[any]{
@@ -621,7 +612,7 @@ func (ds *debuggerSession) restartDebugger(ctx context.Context, _ *mcp.ServerSes
 	if err != nil {
 		return nil, err
 	}
-	if err := readAndValidateResponse(ds.client, seq, "unable to restart debugger"); err != nil {
+	if err := awaitResponseValidate(ctx, ds.client, seq, "unable to restart debugger"); err != nil {
 		return nil, err
 	}
 
@@ -653,7 +644,7 @@ func (ds *debuggerSession) info(ctx context.Context, _ *mcp.ServerSession, param
 		if err != nil {
 			return nil, err
 		}
-		resp, err := readTypedResponse[*dap.ThreadsResponse](ds.client, seq)
+		resp, err := awaitResponseTyped[*dap.ThreadsResponse](ctx, ds.client, seq)
 		if err != nil {
 			return nil, fmt.Errorf("failed to get threads: %w", err)
 		}
@@ -674,7 +665,7 @@ func (ds *debuggerSession) info(ctx context.Context, _ *mcp.ServerSession, param
 		if err != nil {
 			return nil, err
 		}
-		resp, err := readTypedResponse[*dap.LoadedSourcesResponse](ds.client, seq)
+		resp, err := awaitResponseTyped[*dap.LoadedSourcesResponse](ctx, ds.client, seq)
 		if err != nil {
 			return nil, fmt.Errorf("failed to get loaded sources: %w", err)
 		}
@@ -695,7 +686,7 @@ func (ds *debuggerSession) info(ctx context.Context, _ *mcp.ServerSession, param
 		if err != nil {
 			return nil, err
 		}
-		resp, err := readTypedResponse[*dap.ModulesResponse](ds.client, seq)
+		resp, err := awaitResponseTyped[*dap.ModulesResponse](ctx, ds.client, seq)
 		if err != nil {
 			return nil, fmt.Errorf("failed to get modules: %w", err)
 		}
@@ -737,7 +728,7 @@ func (ds *debuggerSession) disassembleCode(ctx context.Context, _ *mcp.ServerSes
 		return nil, err
 	}
 
-	disResp, err := readTypedResponse[*dap.DisassembleResponse](ds.client, seq)
+	disResp, err := awaitResponseTyped[*dap.DisassembleResponse](ctx, ds.client, seq)
 	if err != nil {
 		return nil, fmt.Errorf("unable to disassemble: %w", err)
 	}
@@ -775,7 +766,7 @@ func (ds *debuggerSession) stop(ctx context.Context, _ *mcp.ServerSession, param
 		if err != nil {
 			log.Printf("stop: disconnect request failed: %v", err)
 		} else {
-			if err := readAndValidateResponse(ds.client, seq, "disconnect"); err != nil {
+			if err := awaitResponseValidate(ctx, ds.client, seq, "disconnect"); err != nil {
 				log.Printf("stop: disconnect response error: %v", err)
 			}
 		}
@@ -940,7 +931,7 @@ func (ds *debuggerSession) debug(ctx context.Context, _ *mcp.ServerSession, para
 	ds.client.SetReinitHook(ds.reinitialize)
 	ds.client.Start()
 
-	caps, err := ds.client.InitializeRequest(ds.backend.AdapterID())
+	caps, err := ds.client.InitializeRequest(ctx, ds.backend.AdapterID())
 	if err != nil {
 		return nil, err
 	}
@@ -952,8 +943,12 @@ func (ds *debuggerSession) debug(ctx context.Context, _ *mcp.ServerSession, para
 	ds.programArgs = params.Arguments.Args
 	ds.coreFilePath = params.Arguments.CoreFilePath
 
-	// Launch or attach using backend-specific args
+	// Launch or attach using backend-specific args. Capture launchSeq so we can
+	// await its response via the pump registry; and capture since BEFORE sending
+	// so Subscribe's replay ring covers InitializedEvent if it arrives early.
 	stopOnEntry := params.Arguments.StopOnEntry || len(params.Arguments.Breakpoints) == 0
+	since := time.Now()
+	var launchSeq int
 	switch mode {
 	case "source", "binary":
 		launchArgs, err := ds.backend.LaunchArgs(mode, params.Arguments.Path, stopOnEntry, params.Arguments.Args)
@@ -963,7 +958,8 @@ func (ds *debuggerSession) debug(ctx context.Context, _ *mcp.ServerSession, para
 		req := ds.client.newRequest("launch")
 		request := &dap.LaunchRequest{Request: *req}
 		request.Arguments = toRawMessage(launchArgs)
-		if err := ds.client.send(request); err != nil {
+		launchSeq = req.Seq
+		if err := ds.client.sendAndRegister(launchSeq, request); err != nil {
 			return nil, err
 		}
 	case "core":
@@ -974,7 +970,8 @@ func (ds *debuggerSession) debug(ctx context.Context, _ *mcp.ServerSession, para
 		req := ds.client.newRequest("launch")
 		request := &dap.LaunchRequest{Request: *req}
 		request.Arguments = toRawMessage(coreArgs)
-		if err := ds.client.send(request); err != nil {
+		launchSeq = req.Seq
+		if err := ds.client.sendAndRegister(launchSeq, request); err != nil {
 			return nil, err
 		}
 	case "attach":
@@ -985,38 +982,38 @@ func (ds *debuggerSession) debug(ctx context.Context, _ *mcp.ServerSession, para
 		req := ds.client.newRequest("attach")
 		request := &dap.AttachRequest{Request: *req}
 		request.Arguments = toRawMessage(attachArgs)
-		if err := ds.client.send(request); err != nil {
+		launchSeq = req.Seq
+		if err := ds.client.sendAndRegister(launchSeq, request); err != nil {
 			return nil, err
 		}
 	}
-	// After sending the launch/attach request, we must handle two DAP patterns:
+
+	// Different adapters send the launch/attach response and InitializedEvent
+	// in different orders (Delve: response first, then event; GDB native DAP:
+	// either order). The pump handles this transparently — response goes to
+	// the registry, event goes to the bus, regardless of wire order.
 	//
-	// Delve: launch response arrives immediately, then initialized event.
-	//
-	// GDB native DAP: may send an "initialized" event before or after the
-	// launch response.
-	//
-	// We unify both by reading messages until we see the initialized event.
-	// The launch response may arrive before or after — if it arrives here,
-	// we consume it. If it arrives later, it will be automatically skipped
-	// as an out-of-order response by subsequent seq-based readers.
-	for {
-		msg, err := ds.client.ReadMessage()
-		if err != nil {
-			return nil, err
-		}
-		switch resp := msg.(type) {
-		case dap.ResponseMessage:
-			if !resp.GetResponse().Success {
-				return nil, fmt.Errorf("unable to start debug session: %s", resp.GetResponse().Message)
-			}
-			// Launch response consumed; continue reading for initialized event
-		case *dap.InitializedEvent:
-			_ = resp
-			goto initialized
+	// Subscribe first so the replay ring covers an event that arrived between
+	// send and Subscribe. Then await response (verify success), then event.
+	initSub, initCancel := Subscribe[*dap.InitializedEvent](ds.client, since)
+	defer initCancel()
+
+	launchRespMsg, err := ds.client.AwaitResponse(ctx, launchSeq)
+	if err != nil {
+		return nil, err
+	}
+	if r, ok := launchRespMsg.(dap.ResponseMessage); ok {
+		if !r.GetResponse().Success {
+			return nil, fmt.Errorf("unable to start debug session: %s", r.GetResponse().Message)
 		}
 	}
-initialized:
+
+	select {
+	case <-initSub:
+		// InitializedEvent received.
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 
 	// Set breakpoints
 	for _, bp := range params.Arguments.Breakpoints {
@@ -1025,7 +1022,7 @@ initialized:
 			if err != nil {
 				return nil, err
 			}
-			if err := readAndValidateResponse(ds.client, seq, "unable to set function breakpoint"); err != nil {
+			if err := awaitResponseValidate(ctx, ds.client, seq, "unable to set function breakpoint"); err != nil {
 				return nil, err
 			}
 		} else if bp.File != "" && bp.Line > 0 {
@@ -1033,7 +1030,7 @@ initialized:
 			if err != nil {
 				return nil, err
 			}
-			if err := readAndValidateResponse(ds.client, seq, "unable to set breakpoint"); err != nil {
+			if err := awaitResponseValidate(ctx, ds.client, seq, "unable to set breakpoint"); err != nil {
 				return nil, err
 			}
 		}
@@ -1044,14 +1041,13 @@ initialized:
 	if err != nil {
 		return nil, err
 	}
-	if err := readAndValidateResponse(ds.client, configSeq, "unable to complete configuration"); err != nil {
+	if err := awaitResponseValidate(ctx, ds.client, configSeq, "unable to complete configuration"); err != nil {
 		return nil, err
 	}
 
-	// If the launch response was deferred (arrived after the initialized event),
-	// it will be automatically consumed and skipped as an out-of-order response by
-	// subsequent readAndValidateResponse/readTypedResponse calls, which match
-	// by request_seq.
+	// Launch response was already consumed above via AwaitResponse(launchSeq);
+	// any unrelated DAP events that arrived during startup went to the event bus
+	// (dropped if no subscriber).
 
 	// Register session-specific tools based on capabilities
 	ds.registerSessionTools()
@@ -1059,21 +1055,20 @@ initialized:
 	// For core dump mode, the program is already stopped at the crash point.
 	// Wait for the StoppedEvent from the adapter before returning context.
 	if mode == "core" {
-		for {
-			msg, err := ds.client.ReadMessage()
-			if err != nil {
-				return nil, err
+		stopSub, stopCancel := Subscribe[*dap.StoppedEvent](ds.client, since)
+		defer stopCancel()
+		select {
+		case ev, ok := <-stopSub:
+			if !ok {
+				return nil, ErrConnectionStale
 			}
-			switch ev := msg.(type) {
-			case *dap.StoppedEvent:
-				ds.stoppedThreadID = ev.Body.ThreadId
-				if ds.stoppedThreadID == 0 {
-					ds.stoppedThreadID = 1
-				}
-				return ds.getFullContext(ds.stoppedThreadID, 0, 20)
-			case dap.EventMessage:
-				continue
+			ds.stoppedThreadID = ev.Body.ThreadId
+			if ds.stoppedThreadID == 0 {
+				ds.stoppedThreadID = 1
 			}
+			return ds.getFullContext(ctx, ds.stoppedThreadID, 0, 20)
+		case <-ctx.Done():
+			return nil, ctx.Err()
 		}
 	}
 
@@ -1089,16 +1084,23 @@ initialized:
 	// We handle both by reading the first StoppedEvent. If it's an entry stop,
 	// we send ContinueRequest and wait for the next stop.
 	if len(params.Arguments.Breakpoints) > 0 && !params.Arguments.StopOnEntry {
+		stopSub, stopCancel := Subscribe[*dap.StoppedEvent](ds.client, since)
+		defer stopCancel()
+		termSub, termCancel := Subscribe[*dap.TerminatedEvent](ds.client, since)
+		defer termCancel()
+
 		var stoppedThreadID int
+	waitLoop:
 		for {
-			msg, err := ds.client.ReadMessage()
-			if err != nil {
-				return nil, err
-			}
-			switch ev := msg.(type) {
-			case *dap.StoppedEvent:
+			select {
+			case ev, ok := <-stopSub:
+				if !ok {
+					return nil, ErrConnectionStale
+				}
 				if ev.Body.Reason == "entry" {
-					// Stopped at entry — send continue to reach the breakpoint
+					// Stopped at entry — send continue to reach the breakpoint.
+					// The response will be delivered to the registry (we ignore it)
+					// and the next StoppedEvent will arrive via the same subscription.
 					if _, err := ds.client.ContinueRequest(ev.Body.ThreadId); err != nil {
 						return nil, err
 					}
@@ -1106,22 +1108,27 @@ initialized:
 				}
 				stoppedThreadID = ev.Body.ThreadId
 				ds.stoppedThreadID = stoppedThreadID
-				goto stopped
-			case *dap.TerminatedEvent:
-				goto stopped
+				break waitLoop
+			case _, ok := <-termSub:
+				if !ok {
+					return nil, ErrConnectionStale
+				}
+				break waitLoop
+			case <-ctx.Done():
+				return nil, ctx.Err()
 			}
 		}
-	stopped:
 		if stoppedThreadID == 0 {
 			stoppedThreadID = 1
 		}
 		// Return full context when stopped at breakpoint
-		return ds.getFullContext(stoppedThreadID, 0, 20)
+		return ds.getFullContext(ctx, stoppedThreadID, 0, 20)
 	}
 
 	// Return simple success message when stopped on entry.
-	// The StoppedEvent from the adapter (if any) will be consumed by the
-	// next readTypedResponse call, which skips EventMessages.
+	// Any StoppedEvent from the adapter lands in the pump's event bus and is
+	// dropped when no subscriber is active; continue/step handlers subscribe
+	// fresh when needed.
 	return &mcp.CallToolResultFor[any]{
 		Content: []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf("Debug session started for %s. Use 'breakpoint' to set breakpoints and 'continue' to run.", params.Arguments.Path)}},
 	}, nil
@@ -1139,11 +1146,11 @@ func (ds *debuggerSession) context(ctx context.Context, _ *mcp.ServerSession, pa
 	if maxFrames == 0 {
 		maxFrames = 20
 	}
-	result, err := ds.getFullContext(threadID, params.Arguments.FrameID.Int(), maxFrames)
+	result, err := ds.getFullContext(ctx, threadID, params.Arguments.FrameID.Int(), maxFrames)
 	if err != nil {
 		// If the thread ID was invalid, try to help by listing available threads
 		if strings.Contains(err.Error(), "threadId") || strings.Contains(err.Error(), "thread") {
-			threadList := ds.getThreadList()
+			threadList := ds.getThreadList(ctx)
 			if threadList != "" {
 				return nil, fmt.Errorf("%w\n\nAvailable threads (use info tool with type 'threads' to refresh):\n%s", err, threadList)
 			}
@@ -1154,7 +1161,7 @@ func (ds *debuggerSession) context(ctx context.Context, _ *mcp.ServerSession, pa
 }
 
 // getThreadList returns a formatted string of available threads, or empty string on error.
-func (ds *debuggerSession) getThreadList() string {
+func (ds *debuggerSession) getThreadList(ctx context.Context) string {
 	if ds.client == nil {
 		return ""
 	}
@@ -1162,7 +1169,7 @@ func (ds *debuggerSession) getThreadList() string {
 	if err != nil {
 		return ""
 	}
-	resp, err := readTypedResponse[*dap.ThreadsResponse](ds.client, seq)
+	resp, err := awaitResponseTyped[*dap.ThreadsResponse](ctx, ds.client, seq)
 	if err != nil {
 		return ""
 	}
@@ -1186,54 +1193,46 @@ func (ds *debuggerSession) step(ctx context.Context, _ *mcp.ServerSession, param
 		threadID = ds.defaultThreadID()
 	}
 
+	// Capture since BEFORE sending so the pump's replay ring covers any
+	// stopped/terminated event that arrives between send and Subscribe.
+	since := time.Now()
+
 	// Execute the appropriate step command
+	var stepSeq int
+	var err error
 	switch params.Arguments.Mode {
 	case "over":
-		stepSeq, err := ds.client.NextRequest(threadID)
-		if err != nil {
-			return nil, err
-		}
-		_ = stepSeq
+		stepSeq, err = ds.client.NextRequest(threadID)
 	case "in":
-		stepSeq, err := ds.client.StepInRequest(threadID)
-		if err != nil {
-			return nil, err
-		}
-		_ = stepSeq
+		stepSeq, err = ds.client.StepInRequest(threadID)
 	case "out":
-		stepSeq, err := ds.client.StepOutRequest(threadID)
-		if err != nil {
-			return nil, err
-		}
-		_ = stepSeq
+		stepSeq, err = ds.client.StepOutRequest(threadID)
 	default:
 		return nil, fmt.Errorf("invalid step mode: %s (must be 'over', 'in', or 'out')", params.Arguments.Mode)
 	}
-
-	// Wait for stopped or terminated event
-	for {
-		msg, err := ds.client.ReadMessage()
-		if err != nil {
-			return nil, err
-		}
-		switch resp := msg.(type) {
-		case dap.ResponseMessage:
-			if !resp.GetResponse().Success {
-				return nil, fmt.Errorf("step failed: %s", resp.GetResponse().Message)
-			}
-		case *dap.StoppedEvent:
-			ds.stoppedThreadID = resp.Body.ThreadId
-			return ds.getFullContext(resp.Body.ThreadId, 0, 20)
-		case *dap.TerminatedEvent:
-			return &mcp.CallToolResultFor[any]{
-				Content: []mcp.Content{&mcp.TextContent{Text: "Program terminated"}},
-			}, nil
-		}
+	if err != nil {
+		return nil, err
 	}
+	if err := awaitResponseValidate(ctx, ds.client, stepSeq, "step failed"); err != nil {
+		return nil, err
+	}
+
+	// Wait for stopped or terminated event via pump subscriptions.
+	stopped, terminated, err := awaitStopOrTerminate(ctx, ds.client, since)
+	if err != nil {
+		return nil, err
+	}
+	if terminated != nil {
+		return &mcp.CallToolResultFor[any]{
+			Content: []mcp.Content{&mcp.TextContent{Text: "Program terminated"}},
+		}, nil
+	}
+	ds.stoppedThreadID = stopped.Body.ThreadId
+	return ds.getFullContext(ctx, stopped.Body.ThreadId, 0, 20)
 }
 
 // getFullContext returns a complete context dump including location, stack trace, scopes, and variables.
-func (ds *debuggerSession) getFullContext(threadID, frameID, maxFrames int) (*mcp.CallToolResultFor[any], error) {
+func (ds *debuggerSession) getFullContext(ctx context.Context, threadID, frameID, maxFrames int) (*mcp.CallToolResultFor[any], error) {
 	if ds.client == nil {
 		return nil, fmt.Errorf("debugger not started")
 	}
@@ -1245,7 +1244,7 @@ func (ds *debuggerSession) getFullContext(threadID, frameID, maxFrames int) (*mc
 	if err != nil {
 		return nil, err
 	}
-	stResp, err := readTypedResponse[*dap.StackTraceResponse](ds.client, stSeq)
+	stResp, err := awaitResponseTyped[*dap.StackTraceResponse](ctx, ds.client, stSeq)
 	if err != nil {
 		return nil, fmt.Errorf("unable to get stack trace: %w", err)
 	}
@@ -1284,7 +1283,7 @@ func (ds *debuggerSession) getFullContext(threadID, frameID, maxFrames int) (*mc
 	ds.lastFrameID = targetFrameID
 
 	// Get scopes and variables
-	ds.writeScopesAndVariables(&result, targetFrameID)
+	ds.writeScopesAndVariables(ctx, &result, targetFrameID)
 
 	return &mcp.CallToolResultFor[any]{
 		Content: []mcp.Content{&mcp.TextContent{Text: result.String()}},
@@ -1294,14 +1293,14 @@ func (ds *debuggerSession) getFullContext(threadID, frameID, maxFrames int) (*mc
 // writeScopesAndVariables fetches scopes and their variables for the given
 // frame and writes them to the result builder. Errors are written inline
 // rather than propagated, since partial context is better than none.
-func (ds *debuggerSession) writeScopesAndVariables(result *strings.Builder, frameID int) {
+func (ds *debuggerSession) writeScopesAndVariables(ctx context.Context, result *strings.Builder, frameID int) {
 	scopesSeq, err := ds.client.ScopesRequest(frameID)
 	if err != nil {
 		result.WriteString("## Variables\n(unable to retrieve scopes)\n")
 		return
 	}
 
-	scopesResp, err := readTypedResponse[*dap.ScopesResponse](ds.client, scopesSeq)
+	scopesResp, err := awaitResponseTyped[*dap.ScopesResponse](ctx, ds.client, scopesSeq)
 	if err != nil {
 		result.WriteString("## Variables\n(unable to retrieve scopes)\n")
 		return
@@ -1323,7 +1322,7 @@ func (ds *debuggerSession) writeScopesAndVariables(result *strings.Builder, fram
 			result.WriteString("  (unable to retrieve variables)\n")
 			continue
 		}
-		varResp, err := readTypedResponse[*dap.VariablesResponse](ds.client, varSeq)
+		varResp, err := awaitResponseTyped[*dap.VariablesResponse](ctx, ds.client, varSeq)
 		if err != nil {
 			result.WriteString("  (unable to retrieve variables)\n")
 			continue
@@ -1365,7 +1364,7 @@ func (ds *debuggerSession) breakpoint(ctx context.Context, _ *mcp.ServerSession,
 		if err != nil {
 			return nil, err
 		}
-		if err := readAndValidateResponse(ds.client, seq, "unable to set function breakpoint"); err != nil {
+		if err := awaitResponseValidate(ctx, ds.client, seq, "unable to set function breakpoint"); err != nil {
 			return nil, err
 		}
 		// Persist state only after successful DAP call.
@@ -1404,7 +1403,7 @@ func (ds *debuggerSession) breakpoint(ctx context.Context, _ *mcp.ServerSession,
 		return nil, err
 	}
 
-	resp, err := readTypedResponse[*dap.SetBreakpointsResponse](ds.client, bpSeq)
+	resp, err := awaitResponseTyped[*dap.SetBreakpointsResponse](ctx, ds.client, bpSeq)
 	if err != nil {
 		return nil, fmt.Errorf("unable to set breakpoint: %w", err)
 	}
@@ -1452,43 +1451,44 @@ func (ds *debuggerSession) reinitialize(ctx context.Context) error {
 	log.Printf("reinitialize: starting")
 
 	// 1. Initialize
-	caps, err := ds.client.InitializeRequestRaw(ds.backend.AdapterID())
+	caps, err := ds.client.InitializeRequestRaw(ctx, ds.backend.AdapterID())
 	if err != nil {
 		return fmt.Errorf("reinitialize: InitializeRequest failed: %w", err)
 	}
 	ds.capabilities = caps
 
-	// 2. Attach with mode="remote"
+	// 2. Attach with mode="remote". Capture since BEFORE sending so Subscribe's
+	// replay ring covers InitializedEvent even if it arrives before subscription.
 	attachArgs, err := ds.backend.AttachArgs(0)
 	if err != nil {
 		return fmt.Errorf("reinitialize: AttachArgs failed: %w", err)
 	}
+	since := time.Now()
 	attachSeq, err := ds.client.AttachRequestRaw(attachArgs)
 	if err != nil {
 		return fmt.Errorf("reinitialize: AttachRequest send failed: %w", err)
 	}
 
-	// Wait for InitializedEvent; consume AttachResponse along the way.
-	for {
-		msg, err := ds.client.ReadMessage()
-		if err != nil {
-			return fmt.Errorf("reinitialize: reading for InitializedEvent: %w", err)
-		}
-		switch m := msg.(type) {
-		case *dap.InitializedEvent:
-			_ = m
-			goto reinitInitialized
-		case dap.ResponseMessage:
-			r := m.GetResponse()
-			if r.RequestSeq == attachSeq && !r.Success {
-				return fmt.Errorf("reinitialize: attach failed: %s", r.Message)
-			}
-			// skip other out-of-order responses
-		case dap.EventMessage:
-			// skip events
+	initSub, initCancel := Subscribe[*dap.InitializedEvent](ds.client, since)
+	defer initCancel()
+
+	// Await AttachResponse (routed via registry); events go to the bus.
+	attachRespMsg, err := ds.client.AwaitResponse(ctx, attachSeq)
+	if err != nil {
+		return fmt.Errorf("reinitialize: attach response: %w", err)
+	}
+	if r, ok := attachRespMsg.(dap.ResponseMessage); ok {
+		if !r.GetResponse().Success {
+			return fmt.Errorf("reinitialize: attach failed: %s", r.GetResponse().Message)
 		}
 	}
-reinitInitialized:
+
+	select {
+	case <-initSub:
+		// InitializedEvent received.
+	case <-ctx.Done():
+		return fmt.Errorf("reinitialize: waiting for InitializedEvent: %w", ctx.Err())
+	}
 
 	// 3. Re-apply source breakpoints.
 	applied := 0
@@ -1501,7 +1501,7 @@ reinitInitialized:
 		if err != nil {
 			return fmt.Errorf("reinitialize: SetBreakpointsRequest for %s failed: %w (%d/%d applied)", file, err, applied, len(ds.breakpoints))
 		}
-		if err := readAndValidateResponse(ds.client, seq, fmt.Sprintf("reinitialize SetBreakpoints %s", file)); err != nil {
+		if err := awaitResponseValidate(ctx, ds.client, seq, fmt.Sprintf("reinitialize SetBreakpoints %s", file)); err != nil {
 			return fmt.Errorf("reinitialize: SetBreakpoints response for %s: %w (%d/%d applied)", file, err, applied, len(ds.breakpoints))
 		}
 		applied++
@@ -1513,7 +1513,7 @@ reinitInitialized:
 		if err != nil {
 			return fmt.Errorf("reinitialize: SetFunctionBreakpointsRequest: %w", err)
 		}
-		if err := readAndValidateResponse(ds.client, seq, "reinitialize SetFunctionBreakpoints"); err != nil {
+		if err := awaitResponseValidate(ctx, ds.client, seq, "reinitialize SetFunctionBreakpoints"); err != nil {
 			return fmt.Errorf("reinitialize: SetFunctionBreakpoints response: %w", err)
 		}
 	}
@@ -1523,7 +1523,7 @@ reinitInitialized:
 	if err != nil {
 		return fmt.Errorf("reinitialize: ConfigurationDoneRequest: %w", err)
 	}
-	if err := readAndValidateResponse(ds.client, seq, "reinitialize ConfigurationDone"); err != nil {
+	if err := awaitResponseValidate(ctx, ds.client, seq, "reinitialize ConfigurationDone"); err != nil {
 		return fmt.Errorf("reinitialize: ConfigurationDone response: %w", err)
 	}
 
