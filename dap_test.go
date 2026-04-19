@@ -531,3 +531,488 @@ func TestReconnect_SeqContinuesMonotonically(t *testing.T) {
 			req1.Seq, req2.Seq, req3.Seq)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Phase 1: Event Pump unit tests (11 required by phase-01.md)
+// ---------------------------------------------------------------------------
+
+// pumpPipe holds a client/server pair for pump tests that exercise readLoop.
+// The test writes DAP messages to serverConn; the DAPClient receives them.
+type pumpPipe struct {
+	client     *DAPClient
+	serverConn net.Conn // test-controlled side: write responses/events here
+	clientConn net.Conn // DAPClient's underlying connection (closed via Close)
+}
+
+// newPumpPipe creates a DAPClient + in-process net.Pipe pair. The client is NOT
+// started (no goroutines). Call p.client.Start() in tests that exercise readLoop.
+func newPumpPipe(t *testing.T) *pumpPipe {
+	t.Helper()
+	serverConn, clientConn := net.Pipe()
+	c := newDAPClientFromRWC(clientConn)
+	return &pumpPipe{client: c, serverConn: serverConn, clientConn: clientConn}
+}
+
+// sendResponse writes a DAP response to the server side of the pipe so the
+// client's readLoop can pick it up. Mirrors the field layout used throughout
+// the existing test suite (Seq/Type are promoted from ProtocolMessage).
+func (p *pumpPipe) sendResponse(t *testing.T, seq, requestSeq int, command string, success bool) {
+	t.Helper()
+	resp := &dap.ErrorResponse{}
+	resp.Seq = seq
+	resp.Type = "response"
+	resp.Response.RequestSeq = requestSeq
+	resp.Response.Command = command
+	resp.Response.Success = success
+	if err := dap.WriteProtocolMessage(p.serverConn, resp); err != nil {
+		t.Errorf("sendResponse: write failed: %v", err)
+	}
+}
+
+// sendStoppedEvent writes a DAP StoppedEvent to the server side of the pipe.
+func (p *pumpPipe) sendStoppedEvent(t *testing.T, seq int) {
+	t.Helper()
+	evt := &dap.StoppedEvent{}
+	evt.Seq = seq
+	evt.Type = "event"
+	evt.Event.Event = "stopped"
+	evt.Body.Reason = "breakpoint"
+	if err := dap.WriteProtocolMessage(p.serverConn, evt); err != nil {
+		t.Errorf("sendStoppedEvent: write failed: %v", err)
+	}
+}
+
+// cleanup closes both sides of the pipe and waits for readLoop to exit.
+func (p *pumpPipe) cleanup(t *testing.T) {
+	t.Helper()
+	_ = p.serverConn.Close()
+	p.client.Close()
+}
+
+// TestPump_SendRequest_RegistersBeforeWrite verifies that when the socket write
+// fails, SendRequest cleans up the channel from the registry so AwaitResponse
+// returns an error instead of hanging forever (ADR-PUMP-2).
+func TestPump_SendRequest_RegistersBeforeWrite(t *testing.T) {
+	t.Parallel()
+
+	writeErr := errors.New("broken pipe")
+	rwc := &mockRWC{
+		writeFn: func(p []byte) (int, error) { return 0, writeErr },
+		closeFn: func() error { return nil },
+	}
+	c := newDAPClientInternal(rwc, "", nil)
+	defer c.Close()
+
+	req := c.newRequest("threads")
+	seq, err := c.SendRequest(req)
+	if err == nil {
+		t.Fatalf("expected SendRequest to return write error, got nil (seq=%d)", seq)
+	}
+
+	// Registry must be empty — AwaitResponse should return "no pending request".
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	_, awaitErr := c.AwaitResponse(ctx, seq)
+	if awaitErr == nil {
+		t.Fatal("expected AwaitResponse to return error after SendRequest failure, got nil")
+	}
+	// Should not be a context timeout (the registry entry must have been cleaned up).
+	if errors.Is(awaitErr, context.DeadlineExceeded) {
+		t.Fatalf("AwaitResponse timed out — registry entry was not cleaned up on write failure")
+	}
+}
+
+// TestPump_AwaitResponse_RespectsContext verifies that AwaitResponse honours
+// the provided context and returns ctx.Err() on deadline/cancellation.
+func TestPump_AwaitResponse_RespectsContext(t *testing.T) {
+	t.Parallel()
+
+	rwc := &mockRWC{
+		writeFn: func(p []byte) (int, error) { return len(p), nil },
+		closeFn: func() error { return nil },
+	}
+	c := newDAPClientInternal(rwc, "", nil)
+	defer c.Close()
+
+	// Register a channel manually (simulating SendRequest without a real write).
+	seq := 42
+	ch := make(chan dap.Message, 1)
+	c.registryMu.Lock()
+	c.responses[seq] = ch
+	c.registryMu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	_, err := c.AwaitResponse(ctx, seq)
+	elapsed := time.Since(start)
+
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expected context.DeadlineExceeded, got %v", err)
+	}
+	if elapsed > 50*time.Millisecond {
+		t.Fatalf("AwaitResponse took too long: %s (expected ≤ 50ms)", elapsed)
+	}
+}
+
+// TestPump_AwaitResponse_StaleClosesChannel verifies that closeRegistry closes
+// pending channels so AwaitResponse returns ErrConnectionStale.
+func TestPump_AwaitResponse_StaleClosesChannel(t *testing.T) {
+	t.Parallel()
+
+	rwc := &mockRWC{
+		writeFn: func(p []byte) (int, error) { return len(p), nil },
+		closeFn: func() error { return nil },
+	}
+	c := newDAPClientInternal(rwc, "", nil)
+	defer c.Close()
+
+	// Manually register a channel.
+	seq := 77
+	ch := make(chan dap.Message, 1)
+	c.registryMu.Lock()
+	c.responses[seq] = ch
+	c.registryMu.Unlock()
+
+	// Call closeRegistry in a separate goroutine after a brief delay.
+	go func() {
+		time.Sleep(10 * time.Millisecond)
+		c.closeRegistry(ErrConnectionStale)
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+
+	_, err := c.AwaitResponse(ctx, seq)
+	if !errors.Is(err, ErrConnectionStale) {
+		t.Fatalf("expected ErrConnectionStale, got %v", err)
+	}
+}
+
+// TestPump_Subscribe_DropOnFullBuffer verifies that dispatching 70 events to a
+// subscriber with buffer 64 does not block the pump (ADR-PUMP-4).
+// The bridge goroutine may drain sub.ch concurrently, so the total received can
+// be anywhere from 1 to total; the key invariant is no deadlock and no panic.
+func TestPump_Subscribe_DropOnFullBuffer(t *testing.T) {
+	t.Parallel()
+
+	rwc := &mockRWC{
+		writeFn: func(p []byte) (int, error) { return len(p), nil },
+		closeFn: func() error { return nil },
+	}
+	c := newDAPClientInternal(rwc, "", nil)
+	defer c.Close()
+
+	ch, cancel := Subscribe[*dap.StoppedEvent](c, time.Time{})
+	defer cancel()
+
+	const total = 70
+	for i := 0; i < total; i++ {
+		evt := &dap.StoppedEvent{}
+		evt.Event.Type = "event"
+		evt.Event.Event = "stopped"
+		evt.Event.Seq = i + 1
+		evt.Body.Reason = "breakpoint"
+		c.dispatchEvent(evt)
+	}
+
+	// Drain the output channel (bridge goroutine is running).
+	// Give the bridge goroutine time to forward messages.
+	time.Sleep(10 * time.Millisecond)
+
+	received := 0
+drain:
+	for {
+		select {
+		case _, ok := <-ch:
+			if !ok {
+				break drain
+			}
+			received++
+		default:
+			break drain
+		}
+	}
+
+	if received > total {
+		t.Fatalf("received %d events, expected at most %d (total dispatched)", received, total)
+	}
+	if received == 0 {
+		t.Fatal("received 0 events, expected at least 1")
+	}
+	// The pump must not have blocked — if we got here, the dispatch loop completed.
+}
+
+// TestPump_Subscribe_TypedEventFilter verifies that a Subscribe[*dap.StoppedEvent]
+// subscription does not receive *dap.OutputEvent dispatches.
+func TestPump_Subscribe_TypedEventFilter(t *testing.T) {
+	t.Parallel()
+
+	rwc := &mockRWC{
+		writeFn: func(p []byte) (int, error) { return len(p), nil },
+		closeFn: func() error { return nil },
+	}
+	c := newDAPClientInternal(rwc, "", nil)
+	defer c.Close()
+
+	ch, cancel := Subscribe[*dap.StoppedEvent](c, time.Time{})
+	defer cancel()
+
+	// Dispatch an OutputEvent — must NOT arrive on the StoppedEvent channel.
+	out := &dap.OutputEvent{}
+	out.Event.Type = "event"
+	out.Event.Event = "output"
+	out.Body.Output = "hello\n"
+	c.dispatchEvent(out)
+
+	// Give the bridge goroutine time to potentially (wrongly) forward.
+	time.Sleep(10 * time.Millisecond)
+
+	select {
+	case evt := <-ch:
+		t.Fatalf("unexpected event on StoppedEvent channel: %T %+v", evt, evt)
+	default:
+		// correct: nothing received
+	}
+}
+
+// TestPump_Subscribe_ReplayWithinWindow verifies that Subscribe with since=T0
+// delivers events that arrived at T0 or after, and skips events before T0.
+func TestPump_Subscribe_ReplayWithinWindow(t *testing.T) {
+	t.Parallel()
+
+	rwc := &mockRWC{
+		writeFn: func(p []byte) (int, error) { return len(p), nil },
+		closeFn: func() error { return nil },
+	}
+	c := newDAPClientInternal(rwc, "", nil)
+	defer c.Close()
+
+	// Inject an event directly into the ring, simulating what dispatchEvent does.
+	t0 := time.Now()
+	evt := &dap.StoppedEvent{}
+	evt.Event.Type = "event"
+	evt.Event.Event = "stopped"
+	evt.Event.Seq = 1
+	evt.Body.Reason = "breakpoint"
+	c.replayRing.push(ringEntry{t: t0, msg: evt})
+
+	// since = t0-1s should receive the event (t0 >= since).
+	ch1, cancel1 := Subscribe[*dap.StoppedEvent](c, t0.Add(-1*time.Second))
+	defer cancel1()
+
+	time.Sleep(5 * time.Millisecond) // let bridge goroutine forward
+	select {
+	case got := <-ch1:
+		if got.Event.Seq != 1 {
+			t.Fatalf("replay: expected seq=1, got seq=%d", got.Event.Seq)
+		}
+	default:
+		t.Fatal("expected replay event on ch1, got nothing")
+	}
+
+	// since = t0+1s should NOT receive the event (t0 < since).
+	ch2, cancel2 := Subscribe[*dap.StoppedEvent](c, t0.Add(1*time.Second))
+	defer cancel2()
+
+	time.Sleep(5 * time.Millisecond)
+	select {
+	case got := <-ch2:
+		t.Fatalf("unexpected replay event on ch2: %+v", got)
+	default:
+		// correct: nothing replayed
+	}
+}
+
+// TestPump_Unsubscribe_StopsDelivery verifies that calling cancel() stops
+// further event delivery to the subscription channel.
+func TestPump_Unsubscribe_StopsDelivery(t *testing.T) {
+	t.Parallel()
+
+	rwc := &mockRWC{
+		writeFn: func(p []byte) (int, error) { return len(p), nil },
+		closeFn: func() error { return nil },
+	}
+	c := newDAPClientInternal(rwc, "", nil)
+	defer c.Close()
+
+	ch, cancel := Subscribe[*dap.StoppedEvent](c, time.Time{})
+
+	// Cancel the subscription.
+	cancel()
+	// Allow bridge goroutine to drain and exit.
+	time.Sleep(10 * time.Millisecond)
+
+	// Dispatch an event — should not arrive on ch (either ch is closed or empty).
+	evt := &dap.StoppedEvent{}
+	evt.Event.Type = "event"
+	evt.Event.Event = "stopped"
+	evt.Event.Seq = 99
+	c.dispatchEvent(evt)
+
+	time.Sleep(10 * time.Millisecond)
+
+	// The channel should be drained or closed; no new events expected.
+	select {
+	case got, ok := <-ch:
+		if ok {
+			t.Fatalf("unexpected event after cancel: %+v", got)
+		}
+		// channel closed — correct
+	default:
+		// channel empty and not closed — also acceptable
+	}
+}
+
+// TestPump_Unsubscribe_IdempotentDoubleCancel verifies that calling cancel()
+// twice does not panic.
+func TestPump_Unsubscribe_IdempotentDoubleCancel(t *testing.T) {
+	t.Parallel()
+
+	rwc := &mockRWC{
+		writeFn: func(p []byte) (int, error) { return len(p), nil },
+		closeFn: func() error { return nil },
+	}
+	c := newDAPClientInternal(rwc, "", nil)
+	defer c.Close()
+
+	_, cancel := Subscribe[*dap.StoppedEvent](c, time.Time{})
+	cancel()
+	// Second cancel must not panic.
+	cancel()
+}
+
+// TestPump_ReplaceConn_DrainsOldRegistry verifies that calling replaceConn
+// closes all pending response channels so AwaitResponse returns ErrConnectionStale.
+func TestPump_ReplaceConn_DrainsOldRegistry(t *testing.T) {
+	t.Parallel()
+
+	rwc1 := &mockRWC{
+		writeFn: func(p []byte) (int, error) { return len(p), nil },
+		closeFn: func() error { return nil },
+	}
+	c := newDAPClientInternal(rwc1, "", nil)
+	defer c.Close()
+
+	// Register N pending response channels.
+	const N = 5
+	seqs := make([]int, N)
+	for i := 0; i < N; i++ {
+		ch := make(chan dap.Message, 1)
+		c.mu.Lock()
+		seq := c.seq
+		c.seq++
+		c.mu.Unlock()
+		seqs[i] = seq
+		c.registryMu.Lock()
+		c.responses[seq] = ch
+		c.registryMu.Unlock()
+	}
+
+	// Replace the connection — must drain the registry.
+	rwc2 := &mockRWC{
+		writeFn: func(p []byte) (int, error) { return len(p), nil },
+		closeFn: func() error { return nil },
+	}
+	c.replaceConn(rwc2)
+
+	// All pending AwaitResponse calls must return ErrConnectionStale.
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	for _, seq := range seqs {
+		_, err := c.AwaitResponse(ctx, seq)
+		if !errors.Is(err, ErrConnectionStale) {
+			t.Fatalf("seq %d: expected ErrConnectionStale, got %v", seq, err)
+		}
+	}
+}
+
+// TestPump_ReadLoop_ExitsOnContextCancel verifies that Close() causes readLoop
+// to exit within 100ms (pumpDone is closed). Uses startReadLoop directly since
+// in Phase 1 Start() does not start readLoop (tools.go still uses ReadMessage;
+// migration to pump API happens in Phase 2).
+func TestPump_ReadLoop_ExitsOnContextCancel(t *testing.T) {
+	t.Parallel()
+
+	p := newPumpPipe(t)
+	p.client.startReadLoop() // Phase 1: explicit pump start, not via Start()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		p.client.Close()
+	}()
+
+	select {
+	case <-p.client.pumpDone:
+		// readLoop exited — good
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("readLoop did not exit within 100ms after Close()")
+	}
+
+	// Ensure Close() itself also returns promptly.
+	select {
+	case <-done:
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("Close() did not return within 100ms")
+	}
+
+	// Clean up server side.
+	_ = p.serverConn.Close()
+}
+
+// TestPump_Concurrent_SendAndSubscribe_Race exercises concurrent SendRequest,
+// AwaitResponse, Subscribe, and dispatchEvent/dispatchResponse under the race
+// detector to verify no data races exist (ADR-PUMP-3).
+func TestPump_Concurrent_SendAndSubscribe_Race(t *testing.T) {
+	t.Parallel()
+
+	rwc := &mockRWC{
+		writeFn: func(p []byte) (int, error) { return len(p), nil },
+		closeFn: func() error { return nil },
+	}
+	c := newDAPClientInternal(rwc, "", nil)
+	defer c.Close()
+
+	var wg sync.WaitGroup
+	const goroutines = 100
+
+	for i := 0; i < goroutines; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			switch idx % 4 {
+			case 0:
+				// SendRequest (write will succeed, no response dispatched).
+				req := c.newRequest("threads")
+				seq, err := c.SendRequest(req)
+				if err == nil {
+					// Register but don't await — just clean up via timeout.
+					ctx, cancel := context.WithTimeout(context.Background(), 1*time.Millisecond)
+					defer cancel()
+					_, _ = c.AwaitResponse(ctx, seq)
+				}
+			case 1:
+				// Subscribe and immediately unsubscribe.
+				_, cancel := Subscribe[*dap.StoppedEvent](c, time.Time{})
+				cancel()
+			case 2:
+				// dispatchEvent.
+				evt := &dap.StoppedEvent{}
+				evt.Event.Type = "event"
+				evt.Event.Event = "stopped"
+				c.dispatchEvent(evt)
+			case 3:
+				// dispatchResponse to an orphan seq (no registered channel).
+				resp := &dap.ErrorResponse{}
+				resp.Response.Type = "response"
+				resp.Response.RequestSeq = idx + 10000
+				c.dispatchResponse(resp)
+			}
+		}(i)
+	}
+
+	wg.Wait()
+}
