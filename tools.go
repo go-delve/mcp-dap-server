@@ -334,8 +334,36 @@ func awaitResponseTyped[T dap.ResponseMessage](ctx context.Context, c *DAPClient
 	return zero, fmt.Errorf("expected response, got %T (seq=%d)", msg, seq)
 }
 
+// awaitInitializedEvent subscribes to *dap.InitializedEvent and
+// *ConnectionLostEvent with the given since time, then waits for one of them
+// or ctx cancellation. Returns nil on normal receipt of InitializedEvent.
+// since MUST be captured BEFORE the request that triggers InitializedEvent.
+func awaitInitializedEvent(ctx context.Context, c *DAPClient, since time.Time) error {
+	initSub, initCancel := Subscribe[*dap.InitializedEvent](c, since)
+	defer initCancel()
+	lostSub, lostCancel := Subscribe[*ConnectionLostEvent](c, since)
+	defer lostCancel()
+	select {
+	case _, ok := <-initSub:
+		if !ok {
+			return ErrConnectionStale
+		}
+		return nil
+	case lost, ok := <-lostSub:
+		if !ok {
+			return ErrConnectionStale
+		}
+		return fmt.Errorf("%w: %v", ErrConnectionStale, lost.Err)
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
 // awaitStopOrTerminate subscribes to StoppedEvent and TerminatedEvent with the
-// given since time, then waits for whichever arrives first (or ctx cancellation).
+// given since time, then waits for whichever arrives first (or ctx cancellation,
+// or a ConnectionLostEvent signalling that the DAP connection dropped while we
+// were waiting).
+//
 // since MUST be captured BEFORE sending the request that may trigger the events,
 // so the pump's replay ring covers any event that arrives between send and
 // subscription.
@@ -346,6 +374,8 @@ func awaitStopOrTerminate(ctx context.Context, c *DAPClient, since time.Time) (*
 	defer stopCancel()
 	termSub, termCancel := Subscribe[*dap.TerminatedEvent](c, since)
 	defer termCancel()
+	lostSub, lostCancel := Subscribe[*ConnectionLostEvent](c, since)
+	defer lostCancel()
 	select {
 	case s, ok := <-stopSub:
 		if !ok {
@@ -357,6 +387,11 @@ func awaitStopOrTerminate(ctx context.Context, c *DAPClient, since time.Time) (*
 			return nil, nil, ErrConnectionStale
 		}
 		return nil, t, nil
+	case lost, ok := <-lostSub:
+		if !ok {
+			return nil, nil, ErrConnectionStale
+		}
+		return nil, nil, fmt.Errorf("%w: %v", ErrConnectionStale, lost.Err)
 	case <-ctx.Done():
 		return nil, nil, ctx.Err()
 	}
@@ -995,9 +1030,6 @@ func (ds *debuggerSession) debug(ctx context.Context, _ *mcp.ServerSession, para
 	//
 	// Subscribe first so the replay ring covers an event that arrived between
 	// send and Subscribe. Then await response (verify success), then event.
-	initSub, initCancel := Subscribe[*dap.InitializedEvent](ds.client, since)
-	defer initCancel()
-
 	launchRespMsg, err := ds.client.AwaitResponse(ctx, launchSeq)
 	if err != nil {
 		return nil, err
@@ -1008,11 +1040,8 @@ func (ds *debuggerSession) debug(ctx context.Context, _ *mcp.ServerSession, para
 		}
 	}
 
-	select {
-	case <-initSub:
-		// InitializedEvent received.
-	case <-ctx.Done():
-		return nil, ctx.Err()
+	if err := awaitInitializedEvent(ctx, ds.client, since); err != nil {
+		return nil, fmt.Errorf("debug startup: %w", err)
 	}
 
 	// Set breakpoints
@@ -1055,21 +1084,17 @@ func (ds *debuggerSession) debug(ctx context.Context, _ *mcp.ServerSession, para
 	// For core dump mode, the program is already stopped at the crash point.
 	// Wait for the StoppedEvent from the adapter before returning context.
 	if mode == "core" {
-		stopSub, stopCancel := Subscribe[*dap.StoppedEvent](ds.client, since)
-		defer stopCancel()
-		select {
-		case ev, ok := <-stopSub:
-			if !ok {
-				return nil, ErrConnectionStale
-			}
-			ds.stoppedThreadID = ev.Body.ThreadId
-			if ds.stoppedThreadID == 0 {
-				ds.stoppedThreadID = 1
-			}
-			return ds.getFullContext(ctx, ds.stoppedThreadID, 0, 20)
-		case <-ctx.Done():
-			return nil, ctx.Err()
+		stopped, _, err := awaitStopOrTerminate(ctx, ds.client, since)
+		if err != nil {
+			return nil, err
 		}
+		if stopped != nil {
+			ds.stoppedThreadID = stopped.Body.ThreadId
+		}
+		if ds.stoppedThreadID == 0 {
+			ds.stoppedThreadID = 1
+		}
+		return ds.getFullContext(ctx, ds.stoppedThreadID, 0, 20)
 	}
 
 	// If we have breakpoints and not explicitly stopping on entry, wait for the
@@ -1088,6 +1113,8 @@ func (ds *debuggerSession) debug(ctx context.Context, _ *mcp.ServerSession, para
 		defer stopCancel()
 		termSub, termCancel := Subscribe[*dap.TerminatedEvent](ds.client, since)
 		defer termCancel()
+		lostSub, lostCancel := Subscribe[*ConnectionLostEvent](ds.client, since)
+		defer lostCancel()
 
 		var stoppedThreadID int
 	waitLoop:
@@ -1114,6 +1141,11 @@ func (ds *debuggerSession) debug(ctx context.Context, _ *mcp.ServerSession, para
 					return nil, ErrConnectionStale
 				}
 				break waitLoop
+			case lost, ok := <-lostSub:
+				if !ok {
+					return nil, ErrConnectionStale
+				}
+				return nil, fmt.Errorf("debug startup: %w: %v", ErrConnectionStale, lost.Err)
 			case <-ctx.Done():
 				return nil, ctx.Err()
 			}
@@ -1469,9 +1501,6 @@ func (ds *debuggerSession) reinitialize(ctx context.Context) error {
 		return fmt.Errorf("reinitialize: AttachRequest send failed: %w", err)
 	}
 
-	initSub, initCancel := Subscribe[*dap.InitializedEvent](ds.client, since)
-	defer initCancel()
-
 	// Await AttachResponse (routed via registry); events go to the bus.
 	attachRespMsg, err := ds.client.AwaitResponse(ctx, attachSeq)
 	if err != nil {
@@ -1483,11 +1512,8 @@ func (ds *debuggerSession) reinitialize(ctx context.Context) error {
 		}
 	}
 
-	select {
-	case <-initSub:
-		// InitializedEvent received.
-	case <-ctx.Done():
-		return fmt.Errorf("reinitialize: waiting for InitializedEvent: %w", ctx.Err())
+	if err := awaitInitializedEvent(ctx, ds.client, since); err != nil {
+		return fmt.Errorf("reinitialize: waiting for InitializedEvent: %w", err)
 	}
 
 	// 3. Re-apply source breakpoints.
