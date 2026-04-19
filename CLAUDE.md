@@ -21,7 +21,7 @@ This is an MCP (Model Context Protocol) server that bridges MCP clients with DAP
 - Registered via `server.AddPrompt()` — no session state, always available
 - Each prompt returns a `GetPromptResult` with step-by-step tool invocation guidance
 
-**tools.go**: MCP tool implementations (~1200 lines)
+**tools.go**: MCP tool implementations (~1300 lines)
 - All MCP tools are methods on `debuggerSession` struct
 - Each tool method signature: `func (ds *debuggerSession) toolName(ctx context.Context, _ *mcp.ServerSession, params *mcp.CallToolParamsFor[ParamsType]) (*mcp.CallToolResultFor[any], error)`
 - Tools send DAP requests via `ds.client` and read/parse responses
@@ -66,6 +66,8 @@ This is an MCP (Model Context Protocol) server that bridges MCP clients with DAP
 
 ## Development Commands
 
+Go toolchain: `go 1.26.1` (see `go.mod`); CI pins Go 1.26.
+
 ### Build
 ```bash
 go build -o bin/mcp-dap-server
@@ -73,27 +75,31 @@ go build -o bin/mcp-dap-server
 
 ### Run Tests
 ```bash
-# Run all tests
-go test -v
+# Run all tests (CI uses ./... — keep that habit if packages are added)
+go test -v ./...
 
 # Run a specific test
 go test -v -run TestBasic
 
 # Run with race detector
-go test -race -v
+go test -race -v ./...
 
 # Run with coverage
-go test -v -coverprofile=coverage.out && go tool cover -func=coverage.out | grep total
+go test -v -coverprofile=coverage.out ./... && go tool cover -func=coverage.out | grep total
 ```
 
 ### Run the Server
+The server speaks MCP over stdio — there is no TCP port to configure. An MCP
+client spawns the binary and communicates via stdin/stdout.
 ```bash
-# Default (port 8080)
-./bin/mcp-dap-server
-
-# Or via go run
-go run .
+./bin/mcp-dap-server   # or: go run .
 ```
+
+Logs are written to `$TMPDIR/mcp-dap-server.log` (truncated on every start).
+**Never log to stderr** — MCP stdio transport uses stderr as a pipe to the
+client; a full pipe buffer will block the logging goroutine and hang the
+server. See `main.go:15-31` for the log-file plumbing and the fallback to
+`io.Discard` on open failure.
 
 ### Test Program Compilation
 Test programs are compiled with debugging symbols during test execution:
@@ -138,13 +144,14 @@ Tests in `tools_test.go` follow a common pattern:
 2. **Compilation**: `compileTestProgram()` builds test Go programs with debug flags (`-gcflags=all=-N -l`)
 3. **Session Management**: `startDebugSession()` starts a debug session with optional breakpoints
 4. **Helpers**: `callTool()` reduces boilerplate for calling tools and extracting text content; `setBreakpointAndContinue()`, `getContextContent()`, `stopDebugger()` handle common operations
-5. **Test Programs**: Located in `testdata/go/*/main.go`:
-   - `helloworld` — basic program with a greeting variable
-   - `step` — arithmetic with multiple variables for stepping tests
-   - `scopes` — complex data types (slices, maps, structs) for variable inspection
-   - `restart` — program that uses command-line args for restart testing
-   - `coredump` — program that crashes for core dump testing
-   - `loop` — infinite loop for pause testing
+5. **Test Programs**:
+   - `testdata/go/helloworld/main.go` — basic program with a greeting variable
+   - `testdata/go/step/main.go` — arithmetic with multiple variables for stepping tests
+   - `testdata/go/scopes/main.go` — complex data types (slices, maps, structs) for variable inspection
+   - `testdata/go/restart/main.go` — program that uses command-line args for restart testing
+   - `testdata/go/coredump/main.go` — program that crashes for core dump testing
+   - `testdata/go/loop/main.go` — infinite loop for pause testing
+   - `testdata/c/helloworld/` — C program used by the GDB backend tests
 
 ### Common Test Flow
 ```go
@@ -201,6 +208,7 @@ func TestSomething(t *testing.T) {
 8. **go-dap ErrorResponse Decoding**: go-dap decodes ALL failed responses (`success: false`) as `*dap.ErrorResponse` regardless of command. Response matching must use `request_seq`, not Go type
 9. **DAP Response Ordering**: GDB native DAP may send responses out of order (e.g., `StoppedEvent` before `ContinueResponse`). Out-of-order responses are skipped by `request_seq` matching
 10. **go-dap `omitempty` on FrameId**: `EvaluateArguments.FrameId` has `omitempty`, so `frameId=0` is silently dropped. `EvaluateRequest` uses raw JSON map to work around this
+11. **Never write logs to stderr**: MCP stdio transport uses stderr as a pipe to the client. If that pipe buffer fills — either from our logs or the DAP adapter's stderr — the writing goroutine blocks and the server hangs. All logging must go to the file opened in `main.go`; if the file can't be opened, the code intentionally discards logs rather than falling back to stderr
 
 ## Dependencies
 
@@ -208,6 +216,13 @@ func TestSomething(t *testing.T) {
 - `github.com/modelcontextprotocol/go-sdk` - MCP server framework
 - Requires `dlv` (Delve debugger) in `$PATH` for Go debugging
 - Optional: GDB 14+ for C/C++ debugging (native DAP support via `gdb -i dap`)
+
+## Release & Container Images
+
+- **GoReleaser** (`.goreleaser.yaml`): cross-platform binaries, sigstore (`cosign`) signing, and OCI image publishing. Release workflow is `.github/workflows/release.yml`.
+- **CI**: `.github/workflows/go.yml` runs `go build -v ./...` then `go test -v ./...` on Go 1.26, installing Delve via `go install github.com/go-delve/delve/cmd/dlv@latest`.
+- **Dockerfile.minimal**: runtime image with just the server binary.
+- **Dockerfile.debug**: multi-stage image bundling `dlv` (built in a Go stage) and `gdb` (from Debian bookworm) for out-of-the-box debugging of Go and C/C++. Consumes the GoReleaser-built `mcp-dap-server` binary.
 
 ## Workflow Guidance
 
@@ -243,3 +258,61 @@ See `docs/debugging-workflows.md` for:
 - Decision table: scenario → mode → which prompt/skill to use
 - Mermaid workflow diagrams for each scenario
 - Common gotchas and patterns per scenario
+
+### Design & Implementation Plans
+
+`docs/plans/` holds paired design + implementation documents for shipped
+features — read these when touching the corresponding subsystem:
+- `2026-01-27-tool-consolidation-*` — how the tool surface was reduced to the current 13-tool API
+- `2026-02-27-capability-aware-tools-*` — rationale for `set-variable` / `disassemble` / `restart` being capability-gated
+- `2026-03-02-gdb-support-*` — native GDB DAP backend (`gdb -i dap`) design notes
+
+Additional skill/spec material lives under `docs/superpowers/`.
+
+## Kubernetes Remote Debugging (fork-added)
+
+This fork extends upstream with remote-debugging capabilities for Go
+services running in Kubernetes pods.
+
+### Architecture overview
+
+- `ConnectBackend` (`connect_backend.go`) — implements `DebuggerBackend`
+  plus the optional `Redialer` (`redialer.go`). Connects via TCP to a
+  `dlv --headless --accept-multiclient` server.
+- `DAPClient` (`dap.go`) — extended with a mutex, a stale flag, and a
+  `reconnectLoop` goroutine. I/O errors mark the connection stale; the
+  loop calls `backend.Redial` with exponential backoff.
+- `debuggerSession` (`tools.go`) — extended with `breakpoints` and
+  `functionBreakpoints` fields and a `reinitialize(ctx)` method for
+  re-applying state after reconnect.
+- `reconnect` MCP tool — session-level; exposes manual reconnect/wait
+  with observability (attempts count, last error).
+
+### Key design decisions
+
+- Binary name unchanged (`mcp-dap-server`); the feature is enabled via
+  the `--connect <addr>` CLI flag or the `DAP_CONNECT_ADDR` env var.
+- `Redialer` is a **separate optional interface** (NOT added to
+  `DebuggerBackend`) to keep the upstream interface unchanged —
+  important for upstream PR acceptance.
+- Lock ordering: always `ds.mu` → `DAPClient.mu`. `reinitialize` holds
+  `ds.mu` for the entire DAP handshake (see ADR-13).
+- DAP `SetBreakpointsRequest` replaces all breakpoints for a file, so
+  our session state tracks the full list to re-apply after reconnect.
+
+### Workflow for adding/changing remote-debug code
+
+- Design docs: `docs/design-feature/mcp-delve-extension-for-k8s/`
+- Original baseline: `docs/mcp-dap-remote-design.md`
+- Research (upstream code analysis):
+  `docs/research/2026-04-18-mcp-dap-remote-current-state.md`
+
+When modifying `connect_backend.go`, the `dap.go` reconnect machinery,
+or `tools.go` session state — **always run**:
+
+```bash
+go test -v -race ./...
+```
+
+The race detector catches our lock-ordering invariants (ADR-13). Flaky
+races here are NOT acceptable.
