@@ -275,6 +275,7 @@ func TestReconnectLoop_Backoff_EventualSuccess(t *testing.T) {
 	_, clientConn := net.Pipe()
 	c := newDAPClientInternal(clientConn, "127.0.0.1:0", redial)
 	defer c.Close()
+	c.Start()
 
 	c.markStale()
 
@@ -345,6 +346,7 @@ func TestReconnectLoop_BackoffCappedAt30s(t *testing.T) {
 		closeFn: func() error { return nil },
 	}
 	c := newDAPClientInternal(rwc, "127.0.0.1:0", redial)
+	c.Start()
 	c.markStale()
 
 	select {
@@ -402,6 +404,7 @@ func TestReconnectLoop_CancelledOnCtxDone(t *testing.T) {
 		closeFn: func() error { return nil },
 	}
 	c := newDAPClientInternal(rwc, "127.0.0.1:0", redial)
+	c.Start()
 
 	// Trigger stale so reconnectLoop enters doReconnect.
 	c.markStale()

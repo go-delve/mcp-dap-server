@@ -29,6 +29,10 @@ type debuggerSession struct {
 	coreFilePath    string           // path to core dump file (core mode only)
 	stoppedThreadID int              // thread ID from last StoppedEvent (for adapters that use non-sequential IDs)
 	lastFrameID     int              // frame ID from last getFullContext; -1 means not set (0 is valid for GDB)
+
+	// Phase 4 — breakpoints persistence across reconnects (ADR-5)
+	breakpoints         map[string][]dap.SourceBreakpoint // file path → breakpoint specs
+	functionBreakpoints []string                          // function-name breakpoints
 }
 
 // defaultThreadID returns the thread ID to use when none is specified.
@@ -55,7 +59,12 @@ Choose the debugger based on the language of the program being debugged: use 'de
 // connectAddr, if non-empty, pre-creates a ConnectBackend targeting that TCP address
 // (set via --connect flag or DAP_CONNECT_ADDR env; CLI takes precedence per ADR-9).
 func registerTools(server *mcp.Server, logWriter io.Writer, connectAddr string) *debuggerSession {
-	ds := &debuggerSession{server: server, logWriter: logWriter, lastFrameID: -1}
+	ds := &debuggerSession{
+		server:      server,
+		logWriter:   logWriter,
+		lastFrameID: -1,
+		breakpoints: make(map[string][]dap.SourceBreakpoint),
+	}
 
 	// Pre-create ConnectBackend if --connect / DAP_CONNECT_ADDR provided.
 	if connectAddr != "" {
@@ -343,7 +352,17 @@ func (ds *debuggerSession) clearBreakpoints(ctx context.Context, _ *mcp.ServerSe
 	}
 
 	if params.Arguments.All {
-		// Clear all function breakpoints
+		// Clear source breakpoints per file.
+		for file := range ds.breakpoints {
+			seq, err := ds.client.SetBreakpointsRequest(file, []int{})
+			if err != nil {
+				return nil, err
+			}
+			if err := readAndValidateResponse(ds.client, seq, "unable to clear breakpoints"); err != nil {
+				return nil, err
+			}
+		}
+		// Clear all function breakpoints.
 		seq, err := ds.client.SetFunctionBreakpointsRequest([]string{})
 		if err != nil {
 			return nil, err
@@ -351,13 +370,15 @@ func (ds *debuggerSession) clearBreakpoints(ctx context.Context, _ *mcp.ServerSe
 		if err := readAndValidateResponse(ds.client, seq, "unable to clear breakpoints"); err != nil {
 			return nil, err
 		}
+		ds.breakpoints = make(map[string][]dap.SourceBreakpoint)
+		ds.functionBreakpoints = nil
 		return &mcp.CallToolResultFor[any]{
 			Content: []mcp.Content{&mcp.TextContent{Text: "Cleared all breakpoints"}},
 		}, nil
 	}
 
 	if params.Arguments.File != "" {
-		// Clear breakpoints in specific file by setting empty list
+		// Clear breakpoints in specific file by setting empty list.
 		seq, err := ds.client.SetBreakpointsRequest(params.Arguments.File, []int{})
 		if err != nil {
 			return nil, err
@@ -365,6 +386,7 @@ func (ds *debuggerSession) clearBreakpoints(ctx context.Context, _ *mcp.ServerSe
 		if err := readAndValidateResponse(ds.client, seq, "unable to clear breakpoints"); err != nil {
 			return nil, err
 		}
+		delete(ds.breakpoints, params.Arguments.File)
 		return &mcp.CallToolResultFor[any]{
 			Content: []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf("Cleared breakpoints in: %s", params.Arguments.File)}},
 		}, nil
@@ -891,6 +913,14 @@ func (ds *debuggerSession) debug(ctx context.Context, _ *mcp.ServerSession, para
 	default:
 		return nil, fmt.Errorf("unsupported transport mode: %s", ds.backend.TransportMode())
 	}
+
+	// Register reinit hook BEFORE calling Start() so the reconnectLoop never
+	// observes a nil hook after a connection drop (Issue 1). Start() must come
+	// after SetReinitHook; reversing the order creates a race window where a TCP
+	// drop in between would be handled with no hook wired.
+	ds.client.SetReinitHook(ds.reinitialize)
+	ds.client.Start()
+
 	caps, err := ds.client.InitializeRequest(ds.backend.AdapterID())
 	if err != nil {
 		return nil, err
@@ -1298,13 +1328,29 @@ func (ds *debuggerSession) breakpoint(ctx context.Context, _ *mcp.ServerSession,
 	}
 
 	if params.Arguments.Function != "" {
-		seq, err := ds.client.SetFunctionBreakpointsRequest([]string{params.Arguments.Function})
+		// Build cumulative function breakpoint list (dedup).
+		newFuncs := make([]string, len(ds.functionBreakpoints))
+		copy(newFuncs, ds.functionBreakpoints)
+		found := false
+		for _, f := range newFuncs {
+			if f == params.Arguments.Function {
+				found = true
+				break
+			}
+		}
+		if !found {
+			newFuncs = append(newFuncs, params.Arguments.Function)
+		}
+
+		seq, err := ds.client.SetFunctionBreakpointsRequest(newFuncs)
 		if err != nil {
 			return nil, err
 		}
 		if err := readAndValidateResponse(ds.client, seq, "unable to set function breakpoint"); err != nil {
 			return nil, err
 		}
+		// Persist state only after successful DAP call.
+		ds.functionBreakpoints = newFuncs
 		return &mcp.CallToolResultFor[any]{
 			Content: []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf("Breakpoint set on function: %s", params.Arguments.Function)}},
 		}, nil
@@ -1314,7 +1360,27 @@ func (ds *debuggerSession) breakpoint(ctx context.Context, _ *mcp.ServerSession,
 		return nil, fmt.Errorf("either function or file+line is required")
 	}
 
-	bpSeq, err := ds.client.SetBreakpointsRequest(params.Arguments.File, []int{params.Arguments.Line.Int()})
+	// Build cumulative line breakpoint list for this file. DAP SetBreakpoints
+	// replaces all breakpoints for the file on each call, so we must send the
+	// full accumulated list — sending only the new line would erase existing ones.
+	// Dedup: if the line is already in the list, skip the append (idempotent).
+	newSpec := dap.SourceBreakpoint{Line: params.Arguments.Line.Int()}
+	existing := ds.breakpoints[params.Arguments.File]
+	for _, s := range existing {
+		if s.Line == newSpec.Line {
+			log.Printf("breakpoint: %s:%d already set, skipping duplicate", params.Arguments.File, newSpec.Line)
+			return &mcp.CallToolResultFor[any]{
+				Content: []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf("Breakpoint already set at %s:%d", params.Arguments.File, newSpec.Line)}},
+			}, nil
+		}
+	}
+	newSpecs := append(append([]dap.SourceBreakpoint(nil), existing...), newSpec)
+	lines := make([]int, len(newSpecs))
+	for i, s := range newSpecs {
+		lines[i] = s.Line
+	}
+
+	bpSeq, err := ds.client.SetBreakpointsRequest(params.Arguments.File, lines)
 	if err != nil {
 		return nil, err
 	}
@@ -1326,11 +1392,129 @@ func (ds *debuggerSession) breakpoint(ctx context.Context, _ *mcp.ServerSession,
 	if len(resp.Body.Breakpoints) == 0 {
 		return nil, fmt.Errorf("no breakpoints returned")
 	}
-	bp := resp.Body.Breakpoints[0]
+	// The last entry in the response corresponds to the newly-added breakpoint.
+	bp := resp.Body.Breakpoints[len(resp.Body.Breakpoints)-1]
 	if !bp.Verified {
 		return nil, fmt.Errorf("breakpoint not verified: %s", bp.Message)
 	}
+	// Persist state only after successful DAP call.
+	ds.breakpoints[params.Arguments.File] = newSpecs
 	return &mcp.CallToolResultFor[any]{
 		Content: []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf("Breakpoint %d set at %s:%d", bp.Id, params.Arguments.File, bp.Line)}},
 	}, nil
+}
+
+// reinitialize performs a full DAP handshake against a freshly-reconnected
+// adapter and re-applies all persistent state (breakpoints). Called by
+// DAPClient.reconnectLoop via the reinitHook.
+//
+// Lock ordering: acquires ds.mu for the entire operation (ADR-13).
+// Holds across network I/O — parallel tool calls wait on ds.mu, which is
+// correct because they would otherwise get ErrConnectionStale anyway.
+//
+// On partial failure (e.g. SetBreakpointsRequest fails mid-sequence), returns
+// error without attempting rollback — reconnectLoop keeps stale=true and retries
+// from scratch on the next backoff tick (ADR-14). Delve starts with a clean
+// breakpoint state after Initialize, so our snapshot is idempotent.
+//
+// All DAP sends use c.rawSend internally (via the raw* helpers on DAPClient)
+// because stale=true is still active during reinit; c.send would fast-fail.
+func (ds *debuggerSession) reinitialize(ctx context.Context) error {
+	ds.mu.Lock()
+	defer ds.mu.Unlock()
+
+	if ds.client == nil {
+		return fmt.Errorf("reinitialize: no DAP client")
+	}
+	if ds.backend == nil {
+		return fmt.Errorf("reinitialize: no backend")
+	}
+
+	log.Printf("reinitialize: starting")
+
+	// 1. Initialize
+	caps, err := ds.client.InitializeRequestRaw(ds.backend.AdapterID())
+	if err != nil {
+		return fmt.Errorf("reinitialize: InitializeRequest failed: %w", err)
+	}
+	ds.capabilities = caps
+
+	// 2. Attach with mode="remote"
+	attachArgs, err := ds.backend.AttachArgs(0)
+	if err != nil {
+		return fmt.Errorf("reinitialize: AttachArgs failed: %w", err)
+	}
+	attachSeq, err := ds.client.AttachRequestRaw(attachArgs)
+	if err != nil {
+		return fmt.Errorf("reinitialize: AttachRequest send failed: %w", err)
+	}
+
+	// Wait for InitializedEvent; consume AttachResponse along the way.
+	for {
+		msg, err := ds.client.ReadMessage()
+		if err != nil {
+			return fmt.Errorf("reinitialize: reading for InitializedEvent: %w", err)
+		}
+		switch m := msg.(type) {
+		case *dap.InitializedEvent:
+			_ = m
+			goto reinitInitialized
+		case dap.ResponseMessage:
+			r := m.GetResponse()
+			if r.RequestSeq == attachSeq && !r.Success {
+				return fmt.Errorf("reinitialize: attach failed: %s", r.Message)
+			}
+			// skip other out-of-order responses
+		case dap.EventMessage:
+			// skip events
+		}
+	}
+reinitInitialized:
+
+	// 3. Re-apply source breakpoints.
+	applied := 0
+	for file, specs := range ds.breakpoints {
+		lines := make([]int, len(specs))
+		for i, s := range specs {
+			lines[i] = s.Line
+		}
+		seq, err := ds.client.SetBreakpointsRequestRaw(file, lines)
+		if err != nil {
+			return fmt.Errorf("reinitialize: SetBreakpointsRequest for %s failed: %w (%d/%d applied)", file, err, applied, len(ds.breakpoints))
+		}
+		if err := readAndValidateResponse(ds.client, seq, fmt.Sprintf("reinitialize SetBreakpoints %s", file)); err != nil {
+			return fmt.Errorf("reinitialize: SetBreakpoints response for %s: %w (%d/%d applied)", file, err, applied, len(ds.breakpoints))
+		}
+		applied++
+	}
+
+	// 4. Re-apply function breakpoints.
+	if len(ds.functionBreakpoints) > 0 {
+		seq, err := ds.client.SetFunctionBreakpointsRequestRaw(ds.functionBreakpoints)
+		if err != nil {
+			return fmt.Errorf("reinitialize: SetFunctionBreakpointsRequest: %w", err)
+		}
+		if err := readAndValidateResponse(ds.client, seq, "reinitialize SetFunctionBreakpoints"); err != nil {
+			return fmt.Errorf("reinitialize: SetFunctionBreakpoints response: %w", err)
+		}
+	}
+
+	// 5. ConfigurationDone
+	seq, err := ds.client.ConfigurationDoneRequestRaw()
+	if err != nil {
+		return fmt.Errorf("reinitialize: ConfigurationDoneRequest: %w", err)
+	}
+	if err := readAndValidateResponse(ds.client, seq, "reinitialize ConfigurationDone"); err != nil {
+		return fmt.Errorf("reinitialize: ConfigurationDone response: %w", err)
+	}
+
+	// Reset stale frame/thread IDs: after re-attaching to a fresh debuggee the
+	// old IDs from the previous session are meaningless. Callers (e.g. context,
+	// evaluate) fall back to safe defaults when these are 0/-1 respectively.
+	ds.stoppedThreadID = 0
+	ds.lastFrameID = -1
+
+	log.Printf("reinitialize: completed (%d source breakpoints, %d function breakpoints re-applied)",
+		applied, len(ds.functionBreakpoints))
+	return nil
 }

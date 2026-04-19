@@ -1,9 +1,11 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -11,10 +13,12 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
 
+	"github.com/google/go-dap"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
@@ -1566,4 +1570,794 @@ func TestErrorBeforeDebuggerStarted(t *testing.T) {
 			}
 		})
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Phase 4 unit tests — breakpoint persistence + reinitialize
+// ---------------------------------------------------------------------------
+
+// mockDAPServer drives a net.Pipe-based fake DAP server. Each handler in
+// handlers is called in order for successive incoming messages.
+type mockDAPServer struct {
+	conn    net.Conn
+	reader  *bufio.Reader
+	t       *testing.T
+	seenReq []string // command names of received requests, in order
+}
+
+func newMockDAPServer(t *testing.T, conn net.Conn) *mockDAPServer {
+	t.Helper()
+	return &mockDAPServer{conn: conn, reader: bufio.NewReader(conn), t: t}
+}
+
+// readRequest reads the next DAP message from the pipe.
+func (m *mockDAPServer) readRequest() dap.Message {
+	m.t.Helper()
+	msg, err := dap.ReadProtocolMessage(m.reader)
+	if err != nil {
+		m.t.Fatalf("mockDAPServer: read error: %v", err)
+	}
+	if req, ok := msg.(dap.RequestMessage); ok {
+		m.seenReq = append(m.seenReq, req.GetRequest().Command)
+	}
+	return msg
+}
+
+// sendResponse writes a DAP response into the pipe.
+func (m *mockDAPServer) sendResponse(msg dap.Message) {
+	m.t.Helper()
+	if err := dap.WriteProtocolMessage(m.conn, msg); err != nil {
+		m.t.Fatalf("mockDAPServer: write error: %v", err)
+	}
+}
+
+// sendInitializeResponse sends a successful InitializeResponse.
+func (m *mockDAPServer) sendInitializeResponse(requestSeq int) {
+	resp := &dap.InitializeResponse{}
+	resp.Type = "response"
+	resp.Command = "initialize"
+	resp.RequestSeq = requestSeq
+	resp.Success = true
+	m.sendResponse(resp)
+}
+
+// sendAttachResponse sends a successful AttachResponse.
+func (m *mockDAPServer) sendAttachResponse(requestSeq int) {
+	resp := &dap.AttachResponse{}
+	resp.Type = "response"
+	resp.Command = "attach"
+	resp.RequestSeq = requestSeq
+	resp.Success = true
+	m.sendResponse(resp)
+}
+
+// sendInitializedEvent sends an InitializedEvent.
+func (m *mockDAPServer) sendInitializedEvent() {
+	evt := &dap.InitializedEvent{}
+	evt.Type = "event"
+	evt.Event.Event = "initialized"
+	m.sendResponse(evt)
+}
+
+// sendSetBreakpointsResponse sends a successful SetBreakpointsResponse with
+// verified breakpoints for the given lines.
+func (m *mockDAPServer) sendSetBreakpointsResponse(requestSeq int, lines []int) {
+	resp := &dap.SetBreakpointsResponse{}
+	resp.Type = "response"
+	resp.Command = "setBreakpoints"
+	resp.RequestSeq = requestSeq
+	resp.Success = true
+	for i, l := range lines {
+		resp.Body.Breakpoints = append(resp.Body.Breakpoints, dap.Breakpoint{
+			Id:       i + 1,
+			Verified: true,
+			Line:     l,
+		})
+	}
+	m.sendResponse(resp)
+}
+
+// sendSetFunctionBreakpointsResponse sends a successful SetFunctionBreakpointsResponse.
+func (m *mockDAPServer) sendSetFunctionBreakpointsResponse(requestSeq int) {
+	resp := &dap.SetFunctionBreakpointsResponse{}
+	resp.Type = "response"
+	resp.Command = "setFunctionBreakpoints"
+	resp.RequestSeq = requestSeq
+	resp.Success = true
+	m.sendResponse(resp)
+}
+
+// sendConfigurationDoneResponse sends a successful ConfigurationDoneResponse.
+func (m *mockDAPServer) sendConfigurationDoneResponse(requestSeq int) {
+	resp := &dap.ConfigurationDoneResponse{}
+	resp.Type = "response"
+	resp.Command = "configurationDone"
+	resp.RequestSeq = requestSeq
+	resp.Success = true
+	m.sendResponse(resp)
+}
+
+// sendErrorResponse sends a failed response with the given command and message.
+func (m *mockDAPServer) sendErrorResponse(requestSeq int, command, message string) {
+	resp := &dap.ErrorResponse{}
+	resp.Type = "response"
+	resp.Command = command
+	resp.RequestSeq = requestSeq
+	resp.Success = false
+	resp.Message = message
+	m.sendResponse(resp)
+}
+
+// newTestDebuggerSession creates a minimal debuggerSession wired to a
+// TCP-loopback-based DAPClient. The mock server side of the connection is
+// returned. Using TCP (not net.Pipe) avoids synchronous-write deadlocks:
+// net.Pipe blocks Write until the other side Reads, which can deadlock
+// when both sides write concurrently (rawSend holds c.mu during write).
+// The DAPClient is created with nil backend (Redialer) so reconnectLoop will
+// not auto-connect; the test controls all I/O.
+func newTestDebuggerSession(t *testing.T) (*debuggerSession, *mockDAPServer) {
+	t.Helper()
+	clientConn, serverConn := newTCPPair(t)
+	client := newDAPClientFromRWC(clientConn)
+	// Prevent reconnectLoop from doing anything on error (no Redialer).
+	ds := &debuggerSession{
+		client:      client,
+		backend:     &ConnectBackend{Addr: "test:0"},
+		lastFrameID: -1,
+		breakpoints: make(map[string][]dap.SourceBreakpoint),
+	}
+	srv := newMockDAPServer(t, serverConn)
+	t.Cleanup(func() {
+		client.Close()
+		serverConn.Close()
+	})
+	return ds, srv
+}
+
+// newTCPPair creates a pair of connected TCP connections via a local listener.
+// Unlike net.Pipe, TCP connections have OS-level send/receive buffers, so
+// writes do not synchronously block waiting for the remote to read.
+func newTCPPair(t *testing.T) (client net.Conn, server net.Conn) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("newTCPPair: listen: %v", err)
+	}
+	defer ln.Close()
+
+	var serverConn net.Conn
+	var acceptErr error
+	accepted := make(chan struct{})
+	go func() {
+		serverConn, acceptErr = ln.Accept()
+		close(accepted)
+	}()
+
+	clientConn, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("newTCPPair: dial: %v", err)
+	}
+	<-accepted
+	if acceptErr != nil {
+		t.Fatalf("newTCPPair: accept: %v", acceptErr)
+	}
+	return clientConn, serverConn
+}
+
+// ---------------------------------------------------------------------------
+// breakpoint tool state tests
+// ---------------------------------------------------------------------------
+
+// TestBreakpointTool_UpdatesDebuggerSessionMap verifies that a successful
+// SetBreakpoints call persists the spec in ds.breakpoints.
+func TestBreakpointTool_UpdatesDebuggerSessionMap(t *testing.T) {
+	ds, srv := newTestDebuggerSession(t)
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		req := srv.readRequest() // setBreakpoints
+		r := req.(*dap.SetBreakpointsRequest)
+		srv.sendSetBreakpointsResponse(r.Seq, []int{r.Arguments.Breakpoints[0].Line})
+	}()
+
+	params := &mcp.CallToolParamsFor[BreakpointToolParams]{
+		Arguments: BreakpointToolParams{
+			File: "/src/handler.go",
+			Line: FlexInt(42),
+		},
+	}
+	_, err := ds.breakpoint(context.Background(), nil, params)
+	wg.Wait()
+
+	if err != nil {
+		t.Fatalf("breakpoint returned error: %v", err)
+	}
+	specs, ok := ds.breakpoints["/src/handler.go"]
+	if !ok || len(specs) != 1 {
+		t.Fatalf("expected 1 breakpoint in map, got %v", ds.breakpoints)
+	}
+	if specs[0].Line != 42 {
+		t.Errorf("expected line 42, got %d", specs[0].Line)
+	}
+}
+
+// TestBreakpointTool_Function_UpdatesFunctionBreakpoints verifies that a
+// successful SetFunctionBreakpoints call persists the function name.
+func TestBreakpointTool_Function_UpdatesFunctionBreakpoints(t *testing.T) {
+	ds, srv := newTestDebuggerSession(t)
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		req := srv.readRequest()
+		r := req.(*dap.SetFunctionBreakpointsRequest)
+		srv.sendSetFunctionBreakpointsResponse(r.Seq)
+	}()
+
+	params := &mcp.CallToolParamsFor[BreakpointToolParams]{
+		Arguments: BreakpointToolParams{Function: "main.handler"},
+	}
+	_, err := ds.breakpoint(context.Background(), nil, params)
+	wg.Wait()
+
+	if err != nil {
+		t.Fatalf("breakpoint returned error: %v", err)
+	}
+	if len(ds.functionBreakpoints) != 1 || ds.functionBreakpoints[0] != "main.handler" {
+		t.Errorf("expected [main.handler], got %v", ds.functionBreakpoints)
+	}
+}
+
+// TestBreakpointTool_Function_DedupDuplicate verifies that adding the same
+// function name twice results in only one entry in functionBreakpoints.
+func TestBreakpointTool_Function_DedupDuplicate(t *testing.T) {
+	ds, srv := newTestDebuggerSession(t)
+
+	// First call
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		req := srv.readRequest()
+		r := req.(*dap.SetFunctionBreakpointsRequest)
+		srv.sendSetFunctionBreakpointsResponse(r.Seq)
+	}()
+	params := &mcp.CallToolParamsFor[BreakpointToolParams]{
+		Arguments: BreakpointToolParams{Function: "main.handler"},
+	}
+	_, err := ds.breakpoint(context.Background(), nil, params)
+	wg.Wait()
+	if err != nil {
+		t.Fatalf("first call error: %v", err)
+	}
+
+	// Second call — same function name; should still send (cumulative list is same),
+	// and should NOT grow functionBreakpoints.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		req := srv.readRequest()
+		r := req.(*dap.SetFunctionBreakpointsRequest)
+		// DAP should receive exactly 1 entry (dedup'd).
+		if len(r.Arguments.Breakpoints) != 1 {
+			t.Errorf("expected 1 breakpoint in request, got %d", len(r.Arguments.Breakpoints))
+		}
+		srv.sendSetFunctionBreakpointsResponse(r.Seq)
+	}()
+	_, err = ds.breakpoint(context.Background(), nil, params)
+	wg.Wait()
+	if err != nil {
+		t.Fatalf("second call error: %v", err)
+	}
+
+	if len(ds.functionBreakpoints) != 1 {
+		t.Errorf("expected 1 function breakpoint after dedup, got %d", len(ds.functionBreakpoints))
+	}
+}
+
+// TestBreakpointTool_FileAccumulation_DoesNotOverwrite is the critical fix
+// test: set BP on handler.go:42, then BP on handler.go:100. The second DAP
+// call must contain BOTH lines [42, 100], not just [100].
+func TestBreakpointTool_FileAccumulation_DoesNotOverwrite(t *testing.T) {
+	ds, srv := newTestDebuggerSession(t)
+
+	// First breakpoint: line 42
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		req := srv.readRequest()
+		r := req.(*dap.SetBreakpointsRequest)
+		srv.sendSetBreakpointsResponse(r.Seq, []int{r.Arguments.Breakpoints[0].Line})
+	}()
+	_, err := ds.breakpoint(context.Background(), nil, &mcp.CallToolParamsFor[BreakpointToolParams]{
+		Arguments: BreakpointToolParams{File: "/src/handler.go", Line: FlexInt(42)},
+	})
+	wg.Wait()
+	if err != nil {
+		t.Fatalf("first breakpoint error: %v", err)
+	}
+
+	// Second breakpoint: line 100 in same file.
+	// Mock server must receive [42, 100] in the request.
+	var receivedLines []int
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		req := srv.readRequest()
+		r := req.(*dap.SetBreakpointsRequest)
+		for _, bp := range r.Arguments.Breakpoints {
+			receivedLines = append(receivedLines, bp.Line)
+		}
+		srv.sendSetBreakpointsResponse(r.Seq, receivedLines)
+	}()
+	_, err = ds.breakpoint(context.Background(), nil, &mcp.CallToolParamsFor[BreakpointToolParams]{
+		Arguments: BreakpointToolParams{File: "/src/handler.go", Line: FlexInt(100)},
+	})
+	wg.Wait()
+	if err != nil {
+		t.Fatalf("second breakpoint error: %v", err)
+	}
+
+	if len(receivedLines) != 2 {
+		t.Fatalf("expected 2 lines in DAP request, got %v", receivedLines)
+	}
+	if receivedLines[0] != 42 || receivedLines[1] != 100 {
+		t.Errorf("expected [42 100], got %v", receivedLines)
+	}
+	if len(ds.breakpoints["/src/handler.go"]) != 2 {
+		t.Errorf("expected 2 specs in map, got %d", len(ds.breakpoints["/src/handler.go"]))
+	}
+}
+
+// ---------------------------------------------------------------------------
+// clear-breakpoints tool state tests
+// ---------------------------------------------------------------------------
+
+// TestClearBreakpointsTool_File_RemovesFromMap verifies that clearing by file
+// deletes only that file's entry from ds.breakpoints.
+func TestClearBreakpointsTool_File_RemovesFromMap(t *testing.T) {
+	ds, srv := newTestDebuggerSession(t)
+
+	// Pre-populate state.
+	ds.breakpoints["/src/handler.go"] = []dap.SourceBreakpoint{{Line: 42}}
+	ds.breakpoints["/src/other.go"] = []dap.SourceBreakpoint{{Line: 10}}
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		req := srv.readRequest()
+		r := req.(*dap.SetBreakpointsRequest)
+		// Should be an empty list.
+		if len(r.Arguments.Breakpoints) != 0 {
+			t.Errorf("expected empty breakpoints in request, got %v", r.Arguments.Breakpoints)
+		}
+		srv.sendSetBreakpointsResponse(r.Seq, nil)
+	}()
+
+	params := &mcp.CallToolParamsFor[ClearBreakpointsParams]{
+		Arguments: ClearBreakpointsParams{File: "/src/handler.go"},
+	}
+	_, err := ds.clearBreakpoints(context.Background(), nil, params)
+	wg.Wait()
+
+	if err != nil {
+		t.Fatalf("clearBreakpoints returned error: %v", err)
+	}
+	if _, ok := ds.breakpoints["/src/handler.go"]; ok {
+		t.Error("expected /src/handler.go to be removed from map")
+	}
+	if _, ok := ds.breakpoints["/src/other.go"]; !ok {
+		t.Error("expected /src/other.go to remain in map")
+	}
+}
+
+// TestClearBreakpointsTool_All_ClearsAll verifies that all=true empties both
+// breakpoints map and functionBreakpoints slice.
+func TestClearBreakpointsTool_All_ClearsAll(t *testing.T) {
+	ds, srv := newTestDebuggerSession(t)
+
+	// Pre-populate state.
+	ds.breakpoints["/src/handler.go"] = []dap.SourceBreakpoint{{Line: 42}}
+	ds.functionBreakpoints = []string{"main.Run"}
+
+	var wg sync.WaitGroup
+	// Expect: SetBreakpoints(handler.go, []) + SetFunctionBreakpoints([])
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		// First message: SetBreakpoints for the file.
+		req1 := srv.readRequest()
+		r1 := req1.(*dap.SetBreakpointsRequest)
+		srv.sendSetBreakpointsResponse(r1.Seq, nil)
+		// Second message: SetFunctionBreakpoints with empty list.
+		req2 := srv.readRequest()
+		r2 := req2.(*dap.SetFunctionBreakpointsRequest)
+		if len(r2.Arguments.Breakpoints) != 0 {
+			t.Errorf("expected empty function breakpoints, got %v", r2.Arguments.Breakpoints)
+		}
+		srv.sendSetFunctionBreakpointsResponse(r2.Seq)
+	}()
+
+	params := &mcp.CallToolParamsFor[ClearBreakpointsParams]{
+		Arguments: ClearBreakpointsParams{All: true},
+	}
+	_, err := ds.clearBreakpoints(context.Background(), nil, params)
+	wg.Wait()
+
+	if err != nil {
+		t.Fatalf("clearBreakpoints(all) returned error: %v", err)
+	}
+	if len(ds.breakpoints) != 0 {
+		t.Errorf("expected breakpoints map to be empty, got %v", ds.breakpoints)
+	}
+	if ds.functionBreakpoints != nil {
+		t.Errorf("expected functionBreakpoints to be nil, got %v", ds.functionBreakpoints)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// reinitialize tests
+// ---------------------------------------------------------------------------
+
+// driveReinit runs reinitialize in a goroutine and returns a channel that
+// receives the error (or nil) when it finishes.
+func driveReinit(ds *debuggerSession) <-chan error {
+	ch := make(chan error, 1)
+	go func() {
+		ch <- ds.reinitialize(context.Background())
+	}()
+	return ch
+}
+
+// TestReinitialize_OrderIsInitAttachBPConfDone verifies the handshake sequence:
+// Initialize → Attach → SetBreakpoints → ConfigurationDone.
+func TestReinitialize_OrderIsInitAttachBPConfDone(t *testing.T) {
+	ds, srv := newTestDebuggerSession(t)
+	ds.breakpoints["/src/main.go"] = []dap.SourceBreakpoint{{Line: 10}}
+
+	done := driveReinit(ds)
+
+	// Run mock in goroutine to avoid net.Pipe synchronous-write deadlocks.
+	// net.Pipe writes block until the other side reads, so mock must always
+	// respond immediately after each request without blocking on its own writes.
+	mockDone := make(chan struct{})
+	go func() {
+		defer close(mockDone)
+		// 1. Initialize
+		req1 := srv.readRequest()
+		r1 := req1.(*dap.InitializeRequest)
+		srv.sendInitializeResponse(r1.Seq)
+
+		// 2. Attach — send InitializedEvent THEN AttachResponse
+		req2 := srv.readRequest()
+		r2 := req2.(*dap.AttachRequest)
+		srv.sendInitializedEvent()
+		srv.sendAttachResponse(r2.Seq)
+
+		// 3. SetBreakpoints
+		req3 := srv.readRequest()
+		r3 := req3.(*dap.SetBreakpointsRequest)
+		srv.sendSetBreakpointsResponse(r3.Seq, []int{10})
+
+		// 4. ConfigurationDone
+		req4 := srv.readRequest()
+		r4 := req4.(*dap.ConfigurationDoneRequest)
+		srv.sendConfigurationDoneResponse(r4.Seq)
+	}()
+
+	if err := <-done; err != nil {
+		t.Fatalf("reinitialize returned error: %v", err)
+	}
+	<-mockDone
+
+	want := []string{"initialize", "attach", "setBreakpoints", "configurationDone"}
+	if len(srv.seenReq) != len(want) {
+		t.Fatalf("expected %v commands, got %v", want, srv.seenReq)
+	}
+	for i, w := range want {
+		if srv.seenReq[i] != w {
+			t.Errorf("command[%d]: want %q got %q", i, w, srv.seenReq[i])
+		}
+	}
+}
+
+// TestReinitialize_ReAppliesAllBreakpoints verifies that all files in
+// ds.breakpoints are sent in separate SetBreakpoints requests.
+func TestReinitialize_ReAppliesAllBreakpoints(t *testing.T) {
+	ds, srv := newTestDebuggerSession(t)
+	ds.breakpoints["/src/a.go"] = []dap.SourceBreakpoint{{Line: 1}, {Line: 2}}
+	ds.breakpoints["/src/b.go"] = []dap.SourceBreakpoint{{Line: 5}}
+
+	done := driveReinit(ds)
+
+	seenFiles := map[string][]int{}
+	var seenMu sync.Mutex
+
+	mockDone := make(chan struct{})
+	go func() {
+		defer close(mockDone)
+		// Initialize
+		req := srv.readRequest()
+		srv.sendInitializeResponse(req.(*dap.InitializeRequest).Seq)
+		// Attach
+		req = srv.readRequest()
+		srv.sendInitializedEvent()
+		srv.sendAttachResponse(req.(*dap.AttachRequest).Seq)
+		// Two SetBreakpoints in some order
+		for i := 0; i < 2; i++ {
+			req = srv.readRequest()
+			r := req.(*dap.SetBreakpointsRequest)
+			var lines []int
+			for _, bp := range r.Arguments.Breakpoints {
+				lines = append(lines, bp.Line)
+			}
+			seenMu.Lock()
+			seenFiles[r.Arguments.Source.Path] = lines
+			seenMu.Unlock()
+			srv.sendSetBreakpointsResponse(r.Seq, lines)
+		}
+		// ConfigurationDone
+		req = srv.readRequest()
+		srv.sendConfigurationDoneResponse(req.(*dap.ConfigurationDoneRequest).Seq)
+	}()
+
+	if err := <-done; err != nil {
+		t.Fatalf("reinitialize error: %v", err)
+	}
+	<-mockDone
+
+	if len(seenFiles["/src/a.go"]) != 2 {
+		t.Errorf("expected 2 lines for a.go, got %v", seenFiles["/src/a.go"])
+	}
+	if len(seenFiles["/src/b.go"]) != 1 {
+		t.Errorf("expected 1 line for b.go, got %v", seenFiles["/src/b.go"])
+	}
+}
+
+// TestReinitialize_EmptyBreakpoints_SkipsSetBreakpoints verifies that when
+// there are no breakpoints, no SetBreakpoints request is sent.
+func TestReinitialize_EmptyBreakpoints_SkipsSetBreakpoints(t *testing.T) {
+	ds, srv := newTestDebuggerSession(t)
+	// ds.breakpoints is empty; ds.functionBreakpoints is nil.
+
+	done := driveReinit(ds)
+
+	mockDone := make(chan struct{})
+	go func() {
+		defer close(mockDone)
+		// Initialize
+		req := srv.readRequest()
+		srv.sendInitializeResponse(req.(*dap.InitializeRequest).Seq)
+		// Attach
+		req = srv.readRequest()
+		srv.sendInitializedEvent()
+		srv.sendAttachResponse(req.(*dap.AttachRequest).Seq)
+		// ConfigurationDone (no SetBreakpoints in between)
+		req = srv.readRequest()
+		r, ok := req.(*dap.ConfigurationDoneRequest)
+		if !ok {
+			t.Errorf("expected ConfigurationDoneRequest, got %T", req)
+			return
+		}
+		srv.sendConfigurationDoneResponse(r.Seq)
+	}()
+
+	if err := <-done; err != nil {
+		t.Fatalf("reinitialize error: %v", err)
+	}
+	<-mockDone
+
+	// Only 3 commands: initialize, attach, configurationDone
+	if len(srv.seenReq) != 3 {
+		t.Errorf("expected 3 commands, got %v", srv.seenReq)
+	}
+}
+
+// TestReinitialize_FailureDuringInit_PropagatesError verifies that an error
+// response from Initialize is propagated as a non-nil return value.
+func TestReinitialize_FailureDuringInit_PropagatesError(t *testing.T) {
+	ds, srv := newTestDebuggerSession(t)
+
+	done := driveReinit(ds)
+
+	mockDone := make(chan struct{})
+	go func() {
+		defer close(mockDone)
+		req := srv.readRequest()
+		srv.sendErrorResponse(req.(*dap.InitializeRequest).Seq, "initialize", "init failed")
+	}()
+
+	err := <-done
+	<-mockDone
+
+	if err == nil {
+		t.Fatal("expected error from reinitialize, got nil")
+	}
+	if !strings.Contains(err.Error(), "init failed") {
+		t.Errorf("expected 'init failed' in error, got: %v", err)
+	}
+}
+
+// TestReinitialize_PartialFailure_ReturnsErrorWithoutPartialState verifies the
+// ADR-14 invariant: if SetBreakpoints fails for one file during reinitialize,
+// the method returns an error and ds.breakpoints is left unchanged (no partial
+// mutation of session state).
+func TestReinitialize_PartialFailure_ReturnsErrorWithoutPartialState(t *testing.T) {
+	ds, srv := newTestDebuggerSession(t)
+
+	// Pre-populate two files. Reinit will succeed for fileA and fail for fileB.
+	ds.breakpoints["/src/a.go"] = []dap.SourceBreakpoint{{Line: 10}, {Line: 20}}
+	ds.breakpoints["/src/b.go"] = []dap.SourceBreakpoint{{Line: 1}, {Line: 2}, {Line: 3}}
+
+	// Snapshot original state so we can verify it is unchanged after failure.
+	origA := []dap.SourceBreakpoint{{Line: 10}, {Line: 20}}
+	origB := []dap.SourceBreakpoint{{Line: 1}, {Line: 2}, {Line: 3}}
+
+	done := driveReinit(ds)
+
+	mockDone := make(chan struct{})
+	go func() {
+		defer close(mockDone)
+
+		// 1. Initialize — succeed.
+		req := srv.readRequest()
+		srv.sendInitializeResponse(req.(*dap.InitializeRequest).Seq)
+
+		// 2. Attach — send InitializedEvent then AttachResponse.
+		req = srv.readRequest()
+		srv.sendInitializedEvent()
+		srv.sendAttachResponse(req.(*dap.AttachRequest).Seq)
+
+		// 3. Two SetBreakpoints — succeed for one file, fail for the other.
+		// Map iteration order in Go is non-deterministic, so accept either file
+		// first and fail on the second.
+		req = srv.readRequest()
+		r1 := req.(*dap.SetBreakpointsRequest)
+		// Succeed the first file.
+		srv.sendSetBreakpointsResponse(r1.Seq, []int{r1.Arguments.Breakpoints[0].Line})
+
+		req = srv.readRequest()
+		r2 := req.(*dap.SetBreakpointsRequest)
+		// Fail the second file with an error message containing the file path.
+		srv.sendErrorResponse(r2.Seq, "setBreakpoints", "disk full: "+r2.Arguments.Source.Path)
+	}()
+
+	err := <-done
+	<-mockDone
+
+	// Must return an error.
+	if err == nil {
+		t.Fatal("expected reinitialize to return an error on partial failure, got nil")
+	}
+	// Error must mention a file path (either /src/a.go or /src/b.go).
+	if !strings.Contains(err.Error(), "/src/") {
+		t.Errorf("expected error to mention a file path, got: %v", err)
+	}
+
+	// ds.breakpoints must be unchanged — reinitialize must not mutate session state.
+	if len(ds.breakpoints["/src/a.go"]) != len(origA) {
+		t.Errorf("/src/a.go: expected %d specs, got %d", len(origA), len(ds.breakpoints["/src/a.go"]))
+	}
+	if len(ds.breakpoints["/src/b.go"]) != len(origB) {
+		t.Errorf("/src/b.go: expected %d specs, got %d", len(origB), len(ds.breakpoints["/src/b.go"]))
+	}
+}
+
+// TestReinitialize_ConcurrentBreakpointMutation_NoRace is the critical ADR-13
+// test: reinitialize (reads ds.breakpoints under ds.mu) and breakpoint tool
+// (writes ds.breakpoints under ds.mu) run concurrently. go test -race must
+// report clean.
+func TestReinitialize_ConcurrentBreakpointMutation_NoRace(t *testing.T) {
+	// We need two independent pipe-backed sessions. The reinit session is for
+	// reinitialize; the bp session is just used directly (no mock server needed
+	// for the write path — we assert on ds.mu ordering).
+	//
+	// Strategy: start reinitialize in a goroutine; concurrently call breakpoint
+	// on the SAME ds (which also locks ds.mu). Both compete for ds.mu.
+	// The race detector catches any unsynchronised access to ds.breakpoints.
+
+	// Build a session with a mock server that handles reinit sequence.
+	clientConn, serverConn := newTCPPair(t)
+	client := newDAPClientFromRWC(clientConn)
+	ds := &debuggerSession{
+		client:      client,
+		backend:     &ConnectBackend{Addr: "test:0"},
+		lastFrameID: -1,
+		breakpoints: make(map[string][]dap.SourceBreakpoint),
+	}
+	srv := newMockDAPServer(t, serverConn)
+	t.Cleanup(func() {
+		client.Close()
+		serverConn.Close()
+	})
+
+	// Also build a second TCP pair for the concurrent breakpoint call.
+	// We reuse the same ds but need a separate exchange.
+	// The breakpoint tool will block on ds.mu while reinit holds it;
+	// the race detector checks the map accesses in ds.breakpoints.
+
+	var wg sync.WaitGroup
+
+	// Goroutine 1: reinitialize
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_ = ds.reinitialize(context.Background())
+	}()
+
+	// Goroutine 2: breakpoint call — will block on ds.mu while reinit holds it.
+	bpClientConn, bpServerConn := newTCPPair(t)
+	bpClient := newDAPClientFromRWC(bpClientConn)
+	bpSrv := newMockDAPServer(t, bpServerConn)
+	t.Cleanup(func() {
+		bpClient.Close()
+		bpServerConn.Close()
+	})
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		// Swap the client so the breakpoint tool writes to bpClient.
+		// We need to do this atomically under ds.mu — but since we're
+		// testing race safety, we swap BEFORE ds.mu is contested.
+		// The key is that both goroutines touch ds.breakpoints.
+		// We just verify no race is detected on the map.
+		ds.mu.Lock()
+		origClient := ds.client
+		ds.client = bpClient
+		ds.mu.Unlock()
+
+		params := &mcp.CallToolParamsFor[BreakpointToolParams]{
+			Arguments: BreakpointToolParams{File: "/src/race.go", Line: FlexInt(1)},
+		}
+		// Handle the breakpoint response from bpSrv.
+		go func() {
+			req := bpSrv.readRequest()
+			r := req.(*dap.SetBreakpointsRequest)
+			bpSrv.sendSetBreakpointsResponse(r.Seq, []int{r.Arguments.Breakpoints[0].Line})
+		}()
+		_, _ = ds.breakpoint(context.Background(), nil, params)
+
+		// Restore original client.
+		ds.mu.Lock()
+		ds.client = origClient
+		ds.mu.Unlock()
+	}()
+
+	// Drive reinit mock server in a goroutine (TCP buffering prevents simple
+	// deadlocks, but goroutine isolates the mock's blocking reads).
+	mockDone := make(chan struct{})
+	go func() {
+		defer close(mockDone)
+		req := srv.readRequest()
+		srv.sendInitializeResponse(req.(*dap.InitializeRequest).Seq)
+		req = srv.readRequest()
+		srv.sendInitializedEvent()
+		srv.sendAttachResponse(req.(*dap.AttachRequest).Seq)
+		// Accept optional SetBreakpoints, then ConfigurationDone.
+		for {
+			req = srv.readRequest()
+			if r, ok := req.(*dap.ConfigurationDoneRequest); ok {
+				srv.sendConfigurationDoneResponse(r.Seq)
+				break
+			}
+			if r, ok := req.(*dap.SetBreakpointsRequest); ok {
+				lines := make([]int, len(r.Arguments.Breakpoints))
+				for i, bp := range r.Arguments.Breakpoints {
+					lines[i] = bp.Line
+				}
+				srv.sendSetBreakpointsResponse(r.Seq, lines)
+			}
+		}
+	}()
+
+	wg.Wait()
+	<-mockDone
+	// If go test -race finds a race on ds.breakpoints, the test fails automatically.
+	// No explicit assertion needed — passing = race-free.
 }

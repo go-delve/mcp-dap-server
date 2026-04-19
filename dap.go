@@ -55,6 +55,10 @@ type DAPClient struct {
 	// observability (ADR-15)
 	reconnectAttempts  atomic.Uint32
 	lastReconnectError atomic.Value // stores string; empty if no error yet
+
+	// reinitHook is called by doReconnect after a successful reconnect to
+	// re-establish the DAP session. Set via SetReinitHook from tools.go.
+	reinitHook func(ctx context.Context) error
 }
 
 // newDAPClient creates a new Client over a TCP connection.
@@ -77,7 +81,9 @@ func newDAPClientFromRWC(rwc io.ReadWriteCloser) *DAPClient {
 }
 
 // newDAPClientInternal is the common constructor. It initialises all fields
-// and starts the reconnectLoop goroutine for the DAPClient's lifetime.
+// but does NOT start the reconnectLoop. Callers must call Start() explicitly
+// after any pre-connection setup (e.g. SetReinitHook) to avoid a race window
+// where a connection drop before the hook is wired goes undetected (Issue 1).
 func newDAPClientInternal(rwc io.ReadWriteCloser, addr string, backend Redialer) *DAPClient {
 	ctx, cancel := context.WithCancel(context.Background())
 	c := &DAPClient{
@@ -90,8 +96,16 @@ func newDAPClientInternal(rwc io.ReadWriteCloser, addr string, backend Redialer)
 		ctx:      ctx,
 		cancel:   cancel,
 	}
-	go c.reconnectLoop()
 	return c
+}
+
+// Start launches the reconnectLoop goroutine. Must be called once after
+// construction and after any pre-connection setup (e.g. SetReinitHook) to
+// prevent the race window where a disconnect before the hook is registered
+// would be silently ignored. Safe to call on stdio (nil backend) clients —
+// reconnectLoop exits immediately when no Redialer is present.
+func (c *DAPClient) Start() {
+	go c.reconnectLoop()
 }
 
 // Close cancels the reconnect loop goroutine and closes the current connection.
@@ -231,6 +245,120 @@ func toRawMessage(in any) json.RawMessage {
 	return out
 }
 
+// InitializeRequestRaw sends an 'initialize' request via rawSend (bypassing
+// stale check). Used by reinitialize, which runs while stale=true per the
+// Phase 3 ordering invariant (see ADR-14).
+func (c *DAPClient) InitializeRequestRaw(adapterID string) (dap.Capabilities, error) {
+	req := c.newRequest("initialize")
+	request := &dap.InitializeRequest{Request: *req}
+	request.Arguments = dap.InitializeRequestArguments{
+		AdapterID:                    adapterID,
+		PathFormat:                   "path",
+		LinesStartAt1:                true,
+		ColumnsStartAt1:              true,
+		SupportsVariableType:         true,
+		SupportsVariablePaging:       true,
+		SupportsRunInTerminalRequest: false,
+		Locale:                       "en-us",
+	}
+	if err := c.rawSend(request); err != nil {
+		return dap.Capabilities{}, err
+	}
+	for {
+		msg, err := c.ReadMessage()
+		if err != nil {
+			return dap.Capabilities{}, err
+		}
+		switch resp := msg.(type) {
+		case *dap.InitializeResponse:
+			if resp.RequestSeq != req.Seq {
+				log.Printf("InitializeRequestRaw: skipping out-of-order InitializeResponse (request_seq=%d, waiting for %d)",
+					resp.RequestSeq, req.Seq)
+				continue
+			}
+			if !resp.Success {
+				return dap.Capabilities{}, fmt.Errorf("initialize failed: %s", resp.Message)
+			}
+			return resp.Body, nil
+		case dap.ResponseMessage:
+			// go-dap decodes failed responses as *dap.ErrorResponse regardless of
+			// command; match by request_seq before acting on the result so that any
+			// late response from a pre-reconnect request is skipped (Issue 3).
+			r := resp.GetResponse()
+			if r.RequestSeq != req.Seq {
+				log.Printf("InitializeRequestRaw: skipping out-of-order %T (request_seq=%d, waiting for %d)",
+					resp, r.RequestSeq, req.Seq)
+				continue
+			}
+			if !r.Success {
+				return dap.Capabilities{}, fmt.Errorf("initialize failed: %s", r.Message)
+			}
+			return dap.Capabilities{}, fmt.Errorf("expected InitializeResponse, got %T", msg)
+		case dap.EventMessage:
+			continue
+		default:
+			return dap.Capabilities{}, fmt.Errorf("expected InitializeResponse, got %T", msg)
+		}
+	}
+}
+
+// AttachRequestRaw sends an 'attach' request via rawSend and returns the seq.
+// Raw variant — bypasses the stale fast-check in send. Used only during
+// reinitialize after reconnect, when stale=true is still set per Phase 3's
+// ordering invariant (see ADR-14).
+func (c *DAPClient) AttachRequestRaw(args map[string]any) (int, error) {
+	req := c.newRequest("attach")
+	request := &dap.AttachRequest{Request: *req}
+	request.Arguments = toRawMessage(args)
+	return req.Seq, c.rawSend(request)
+}
+
+// SetBreakpointsRequestRaw sends a 'setBreakpoints' request via rawSend and
+// returns the seq. Raw variant — bypasses the stale fast-check in send. Used
+// only during reinitialize after reconnect, when stale=true is still set per
+// Phase 3's ordering invariant (see ADR-14).
+func (c *DAPClient) SetBreakpointsRequestRaw(file string, lines []int) (int, error) {
+	req := c.newRequest("setBreakpoints")
+	request := &dap.SetBreakpointsRequest{Request: *req}
+	request.Arguments = dap.SetBreakpointsArguments{
+		Source: dap.Source{
+			Name: file,
+			Path: file,
+		},
+		Breakpoints: make([]dap.SourceBreakpoint, len(lines)),
+	}
+	for i, l := range lines {
+		request.Arguments.Breakpoints[i].Line = l
+	}
+	return req.Seq, c.rawSend(request)
+}
+
+// SetFunctionBreakpointsRequestRaw sends a 'setFunctionBreakpoints' request
+// via rawSend and returns the seq. Raw variant — bypasses the stale fast-check
+// in send. Used only during reinitialize after reconnect, when stale=true is
+// still set per Phase 3's ordering invariant (see ADR-14).
+func (c *DAPClient) SetFunctionBreakpointsRequestRaw(functions []string) (int, error) {
+	req := c.newRequest("setFunctionBreakpoints")
+	request := &dap.SetFunctionBreakpointsRequest{Request: *req}
+	request.Arguments = dap.SetFunctionBreakpointsArguments{
+		Breakpoints: make([]dap.FunctionBreakpoint, len(functions)),
+	}
+	for i, f := range functions {
+		request.Arguments.Breakpoints[i].Name = f
+	}
+	return req.Seq, c.rawSend(request)
+}
+
+// ConfigurationDoneRequestRaw sends a 'configurationDone' request via rawSend
+// and returns the seq. Raw variant — bypasses the stale fast-check in send.
+// Used only during reinitialize after reconnect, when stale=true is still set
+// per Phase 3's ordering invariant (see ADR-14).
+func (c *DAPClient) ConfigurationDoneRequestRaw() (int, error) {
+	req := c.newRequest("configurationDone")
+	request := &dap.ConfigurationDoneRequest{Request: *req}
+	return req.Seq, c.rawSend(request)
+}
+
 // markStale is idempotent. The first caller sets stale=true and signals
 // reconnCh; subsequent calls are no-ops (CAS prevents double-signal).
 func (c *DAPClient) markStale() {
@@ -361,15 +489,33 @@ func (c *DAPClient) doReconnect() {
 	}
 }
 
-// notifySessionReconnected is a hook for the session layer to perform
-// DAP handshake and re-apply breakpoints after a successful reconnect.
-// Phase 3: stub (logs only). Phase 4: wired to debuggerSession.reinitialize.
-//
-// Implementers MUST complete all re-initialization
-// (DAP Initialize/Attach/SetBreakpoints/ConfigurationDone) before returning;
-// stale flag is cleared only after this callback returns.
+// SetReinitHook registers the function to call after a successful reconnect.
+// The hook must complete the full DAP re-initialization sequence before
+// returning; stale is cleared only after it returns.
+// Safe to call concurrently (protected by c.mu).
+func (c *DAPClient) SetReinitHook(hook func(ctx context.Context) error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.reinitHook = hook
+}
+
+// notifySessionReconnected calls the registered reinit hook, if any.
+// Called from doReconnect after connection swap; stale is still true at
+// this point so the hook's DAP sends must use raw* methods (Phase 4).
+// If the hook returns an error, the connection is marked stale again so
+// reconnectLoop retries from scratch (ADR-14).
 func (c *DAPClient) notifySessionReconnected() {
-	log.Printf("DAPClient: reconnect complete; session reinit hook not yet wired (phase 3 stub)")
+	c.mu.Lock()
+	hook := c.reinitHook
+	c.mu.Unlock()
+	if hook == nil {
+		log.Printf("DAPClient: reconnect complete; no reinit hook wired (SpawnBackend?)")
+		return
+	}
+	if err := hook(c.ctx); err != nil {
+		log.Printf("DAPClient: reinit failed: %v — marking stale again to retry", err)
+		c.markStale()
+	}
 }
 
 // SetBreakpointsRequest sends a 'setBreakpoints' request.
