@@ -1,0 +1,32 @@
+version: "3.8"
+services:
+  delve-with-app:
+    image: golang:1.26
+    working_dir: /app
+    entrypoint: ["sh", "-c"]
+    # dlv is bind-mounted from the host so no network access is needed inside
+    # the container. The host dlv binary must be present at the path below.
+    command:
+      - >
+        go build -gcflags='all=-N -l' -o /app/bin/example ./testdata/integration/main.go &&
+        exec /app/bin/dlv --listen=:4000 --headless --accept-multiclient --api-version=2 exec /app/bin/example --continue
+    volumes:
+      - ..:/app
+      - /home/vajrock/go2/bin/dlv:/app/bin/dlv:ro
+    ports:
+      - "14000:4000"
+      - "18080:8080"
+    healthcheck:
+      test: ["CMD", "bash", "-c", "echo > /dev/tcp/localhost/4000"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+
+  socat-proxy:
+    image: alpine/socat
+    command: ["TCP-LISTEN:4040,fork,reuseaddr", "TCP:delve-with-app:4000"]
+    ports:
+      - "14040:4040"
+    depends_on:
+      delve-with-app:
+        condition: service_healthy
