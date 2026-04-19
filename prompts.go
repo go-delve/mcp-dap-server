@@ -47,10 +47,10 @@ func registerPrompts(server *mcp.Server) {
 	}, promptDebugBinary)
 }
 
-func promptDebugSource(_ context.Context, _ *mcp.ServerSession, params *mcp.GetPromptParams) (*mcp.GetPromptResult, error) {
-	path := params.Arguments["path"]
-	language := params.Arguments["language"]
-	breakpoints := params.Arguments["breakpoints"]
+func promptDebugSource(_ context.Context, req *mcp.GetPromptRequest) (*mcp.GetPromptResult, error) {
+	path := req.Params.Arguments["path"]
+	language := req.Params.Arguments["language"]
+	breakpoints := req.Params.Arguments["breakpoints"]
 
 	if language == "" {
 		language = "go"
@@ -216,9 +216,9 @@ Call: `+"`"+`stop()`+"`"+`
 	}, nil
 }
 
-func promptDebugAttach(_ context.Context, _ *mcp.ServerSession, params *mcp.GetPromptParams) (*mcp.GetPromptResult, error) {
-	pid := params.Arguments["pid"]
-	program := params.Arguments["program"]
+func promptDebugAttach(_ context.Context, req *mcp.GetPromptRequest) (*mcp.GetPromptResult, error) {
+	pid := req.Params.Arguments["pid"]
+	program := req.Params.Arguments["program"]
 
 	programDesc := ""
 	if program != "" {
@@ -334,10 +334,10 @@ To **detach** (leave the process running): `+"`"+`stop(detach=true)`+"`"+`
 	}, nil
 }
 
-func promptDebugCoreDump(_ context.Context, _ *mcp.ServerSession, params *mcp.GetPromptParams) (*mcp.GetPromptResult, error) {
-	binaryPath := params.Arguments["binary_path"]
-	corePath := params.Arguments["core_path"]
-	language := params.Arguments["language"]
+func promptDebugCoreDump(_ context.Context, req *mcp.GetPromptRequest) (*mcp.GetPromptResult, error) {
+	binaryPath := req.Params.Arguments["binary_path"]
+	corePath := req.Params.Arguments["core_path"]
+	language := req.Params.Arguments["language"]
 
 	if language == "" {
 		language = "go"
@@ -470,8 +470,8 @@ Call: `+"`"+`stop()`+"`"+`
 	}, nil
 }
 
-func promptDebugBinary(_ context.Context, _ *mcp.ServerSession, params *mcp.GetPromptParams) (*mcp.GetPromptResult, error) {
-	path := params.Arguments["path"]
+func promptDebugBinary(_ context.Context, req *mcp.GetPromptRequest) (*mcp.GetPromptResult, error) {
+	path := req.Params.Arguments["path"]
 
 	// Infer likely language/debugger from path or note that both are supported
 	debuggerNote := `Use 'delve' for Go binaries, 'gdb' for C/C++/Rust binaries.

@@ -38,20 +38,19 @@ func makeReconnectSession(client *DAPClient, backend DebuggerBackend) *debuggerS
 }
 
 // callReconnect invokes ds.reconnect synchronously with the given params.
-func callReconnect(t *testing.T, ds *debuggerSession, force bool, waitTimeoutSec int) (*mcp.CallToolResultFor[any], error) {
+func callReconnect(t *testing.T, ds *debuggerSession, force bool, waitTimeoutSec int) (*mcp.CallToolResult, error) {
 	t.Helper()
 	ctx := context.Background()
-	p := &mcp.CallToolParamsFor[ReconnectParams]{
-		Arguments: ReconnectParams{
-			Force:          force,
-			WaitTimeoutSec: FlexInt(waitTimeoutSec),
-		},
+	input := ReconnectParams{
+		Force:          force,
+		WaitTimeoutSec: FlexInt(waitTimeoutSec),
 	}
-	return ds.reconnect(ctx, nil, p)
+	res, _, err := ds.reconnect(ctx, nil, input)
+	return res, err
 }
 
 // responseText extracts the text from the first TextContent element.
-func responseText(t *testing.T, res *mcp.CallToolResultFor[any]) string {
+func responseText(t *testing.T, res *mcp.CallToolResult) string {
 	t.Helper()
 	if len(res.Content) == 0 {
 		t.Fatal("empty content in response")

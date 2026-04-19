@@ -80,7 +80,7 @@ func setupMCPServerAndClient(t *testing.T) *testSetup {
 	getServer := func(request *http.Request) *mcp.Server {
 		return server
 	}
-	sseHandler := mcp.NewSSEHandler(getServer)
+	sseHandler := mcp.NewSSEHandler(getServer, nil)
 	testServer := httptest.NewServer(sseHandler)
 
 	// Create MCP client
@@ -92,8 +92,8 @@ func setupMCPServerAndClient(t *testing.T) *testSetup {
 
 	// Connect client to server
 	ctx := context.Background()
-	transport := mcp.NewSSEClientTransport(testServer.URL, &mcp.SSEClientTransportOptions{})
-	session, err := client.Connect(ctx, transport)
+	transport := &mcp.SSEClientTransport{Endpoint: testServer.URL}
+	session, err := client.Connect(ctx, transport, nil)
 	if err != nil {
 		t.Fatalf("Failed to connect client to server: %v", err)
 	}
@@ -347,7 +347,7 @@ func TestBasic(t *testing.T) {
 		Name: "evaluate",
 		Arguments: map[string]any{
 			"expression": "greeting",
-			"frameID":    1000,
+			"frameId":    1000,
 			"context":    "repl",
 		},
 	})
@@ -463,7 +463,7 @@ func TestRestart(t *testing.T) {
 		Name: "evaluate",
 		Arguments: map[string]any{
 			"expression": "greeting",
-			"frameID":    1000,
+			"frameId":    1000,
 			"context":    "repl",
 		},
 	})
@@ -1726,7 +1726,10 @@ func newTestDebuggerSession(t *testing.T) (*debuggerSession, *mockDAPServer) {
 	t.Helper()
 	clientConn, serverConn := newTCPPair(t)
 	client := newDAPClientFromRWC(clientConn)
-	// Prevent reconnectLoop from doing anything on error (no Redialer).
+	// Start the read-pump so AwaitResponse sees the mock server's responses.
+	// Reconnect loop is intentionally not started — these tests don't exercise
+	// reconnect and would not have a Redialer anyway.
+	client.startReadLoop()
 	ds := &debuggerSession{
 		client:      client,
 		backend:     &ConnectBackend{Addr: "test:0"},
@@ -1789,13 +1792,11 @@ func TestBreakpointTool_UpdatesDebuggerSessionMap(t *testing.T) {
 		srv.sendSetBreakpointsResponse(r.Seq, []int{r.Arguments.Breakpoints[0].Line})
 	}()
 
-	params := &mcp.CallToolParamsFor[BreakpointToolParams]{
-		Arguments: BreakpointToolParams{
+	input := BreakpointToolParams{
 			File: "/src/handler.go",
 			Line: FlexInt(42),
-		},
 	}
-	_, err := ds.breakpoint(context.Background(), nil, params)
+	_, _, err := ds.breakpoint(context.Background(), nil, input)
 	wg.Wait()
 
 	if err != nil {
@@ -1824,10 +1825,8 @@ func TestBreakpointTool_Function_UpdatesFunctionBreakpoints(t *testing.T) {
 		srv.sendSetFunctionBreakpointsResponse(r.Seq)
 	}()
 
-	params := &mcp.CallToolParamsFor[BreakpointToolParams]{
-		Arguments: BreakpointToolParams{Function: "main.handler"},
-	}
-	_, err := ds.breakpoint(context.Background(), nil, params)
+	input := BreakpointToolParams{Function: "main.handler"}
+	_, _, err := ds.breakpoint(context.Background(), nil, input)
 	wg.Wait()
 
 	if err != nil {
@@ -1852,10 +1851,8 @@ func TestBreakpointTool_Function_DedupDuplicate(t *testing.T) {
 		r := req.(*dap.SetFunctionBreakpointsRequest)
 		srv.sendSetFunctionBreakpointsResponse(r.Seq)
 	}()
-	params := &mcp.CallToolParamsFor[BreakpointToolParams]{
-		Arguments: BreakpointToolParams{Function: "main.handler"},
-	}
-	_, err := ds.breakpoint(context.Background(), nil, params)
+	input := BreakpointToolParams{Function: "main.handler"}
+	_, _, err := ds.breakpoint(context.Background(), nil, input)
 	wg.Wait()
 	if err != nil {
 		t.Fatalf("first call error: %v", err)
@@ -1874,7 +1871,7 @@ func TestBreakpointTool_Function_DedupDuplicate(t *testing.T) {
 		}
 		srv.sendSetFunctionBreakpointsResponse(r.Seq)
 	}()
-	_, err = ds.breakpoint(context.Background(), nil, params)
+	_, _, err = ds.breakpoint(context.Background(), nil, input)
 	wg.Wait()
 	if err != nil {
 		t.Fatalf("second call error: %v", err)
@@ -1900,8 +1897,7 @@ func TestBreakpointTool_FileAccumulation_DoesNotOverwrite(t *testing.T) {
 		r := req.(*dap.SetBreakpointsRequest)
 		srv.sendSetBreakpointsResponse(r.Seq, []int{r.Arguments.Breakpoints[0].Line})
 	}()
-	_, err := ds.breakpoint(context.Background(), nil, &mcp.CallToolParamsFor[BreakpointToolParams]{
-		Arguments: BreakpointToolParams{File: "/src/handler.go", Line: FlexInt(42)},
+	_, _, err := ds.breakpoint(context.Background(), nil, BreakpointToolParams{File: "/src/handler.go", Line: FlexInt(42),
 	})
 	wg.Wait()
 	if err != nil {
@@ -1921,8 +1917,7 @@ func TestBreakpointTool_FileAccumulation_DoesNotOverwrite(t *testing.T) {
 		}
 		srv.sendSetBreakpointsResponse(r.Seq, receivedLines)
 	}()
-	_, err = ds.breakpoint(context.Background(), nil, &mcp.CallToolParamsFor[BreakpointToolParams]{
-		Arguments: BreakpointToolParams{File: "/src/handler.go", Line: FlexInt(100)},
+	_, _, err = ds.breakpoint(context.Background(), nil, BreakpointToolParams{File: "/src/handler.go", Line: FlexInt(100),
 	})
 	wg.Wait()
 	if err != nil {
@@ -1966,10 +1961,8 @@ func TestClearBreakpointsTool_File_RemovesFromMap(t *testing.T) {
 		srv.sendSetBreakpointsResponse(r.Seq, nil)
 	}()
 
-	params := &mcp.CallToolParamsFor[ClearBreakpointsParams]{
-		Arguments: ClearBreakpointsParams{File: "/src/handler.go"},
-	}
-	_, err := ds.clearBreakpoints(context.Background(), nil, params)
+	input := ClearBreakpointsParams{File: "/src/handler.go"}
+	_, _, err := ds.clearBreakpoints(context.Background(), nil, input)
 	wg.Wait()
 
 	if err != nil {
@@ -2010,10 +2003,8 @@ func TestClearBreakpointsTool_All_ClearsAll(t *testing.T) {
 		srv.sendSetFunctionBreakpointsResponse(r2.Seq)
 	}()
 
-	params := &mcp.CallToolParamsFor[ClearBreakpointsParams]{
-		Arguments: ClearBreakpointsParams{All: true},
-	}
-	_, err := ds.clearBreakpoints(context.Background(), nil, params)
+	input := ClearBreakpointsParams{All: true}
+	_, _, err := ds.clearBreakpoints(context.Background(), nil, input)
 	wg.Wait()
 
 	if err != nil {
@@ -2339,16 +2330,14 @@ func TestReinitialize_ConcurrentBreakpointMutation_NoRace(t *testing.T) {
 		ds.client = bpClient
 		ds.mu.Unlock()
 
-		params := &mcp.CallToolParamsFor[BreakpointToolParams]{
-			Arguments: BreakpointToolParams{File: "/src/race.go", Line: FlexInt(1)},
-		}
+		input := BreakpointToolParams{File: "/src/race.go", Line: FlexInt(1)}
 		// Handle the breakpoint response from bpSrv.
 		go func() {
 			req := bpSrv.readRequest()
 			r := req.(*dap.SetBreakpointsRequest)
 			bpSrv.sendSetBreakpointsResponse(r.Seq, []int{r.Arguments.Breakpoints[0].Line})
 		}()
-		_, _ = ds.breakpoint(context.Background(), nil, params)
+		_, _, _ = ds.breakpoint(context.Background(), nil, input)
 
 		// Restore original client.
 		ds.mu.Lock()

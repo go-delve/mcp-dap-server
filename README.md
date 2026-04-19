@@ -10,7 +10,7 @@ with extensions for **remote debugging in Kubernetes** via
 ## Features (this fork)
 
 In addition to upstream features (local `dlv dap` / `gdb -i dap`
-spawning, 13 MCP tools, 4 prompts):
+spawning, MCP tools, prompts):
 
 - **`ConnectBackend`**: connect to an already-running
   `dlv --headless --accept-multiclient` server via TCP, instead of
@@ -18,14 +18,82 @@ spawning, 13 MCP tools, 4 prompts):
   services in Kubernetes pods.
 - **Auto-reconnect** on TCP drops (pod restart, network blip): a
   background reconnect goroutine with exponential backoff (1s → 30s)
-  transparently restores the DAP connection.
+  transparently restores the DAP connection. TCP keepalive (30 s)
+  forces half-open sockets to surface within ~2 minutes instead of
+  hanging indefinitely.
 - **Breakpoints persistence** across reconnects: breakpoints set via
   the MCP tool are stored in session state and automatically re-applied
   after reconnect via `reinitialize`.
 - **`reconnect` MCP tool**: fallback for forced reconnect + wait with
   observability (attempts count, last error).
+- **Event pump** (v0.2.0+): the DAP socket has a single reader
+  goroutine that routes responses by `request_seq` and fans events out
+  to typed `Subscribe[T]` channels, with a 64-entry replay ring to
+  avoid lost events on tight races.
+- **Non-blocking `continue` + `wait-for-stop` MCP tool** (v0.2.0+):
+  `continue` returns immediately with `{"status":"running"}`;
+  `wait-for-stop(timeoutSec, pauseIfTimeout, threadId)` blocks until
+  the program stops. Enables parallel `pause`, browser/HTTP triggers
+  between the two steps, and subagent dispatch for long waits.
+- **`step` with `timeoutSec`** (v0.2.0+, default 30 s), so stepping
+  into a blocking call surfaces as a clear error instead of a hang.
+- **Observability** (v0.2.0+): per-PID log file
+  (`/tmp/mcp-dap-server.<pid>.log`), microsecond timestamps,
+  `MCP_LOG_LEVEL=trace` to log every DAP message, `SIGUSR1` → full
+  goroutine dump via `runtime/pprof`. Wrapper script writes its own
+  `/tmp/dlv-k8s-mcp.<pid>.log`.
 - **Bash wrapper `dlv-k8s-mcp.sh`**: `kubectl port-forward` in a retry
   loop + MCP stdio exec. See `scripts/`.
+
+## Compatibility with upstream `go-delve/mcp-dap-server`
+
+Since **v0.2.0 this fork intentionally diverges from upstream** and is
+no longer drop-in compatible at the Go API level, nor at the MCP tool
+contract level. Reasons, short version:
+
+- **BREAKING `continue` contract.** Upstream `continue` blocks the
+  whole MCP call until a stop event arrives. We return immediately
+  with `{"status":"running"}` and rely on a separate `wait-for-stop`
+  tool. This fixes the deadlock where a concurrent `pause` is
+  impossible because the previous `continue` is still holding the
+  session mutex. It also enables a subagent to own the long wait while
+  the main agent issues the trigger (HTTP request, browser
+  navigation, etc.) in parallel.
+- **Internal event pump.** Upstream every tool handler reads the DAP
+  socket synchronously through a shared `ReadMessage()` method with
+  manual `request_seq` skip-loops. We replaced that with a single
+  background `readLoop` goroutine, a response registry, and a typed
+  event bus. Consequences for any upstream caller: `DAPClient.ReadMessage`
+  is not public any more (renamed to `readMessage`), and the
+  `readAndValidateResponse` / `readTypedResponse` helpers are gone,
+  replaced by `awaitResponseValidate` / `awaitResponseTyped` that
+  take a `context.Context` and use the registry.
+- **Reconnect integration.** Upstream's `replaceConn` only swaps the
+  `rwc`. Our version also wakes the parked `readLoop` and broadcasts
+  a `ConnectionLostEvent` so in-flight `wait-for-stop` / other
+  subscribers fail fast with `ErrConnectionStale` instead of hanging.
+- **Observability (per-PID logs, `SIGUSR1` dump, `MCP_LOG_LEVEL`, TCP
+  keepalive).** All fork-specific; no upstream PR planned.
+- **go-sdk major bump.** v0.2.0 tracks
+  `github.com/modelcontextprotocol/go-sdk` **v1.4.1** (was v0.2.0).
+  Handler signatures moved from
+  `func(ctx, *ServerSession, *CallToolParamsFor[T]) (*CallToolResultFor[any], error)`
+  to
+  `func(ctx, *CallToolRequest, T) (*CallToolResult, any, error)`;
+  `NewSSEClientTransport` replaced by `&SSEClientTransport{Endpoint: …}`;
+  `Client.Connect` takes an explicit `*ClientSessionOptions`;
+  prompt handlers take `*GetPromptRequest` instead of
+  `*ServerSession + *GetPromptParams`.
+
+Cherry-picking an individual fix back into upstream
+(`ConnectBackend`, auto-reconnect without the event pump) is still
+possible in principle, but we no longer maintain a synchronised upstream
+branch. The full roadmap from v0.2.0 onward (event pump, non-blocking
+`continue`, observability, Kubernetes-specific hardening) is
+fork-only. See [`CHANGELOG.md`](CHANGELOG.md) for the user-facing
+surface of each release and
+[`docs/design-feature/non-blocking-continue-and-event-pump/`](docs/design-feature/non-blocking-continue-and-event-pump/)
+for the architectural rationale (ADR-PUMP-14).
 
 ## Quick Start — Kubernetes remote debug
 
