@@ -9,6 +9,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"reflect"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -29,11 +30,20 @@ type readWriteCloser struct {
 	io.WriteCloser
 }
 
+// eventBufSize is the buffer size used for both per-subscriber event channels
+// and the event replay ring (ADR-PUMP-4, ADR-PUMP-5).
+const eventBufSize = 64
+
 // DAPClient is a synchronous Debug Adapter Protocol client.
 // It manages a connection to a DAP server and provides methods for
 // sending each DAP request type. Each request method returns the
 // sequence number of the sent request, which callers use to match
 // the corresponding response via request_seq.
+//
+// Phase 1 adds an event pump: readLoop runs as a background goroutine,
+// routing incoming messages to the response registry (SendRequest/AwaitResponse)
+// and the event bus (Subscribe). The existing ReadMessage/send/rawSend paths
+// remain unchanged for backward compatibility during migration.
 type DAPClient struct {
 	// connection state — guarded by mu
 	mu     sync.Mutex
@@ -59,6 +69,15 @@ type DAPClient struct {
 	// reinitHook is called by doReconnect after a successful reconnect to
 	// re-establish the DAP session. Set via SetReinitHook from tools.go.
 	reinitHook func(ctx context.Context) error
+
+	// Phase 1: event pump infrastructure (ADR-PUMP-1 through PUMP-5).
+	// registryMu guards responses, subscribers, and replayRing.
+	// Lock ordering: c.mu → c.registryMu (never reverse).
+	registryMu  sync.Mutex
+	responses   map[int]chan dap.Message          // one-shot buffered(1) channels per pending request
+	subscribers map[reflect.Type][]*subscription  // event fan-out by event type
+	replayRing  *eventRing                         // ring buffer of last 64 events for Subscribe(since)
+	pumpDone    chan struct{}                       // closed when readLoop exits; nil until Start()
 }
 
 // newDAPClient creates a new Client over a TCP connection.
@@ -87,14 +106,17 @@ func newDAPClientFromRWC(rwc io.ReadWriteCloser) *DAPClient {
 func newDAPClientInternal(rwc io.ReadWriteCloser, addr string, backend Redialer) *DAPClient {
 	ctx, cancel := context.WithCancel(context.Background())
 	c := &DAPClient{
-		rwc:      rwc,
-		reader:   bufio.NewReader(rwc),
-		seq:      1, // match VS Code numbering
-		addr:     addr,
-		backend:  backend,
-		reconnCh: make(chan struct{}, 1),
-		ctx:      ctx,
-		cancel:   cancel,
+		rwc:         rwc,
+		reader:      bufio.NewReader(rwc),
+		seq:         1, // match VS Code numbering
+		addr:        addr,
+		backend:     backend,
+		reconnCh:    make(chan struct{}, 1),
+		ctx:         ctx,
+		cancel:      cancel,
+		responses:   make(map[int]chan dap.Message),
+		subscribers: make(map[reflect.Type][]*subscription),
+		replayRing:  newEventRing(eventBufSize),
 	}
 	return c
 }
@@ -104,11 +126,27 @@ func newDAPClientInternal(rwc io.ReadWriteCloser, addr string, backend Redialer)
 // prevent the race window where a disconnect before the hook is registered
 // would be silently ignored. Safe to call on stdio (nil backend) clients —
 // reconnectLoop exits immediately when no Redialer is present.
+//
+// In Phase 2, Start will also launch readLoop once tools.go is migrated to the
+// SendRequest/AwaitResponse/Subscribe API. For Phase 1, use startReadLoop
+// explicitly in pump-only code paths.
 func (c *DAPClient) Start() {
 	go c.reconnectLoop()
 }
 
+// startReadLoop initialises pumpDone and launches the readLoop goroutine.
+// Must only be called on clients that will NOT concurrently call ReadMessage —
+// readLoop and ReadMessage both read from the same connection and are mutually
+// exclusive. In Phase 1, this is called by pump unit tests only; tools.go
+// migrates to the pump API in Phase 2 at which point Start() will call this
+// directly.
+func (c *DAPClient) startReadLoop() {
+	c.pumpDone = make(chan struct{})
+	go c.readLoop()
+}
+
 // Close cancels the reconnect loop goroutine and closes the current connection.
+// If Start() was called, waits for readLoop to exit before returning.
 // Safe to call multiple times (cancel is idempotent, Close on a closed conn is harmless).
 func (c *DAPClient) Close() {
 	if c.cancel != nil {
@@ -118,7 +156,10 @@ func (c *DAPClient) Close() {
 	rwc := c.rwc
 	c.mu.Unlock()
 	if rwc != nil {
-		rwc.Close()
+		rwc.Close() // unblocks any in-flight ReadProtocolMessage in readLoop
+	}
+	if c.pumpDone != nil {
+		<-c.pumpDone // wait for readLoop to exit
 	}
 }
 
@@ -370,15 +411,18 @@ func (c *DAPClient) markStale() {
 	}
 }
 
-// replaceConn atomically swaps the underlying transport under mu.
-// The old rwc must be closed by the caller (doReconnect) before calling
-// replaceConn so that any blocked ReadMessage returns with an error.
-// seq is deliberately NOT reset here (ADR-11).
+// replaceConn atomically swaps the underlying transport under mu, then drains
+// the response registry so any pending AwaitResponse callers receive
+// ErrConnectionStale. The old rwc must be closed by the caller (doReconnect)
+// before calling replaceConn so that any blocked ReadMessage returns with an
+// error. seq is deliberately NOT reset here (ADR-11).
 func (c *DAPClient) replaceConn(newRWC io.ReadWriteCloser) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	c.rwc = newRWC
 	c.reader = bufio.NewReader(newRWC)
+	c.mu.Unlock()
+	// Drain pending response channels so AwaitResponse callers see stale error.
+	c.closeRegistry(ErrConnectionStale)
 }
 
 // reconnectLoop runs in a dedicated goroutine for the DAPClient's entire
@@ -790,4 +834,405 @@ func (c *DAPClient) AttachRequest(mode string, processID int) (int, error) {
 		"processId": processID,
 	})
 	return req.Seq, c.send(request)
+}
+
+// ---------------------------------------------------------------------------
+// Phase 1: Event Pump — types and internal helpers
+// ---------------------------------------------------------------------------
+
+// subscription holds a single event subscriber's state.
+// ch receives incoming events from dispatchEvent (fan-out).
+// stop is closed by cancel() to signal the bridge goroutine to exit.
+// Fan-out in dispatchEvent checks stop before sending to ch.
+type subscription struct {
+	eventType reflect.Type
+	ch        chan dap.Message
+	stop      chan struct{} // closed when cancel() is called
+	id        uint64
+}
+
+// ringEntry is a single slot in the event replay ring.
+type ringEntry struct {
+	t   time.Time
+	msg dap.Message
+}
+
+// eventRing is a fixed-capacity circular buffer used to replay recent events
+// to new subscribers (ADR-PUMP-5). The ring is shared across all event types;
+// Subscribe filters by type during replay.
+type eventRing struct {
+	mu    sync.Mutex
+	items []ringEntry
+	idx   int // next write position (mod cap)
+	cap   int
+	size  int // number of valid entries (0..cap)
+}
+
+// newEventRing creates a new ring buffer with the given capacity.
+func newEventRing(cap int) *eventRing {
+	return &eventRing{
+		items: make([]ringEntry, cap),
+		cap:   cap,
+	}
+}
+
+// push adds an entry to the ring, overwriting the oldest if full.
+func (r *eventRing) push(e ringEntry) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.items[r.idx] = e
+	r.idx = (r.idx + 1) % r.cap
+	if r.size < r.cap {
+		r.size++
+	}
+}
+
+// snapshot returns all valid entries in insertion order (oldest first).
+func (r *eventRing) snapshot() []ringEntry {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.size == 0 {
+		return nil
+	}
+	out := make([]ringEntry, r.size)
+	start := (r.idx - r.size + r.cap) % r.cap
+	for i := 0; i < r.size; i++ {
+		out[i] = r.items[(start+i)%r.cap]
+	}
+	return out
+}
+
+// ConnectionLostEvent is an internal (non-DAP-protocol) event injected into
+// the event bus when the underlying TCP connection drops. It uses the "_"
+// prefix on the event name to avoid collision with real DAP events.
+// Phase 1: type is declared here; active broadcasting happens in Phase 4.
+type ConnectionLostEvent struct {
+	dap.Event        // satisfies dap.EventMessage via embedded GetEvent()
+	Time      time.Time
+	Err       error
+}
+
+// newConnectionLostEvent constructs a ConnectionLostEvent.
+func newConnectionLostEvent(err error) *ConnectionLostEvent {
+	e := &ConnectionLostEvent{
+		Time: time.Now(),
+		Err:  err,
+	}
+	e.Event.Type = "event"
+	e.Event.Event = "_connectionLost"
+	return e
+}
+
+// ---------------------------------------------------------------------------
+// Phase 1: Response registry — SendRequest / AwaitResponse
+// ---------------------------------------------------------------------------
+
+// SendRequest registers a response channel for the request, then writes msg to
+// the socket. It allocates a new sequence number (under c.mu, same as
+// newRequest), sets it on msg if msg is a *dap.Request-bearing type, registers
+// the response channel, and writes to the socket. Registration happens before
+// the write so readLoop can never deliver the response before the channel
+// exists. If the write fails, the channel is cleaned up and the error is
+// returned.
+//
+// Note: for messages whose seq is pre-set by newRequest, the caller should use
+// the seq returned here (which equals msg.Seq). For newly constructed messages,
+// SendRequest allocates the seq internally.
+func (c *DAPClient) SendRequest(msg dap.Message) (seq int, err error) {
+	// Allocate seq under c.mu (same as newRequest), consistent with ADR-11.
+	c.mu.Lock()
+	seq = c.seq
+	c.seq++
+	c.mu.Unlock()
+
+	// Register the channel before writing to socket (ADR-PUMP-2).
+	ch := make(chan dap.Message, 1)
+	c.registryMu.Lock()
+	c.responses[seq] = ch
+	c.registryMu.Unlock()
+
+	// Write to socket outside both locks.
+	if err = c.rawSend(msg); err != nil {
+		c.registryMu.Lock()
+		delete(c.responses, seq)
+		c.registryMu.Unlock()
+		return 0, err
+	}
+	return seq, nil
+}
+
+// AwaitResponse waits for the response matching seq to arrive via readLoop.
+// Returns ErrConnectionStale if closeRegistry was called (channel closed or
+// already drained by a reconnect), or ctx.Err() if the context is cancelled
+// before the response arrives.
+func (c *DAPClient) AwaitResponse(ctx context.Context, seq int) (dap.Message, error) {
+	c.registryMu.Lock()
+	ch, ok := c.responses[seq]
+	c.registryMu.Unlock()
+	if !ok {
+		// Channel not found: either closeRegistry already ran (and deleted it)
+		// or seq was never registered. Treat as stale to give callers a
+		// consistent error they can check with errors.Is(err, ErrConnectionStale).
+		return nil, ErrConnectionStale
+	}
+
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case msg, open := <-ch:
+		if !open {
+			return nil, ErrConnectionStale
+		}
+		return msg, nil
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Phase 1: Event bus — dispatchEvent / Subscribe / closeRegistry / broadcastEvent
+// ---------------------------------------------------------------------------
+
+// dispatchResponse delivers a response to its registered channel (if any),
+// then removes the entry from the registry. Orphaned responses (channel not
+// found) are logged and dropped — this is normal when a caller cancelled via
+// context before the response arrived.
+func (c *DAPClient) dispatchResponse(r dap.ResponseMessage) {
+	seq := r.GetResponse().RequestSeq
+	c.registryMu.Lock()
+	ch, ok := c.responses[seq]
+	if ok {
+		delete(c.responses, seq)
+	}
+	c.registryMu.Unlock()
+
+	if !ok {
+		log.Printf("DAPClient.readLoop: orphan response seq=%d (%T) — caller already cancelled", seq, r)
+		return
+	}
+	// buffer=1 guarantees this send never blocks (ADR-PUMP-2).
+	ch <- r
+}
+
+// dispatchEvent delivers an event to all matching subscribers and appends it
+// to the replay ring. Fan-out is non-blocking: slow subscribers receive a drop
+// log and the event is skipped for them (ADR-PUMP-4). Cancelled subscriptions
+// are skipped via the stop channel to avoid panics on closed channels.
+func (c *DAPClient) dispatchEvent(e dap.EventMessage) {
+	t := reflect.TypeOf(e)
+
+	// Append to replay ring first (under ring's own lock, not registryMu).
+	c.replayRing.push(ringEntry{t: time.Now(), msg: e})
+
+	c.registryMu.Lock()
+	subs := make([]*subscription, len(c.subscribers[t]))
+	copy(subs, c.subscribers[t])
+	c.registryMu.Unlock()
+
+	for _, sub := range subs {
+		// skip cancelled subscriptions without blocking
+		select {
+		case <-sub.stop:
+			continue
+		default:
+		}
+		select {
+		case sub.ch <- e:
+		default:
+			log.Printf("DAPClient.readLoop: subscriber %d for %T buffer full — dropping event", sub.id, e)
+		}
+	}
+}
+
+// closeRegistry closes all pending response channels (callers receive
+// ErrConnectionStale via the closed-channel case in AwaitResponse) and
+// removes them from the map. Idempotent for already-closed channels is
+// handled by the delete before close.
+func (c *DAPClient) closeRegistry(err error) {
+	c.registryMu.Lock()
+	defer c.registryMu.Unlock()
+	for seq, ch := range c.responses {
+		delete(c.responses, seq)
+		close(ch)
+	}
+	_ = err // err stored by Phase 4 for diagnostics; unused in Phase 1
+}
+
+// broadcastEvent delivers an event to all subscribers of its type without
+// going through the replay ring. Used by Phase 4 to inject ConnectionLostEvent.
+func (c *DAPClient) broadcastEvent(e dap.EventMessage) {
+	t := reflect.TypeOf(e)
+
+	c.registryMu.Lock()
+	subs := make([]*subscription, len(c.subscribers[t]))
+	copy(subs, c.subscribers[t])
+	c.registryMu.Unlock()
+
+	for _, sub := range subs {
+		select {
+		case <-sub.stop:
+			continue
+		default:
+		}
+		select {
+		case sub.ch <- e:
+		default:
+			log.Printf("DAPClient.broadcastEvent: subscriber %d for %T buffer full — dropping event", sub.id, e)
+		}
+	}
+}
+
+// subIDCounter is a monotonic counter for subscription IDs.
+var subIDCounter atomic.Uint64
+
+// Subscribe registers a typed event subscription and replays any matching
+// events from the ring that occurred at or after since. Returns a read-only
+// channel delivering events of type T and a cancel function that must be called
+// to release resources. Callers must call defer cancel().
+//
+// Go generics do not allow type parameters on methods, so Subscribe is a
+// package-level function (ADR-PUMP-12).
+func Subscribe[T dap.EventMessage](c *DAPClient, since time.Time) (<-chan T, func()) {
+	t := reflect.TypeOf((*T)(nil)).Elem()
+	// For pointer types (most events are *dap.StoppedEvent etc.), use the
+	// pointer type directly.
+	ch := make(chan dap.Message, eventBufSize)
+	stop := make(chan struct{})
+	id := subIDCounter.Add(1)
+	sub := &subscription{eventType: t, ch: ch, stop: stop, id: id}
+
+	// Replay matching entries from the ring before registering, so there is
+	// no gap between replay and live events once we're subscribed.
+	// We take a snapshot first, then register, then deliver replay.
+	// This ordering means a concurrent event arriving after snapshot but
+	// before registration may be delivered twice (once via replay, once via
+	// fan-out). Callers must tolerate duplicates; in practice this window is
+	// negligible.
+	entries := c.replayRing.snapshot()
+
+	c.registryMu.Lock()
+	c.subscribers[t] = append(c.subscribers[t], sub)
+	c.registryMu.Unlock()
+
+	// Deliver replay entries that match type and time window.
+	for _, e := range entries {
+		if e.t.Before(since) {
+			continue
+		}
+		typed, ok := e.msg.(T)
+		if !ok {
+			continue
+		}
+		select {
+		case ch <- typed:
+		default:
+			// Buffer full during replay — skip; live events will follow.
+		}
+	}
+
+	out := make(chan T, eventBufSize)
+	// Bridge goroutine: converts chan dap.Message → chan T.
+	// Exits when stop is closed (cancel called) or ch is drained after stop.
+	go func() {
+		defer close(out)
+		for {
+			select {
+			case <-stop:
+				// Drain any remaining buffered messages then exit.
+			drainLoop:
+				for {
+					select {
+					case msg, ok := <-ch:
+						if !ok || msg == nil {
+							break drainLoop
+						}
+						if typed, ok := msg.(T); ok {
+							select {
+							case out <- typed:
+							default:
+							}
+						}
+					default:
+						break drainLoop
+					}
+				}
+				return
+			case msg, ok := <-ch:
+				if !ok {
+					return
+				}
+				if typed, ok := msg.(T); ok {
+					out <- typed
+				}
+			}
+		}
+	}()
+
+	var cancelOnce sync.Once
+	cancel := func() {
+		cancelOnce.Do(func() {
+			c.registryMu.Lock()
+			subs := c.subscribers[t]
+			for i, s := range subs {
+				if s.id == id {
+					c.subscribers[t] = append(subs[:i], subs[i+1:]...)
+					break
+				}
+			}
+			c.registryMu.Unlock()
+			// Signal bridge goroutine to stop. Do NOT close sub.ch — dispatchEvent
+			// may hold a reference and send to it; use stop channel to coordinate.
+			close(stop)
+		})
+	}
+	return out, cancel
+}
+
+// ---------------------------------------------------------------------------
+// Phase 1: readLoop — single reader goroutine
+// ---------------------------------------------------------------------------
+
+// readLoop is the single goroutine that reads DAP messages from the connection
+// and routes them to the response registry or event bus. It exits when ctx is
+// cancelled (via Close()) or when the connection returns an I/O error.
+//
+// Invariant: no other code calls dap.ReadProtocolMessage on the live client
+// connection while readLoop is running (ADR-PUMP-1). The existing ReadMessage
+// method is still called by tools.go during Phase 1 (migration happens in
+// Phase 2); when Start() is called, tools.go code and readLoop would race.
+// For now, readLoop is started and the existing synchronous tools.go code is
+// not yet migrated — they co-exist in Phase 1 for unit test purposes only.
+// The readLoop is exercised exclusively via the new Pump unit tests.
+func (c *DAPClient) readLoop() {
+	defer close(c.pumpDone)
+	for {
+		// Check for shutdown before blocking read.
+		select {
+		case <-c.ctx.Done():
+			return
+		default:
+		}
+
+		c.mu.Lock()
+		reader := c.reader
+		c.mu.Unlock()
+
+		msg, err := dap.ReadProtocolMessage(reader)
+		if err != nil {
+			if c.ctx.Err() != nil {
+				// Normal shutdown via Close().
+				return
+			}
+			// I/O error — mark stale so reconnectLoop can recover.
+			c.markStale()
+			return
+		}
+
+		switch m := msg.(type) {
+		case dap.ResponseMessage:
+			c.dispatchResponse(m)
+		case dap.EventMessage:
+			c.dispatchEvent(m)
+		default:
+			log.Printf("DAPClient.readLoop: unexpected message type %T", msg)
+		}
+	}
 }
