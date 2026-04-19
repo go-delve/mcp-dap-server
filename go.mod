@@ -1,4 +1,4 @@
-module github.com/go-delve/mcp-dap-server
+module github.com/vajrock/mcp-dap-server-k8s-forward
 
 go 1.26.1
 

@@ -33,6 +33,11 @@ RELEASE="${DLV_RELEASE:-$NS}"
 RECONNECT_INTERVAL="${DLV_RECONNECT_INTERVAL:-2}"
 READY_TIMEOUT="${DLV_READY_TIMEOUT:-15}"
 
+# Binary name. GoReleaser publishes "mcp-dap-server"; `go install` from
+# source produces "mcp-dap-server-k8s-forward" (matches module basename).
+# Override via MCP_DAP_SERVER_BIN env if you installed under a different name.
+MCP_BIN="${MCP_DAP_SERVER_BIN:-mcp-dap-server}"
+
 log() { echo "[dlv-k8s-mcp $(date +%H:%M:%S)] $*" >&2; }
 
 # Port-forward supervisor loop — runs in background until parent exits
@@ -75,5 +80,5 @@ if ! nc -z localhost "$PORT" 2>/dev/null; then
 fi
 
 # Exec the MCP DAP server — inherits stdio from this process
-log "exec mcp-dap-server --connect localhost:${PORT}"
-exec mcp-dap-server --connect "localhost:${PORT}"
+log "exec ${MCP_BIN} --connect localhost:${PORT}"
+exec "${MCP_BIN}" --connect "localhost:${PORT}"
