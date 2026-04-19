@@ -60,15 +60,47 @@ Choose breakpoint locations based on your hypothesis:
 - Just before the condition you think is wrong
 - At error return paths
 
-### 3. Run to the first interesting point
+### 3. Run to the first interesting point — **two-step pattern (v0.2.0)**
 
+`continue` is non-blocking. It starts or resumes execution and returns
+`{"status":"running","threadId":N}` immediately. To receive the stop event
+(breakpoint hit, termination, pause), follow it with `wait-for-stop`.
+
+**3a. Start execution** (returns right away):
 ```json
 continue()
 ```
 
-Output includes: current file/line, stack trace, all local variables.
+**3b. Wait for the program to stop:**
+```json
+wait-for-stop(timeoutSec=30, pauseIfTimeout=true)
+```
 
-**What to look for:**
+`wait-for-stop` blocks until the program stops (or the timeout expires).
+With `pauseIfTimeout=true`, on timeout it issues a pause and returns the
+current context so you can inspect where the program is stuck.
+
+On success you get: current file/line, stack trace, all local variables.
+
+**When to use a subagent.** If hitting the breakpoint requires an external
+trigger that may take longer than a minute (open a browser page, issue a
+curl command, await a cron tick), dispatch `wait-for-stop` to a subagent
+via the Agent tool so your main agent stays free to issue the trigger in
+parallel. Example pattern:
+
+```
+# Main agent: start the program running (non-blocking).
+continue()
+
+# Dispatch subagent with a long wait — runs in the background.
+Agent(subagent_type=…, prompt="call wait-for-stop(timeoutSec=300) and
+      report the resulting context verbatim")
+
+# Main agent is free to do the trigger work in parallel.
+chrome-devtools.new_page(url="…")
+```
+
+**What to look for at the stop:**
 - Is the current location where you expected?
 - Are variable values what you expect at this point?
 - Is the call stack expected, or is something surprising calling this function?
@@ -108,10 +140,16 @@ evaluate(expression="(struct Node*)node->next")
 ### 5. Step through logic
 
 ```json
-step(mode="over")   // execute current line, stay in same function
-step(mode="in")     // step into the function being called
-step(mode="out")    // run until current function returns
+step(mode="over")                      // execute current line, stay in same function
+step(mode="in")                        // step into the function being called
+step(mode="out")                       // run until current function returns
+step(mode="over", timeoutSec=10)       // bail out early if the step never lands
 ```
+
+`step` still returns full context when it completes (unlike `continue`). The
+optional `timeoutSec` (default 30s) guards against stepping into long or
+blocking operations — on timeout the tool returns an error and suggests
+calling `pause` or `wait-for-stop` to recover.
 
 **When to use each:**
 - `over`: when you don't suspect the called function is the problem
@@ -143,7 +181,7 @@ If the debugger supports it:
 set-variable(variablesReference=<ref>, name="count", value="0")
 ```
 
-Then `continue()` to see if the fix works. This confirms your hypothesis before writing code.
+Then `continue()` + `wait-for-stop(…)` to see if the fix works. This confirms your hypothesis before writing code.
 
 ### 8. Clean up
 

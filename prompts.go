@@ -121,14 +121,27 @@ Or by function: `+"`"+`breakpoint(function="packageName.FunctionName")`+"`"+`
 
 ---
 
-### Step 3: Run to the first interesting point
+### Step 3: Run to the first interesting point — **two-step pattern**
+
+`+"`"+`continue`+"`"+` is non-blocking (v0.2.0+): it returns immediately with a "running" status JSON. To receive the stop event, call `+"`"+`wait-for-stop`+"`"+` next.
 
 Call: `+"`"+`continue()`+"`"+`
+Then call: `+"`"+`wait-for-stop(timeoutSec=30, pauseIfTimeout=true)`+"`"+`
 
-Expected: Stops at your breakpoint. Output includes:
+Expected: `+"`"+`wait-for-stop`+"`"+` returns full context when the program hits
+the breakpoint. With `+"`"+`pauseIfTimeout=true`+"`"+`, a pause is issued on timeout
+and the current stopped context is returned so you can inspect where the
+program got stuck.
+
+Output includes:
 - **Location**: file, line, function name
 - **Stack trace**: full call chain
 - **Variables**: locals and their current values
+
+**When to use a subagent:** if the breakpoint needs an external trigger
+(HTTP request, browser navigation) that may take > 60s, dispatch
+`+"`"+`wait-for-stop`+"`"+` to a subagent via the Agent tool so your main agent can
+issue the trigger in parallel.
 
 **What to look for:**
 - Are variable values what you expect at this point?
@@ -269,9 +282,11 @@ Only set breakpoints if you have a specific hypothesis to test.
 
 Call: `+"`"+`breakpoint(function="packageName.FunctionName")`+"`"+`
 
-Then resume: `+"`"+`continue()`+"`"+`
+Then resume (non-blocking): `+"`"+`continue()`+"`"+`
+And wait for the breakpoint: `+"`"+`wait-for-stop(timeoutSec=60, pauseIfTimeout=true)`+"`"+`
 
-The process resumes and runs until your breakpoint is hit. Inspect state at that point.
+The process resumes; `+"`"+`wait-for-stop`+"`"+` returns full context when the
+breakpoint is hit. Inspect state at that point.
 
 ---
 
@@ -553,7 +568,7 @@ For memory: `+"`"+`evaluate(expression="*(long*)0x<address>")`+"`"+`
 
 When you see a branch or call you want to understand:
 1. Disassemble the target: `+"`"+`disassemble(address="0x<target>", count=40)`+"`"+`
-2. Set a breakpoint there and `+"`"+`continue()`+"`"+`
+2. Set a breakpoint there, then `+"`"+`continue()`+"`"+` followed by `+"`"+`wait-for-stop(…)`+"`"+`
 3. Inspect register/memory state at that point
 
 **Common patterns:**

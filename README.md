@@ -140,8 +140,9 @@ inside one namespace).
 
 - Natural prompt: "set a breakpoint in handler.go at the Login
   function".
-- Claude calls MCP tools `debug`, `breakpoint`, `continue`, `context`,
-  etc.
+- Claude calls MCP tools `debug`, `breakpoint`, `continue`,
+  `wait-for-stop`, `context`, etc. Since v0.2.0 `continue` is non-blocking
+  and pairs with `wait-for-stop` — see [CHANGELOG.md](CHANGELOG.md).
 - Pod restart? The MCP server auto-reconnects and re-applies
   breakpoints in under 15 seconds. Claude continues with the next
   request transparently.
@@ -692,6 +693,7 @@ dev-api-postgres       ClusterIP   5432/TCP
 - Естественный промпт: «поставь breakpoint в `handler.go` на функции
   `Login`».
 - Claude вызывает MCP-инструменты `debug`, `breakpoint`, `continue`,
+  `wait-for-stop` (новое в v0.2.0),
   `context` и т.д.
 - Pod перезапустился? MCP-сервер автоматически переподключается и
   восстанавливает breakpoint'ы менее чем за 15 секунд. Claude
