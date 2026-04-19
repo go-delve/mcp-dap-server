@@ -91,8 +91,50 @@ spawning, 13 MCP tools, 4 prompts):
    }
    ```
 
+   > **Use the SHORT service name in `DLV_SERVICE` — not the full
+   > Helm-rendered name.** The wrapper builds the final Kubernetes
+   > Service reference as `svc/${DLV_RELEASE}-${DLV_SERVICE}`, where
+   > `DLV_RELEASE` defaults to `$DLV_NAMESPACE`. See
+   > [Service name resolution](#service-name-resolution) below for a
+   > worked example.
+
 4. Launch Claude Code in that project — the MCP server starts
    automatically.
+
+### Service name resolution
+
+<a id="service-name-resolution"></a>
+
+The wrapper references the target Service as
+`svc/${DLV_RELEASE}-${DLV_SERVICE}` in the chosen `DLV_NAMESPACE`.
+Default: `DLV_RELEASE=$DLV_NAMESPACE` (typical Helm convention).
+
+Given a cluster where `kubectl get svc -n dev` shows:
+
+```
+NAME                   TYPE        PORT(S)
+dev-frontend           ClusterIP   8080/TCP
+dev-backend            ClusterIP   8010/TCP,8011/TCP,24020/TCP
+dev-backend-postgres   ClusterIP   5432/TCP
+dev-api                ClusterIP   8090/TCP,…,24010/TCP
+dev-api-postgres       ClusterIP   5432/TCP
+```
+
+To debug the `backend` service (Service `dev-backend`, debug port
+`24020`):
+
+| Env var | Correct value | WRONG (common mistake) |
+|---|---|---|
+| `DLV_NAMESPACE` | `dev` | — |
+| `DLV_SERVICE` | `backend` *(short name only)* | `dev-backend` → resolves to `svc/dev-dev-backend` (does not exist) |
+| `DLV_PORT` | `24020` | — |
+| `DLV_RELEASE` | *(unset; defaults to `$DLV_NAMESPACE` = `dev`)* | — |
+
+For `api`: same pattern, `DLV_SERVICE=api`, `DLV_PORT=24010`.
+
+Override `DLV_RELEASE` explicitly only when your Helm release name
+differs from the namespace (e.g. multiple installs of the same chart
+inside one namespace).
 
 ### Usage
 
@@ -446,6 +488,20 @@ devel-Dockerfile to pin a newer `dlv` version.
 Check stderr. The usual cause is missing `DLV_*` env vars (see
 `scripts/README.md`).
 
+### `Error from server (NotFound): services "..." not found` in wrapper stderr
+
+The wrapper builds the Service reference as
+`svc/${DLV_RELEASE}-${DLV_SERVICE}`. If you set `DLV_SERVICE` to the
+full Helm-rendered name (e.g. `dev-backend`) in a `dev` namespace,
+the wrapper then asks for `svc/dev-dev-backend` — which doesn't
+exist.
+
+Fix: set `DLV_SERVICE` to the **short** name (`backend`, `api`,
+etc). The namespace-prefix is added automatically via `DLV_RELEASE`
+(defaults to `$DLV_NAMESPACE`). See
+[Service name resolution](#service-name-resolution) for a full
+worked example.
+
 ## Development
 
 ### Build
@@ -587,8 +643,49 @@ MCP-сервер, связывающий Claude Code (и другие MCP-кли
    }
    ```
 
+   > **В `DLV_SERVICE` — короткое имя, а не полное Helm-имя Service.**
+   > Wrapper собирает итоговое имя как
+   > `svc/${DLV_RELEASE}-${DLV_SERVICE}`, где `DLV_RELEASE` по
+   > умолчанию равен `$DLV_NAMESPACE`. Разбор на примере — см.
+   > [Формула имени Service](#формула-имени-service) ниже.
+
 4. Запустите Claude Code в этом проекте — MCP-сервер стартует
    автоматически.
+
+### Формула имени Service
+
+<a id="формула-имени-service"></a>
+
+Wrapper обращается к Service как
+`svc/${DLV_RELEASE}-${DLV_SERVICE}` в namespace'е `DLV_NAMESPACE`. По
+умолчанию `DLV_RELEASE=$DLV_NAMESPACE` (обычная Helm-конвенция).
+
+Если `kubectl get svc -n dev` выдаёт:
+
+```
+NAME                   TYPE        PORT(S)
+dev-frontend           ClusterIP   8080/TCP
+dev-backend            ClusterIP   8010/TCP,8011/TCP,24020/TCP
+dev-backend-postgres   ClusterIP   5432/TCP
+dev-api                ClusterIP   8090/TCP,…,24010/TCP
+dev-api-postgres       ClusterIP   5432/TCP
+```
+
+Чтобы отладить `backend` (Service `dev-backend`, debug-порт `24020`),
+задайте:
+
+| Env | Правильно | НЕправильно (типичная ошибка) |
+|---|---|---|
+| `DLV_NAMESPACE` | `dev` | — |
+| `DLV_SERVICE` | `backend` *(только короткое имя)* | `dev-backend` → получится `svc/dev-dev-backend` (такого Service нет) |
+| `DLV_PORT` | `24020` | — |
+| `DLV_RELEASE` | *(не задан; default = `$DLV_NAMESPACE` = `dev`)* | — |
+
+Для `api`: тот же паттерн — `DLV_SERVICE=api`, `DLV_PORT=24010`.
+
+`DLV_RELEASE` задавайте явно только тогда, когда имя Helm-release
+отличается от namespace'а (например, несколько установок одного чарта
+в одном namespace'е).
 
 ### Использование
 
@@ -945,6 +1042,18 @@ Delve в вашем pod'е слишком старый для DAP remote-attach.
 
 Проверьте stderr. Обычная причина — отсутствующие `DLV_*` env'ы (см.
 `scripts/README.md`).
+
+### `Error from server (NotFound): services "..." not found` в stderr wrapper'а
+
+Wrapper собирает имя Service как `svc/${DLV_RELEASE}-${DLV_SERVICE}`.
+Если вы задали `DLV_SERVICE` как полное Helm-имя (например,
+`dev-backend`) в namespace'е `dev`, wrapper попытается найти
+`svc/dev-dev-backend` — такого Service нет.
+
+Правильно: `DLV_SERVICE` — **короткое** имя (`backend`, `api` и
+т.п.). Префикс namespace'а добавляется автоматически через
+`DLV_RELEASE` (default = `$DLV_NAMESPACE`). Полный пример — см.
+[Формула имени Service](#формула-имени-service).
 
 ## Разработка
 
