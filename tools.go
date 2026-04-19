@@ -696,7 +696,7 @@ func (ds *debuggerSession) evaluateExpression(ctx context.Context, _ *mcp.Server
 	} else if ds.lastFrameID >= 0 {
 		frameID = ds.lastFrameID
 	}
-	log.Printf("evaluate: expression=%q frameID=%d context=%q", params.Arguments.Expression, frameID, evalContext)
+	logAt(LogDebug, "evaluate: expression=%q frameID=%d context=%q", params.Arguments.Expression, frameID, evalContext)
 
 	evalSeq, err := ds.client.EvaluateRequest(params.Arguments.Expression, frameID, evalContext)
 	if err != nil {
@@ -869,7 +869,7 @@ type DisassembleParams struct {
 func (ds *debuggerSession) disassembleCode(ctx context.Context, _ *mcp.ServerSession, params *mcp.CallToolParamsFor[DisassembleParams]) (*mcp.CallToolResultFor[any], error) {
 	ds.mu.Lock()
 	defer ds.mu.Unlock()
-	log.Printf("disassemble: address=%s offset=%d", params.Arguments.Address, params.Arguments.Offset.Int())
+	logAt(LogDebug, "disassemble: address=%s offset=%d", params.Arguments.Address, params.Arguments.Offset.Int())
 	if ds.client == nil {
 		return nil, fmt.Errorf("debugger not started")
 	}
@@ -907,7 +907,7 @@ func (ds *debuggerSession) disassembleCode(ctx context.Context, _ *mcp.ServerSes
 func (ds *debuggerSession) stop(ctx context.Context, _ *mcp.ServerSession, params *mcp.CallToolParamsFor[StopParams]) (*mcp.CallToolResultFor[any], error) {
 	ds.mu.Lock()
 	defer ds.mu.Unlock()
-	log.Printf("stop")
+	logAt(LogDebug, "stop")
 	if ds.cmd == nil && ds.client == nil {
 		return &mcp.CallToolResultFor[any]{
 			Content: []mcp.Content{&mcp.TextContent{Text: "No debug session active"}},
@@ -1609,7 +1609,7 @@ func (ds *debuggerSession) reinitialize(ctx context.Context) error {
 		return fmt.Errorf("reinitialize: no backend")
 	}
 
-	log.Printf("reinitialize: starting")
+	logAt(LogDebug, "reinitialize: starting")
 
 	// 1. Initialize
 	caps, err := ds.client.InitializeRequestRaw(ctx, ds.backend.AdapterID())
@@ -1688,7 +1688,7 @@ func (ds *debuggerSession) reinitialize(ctx context.Context) error {
 	ds.stoppedThreadID = 0
 	ds.lastFrameID = -1
 
-	log.Printf("reinitialize: completed (%d source breakpoints, %d function breakpoints re-applied)",
+	logAt(LogDebug, "reinitialize: completed (%d source breakpoints, %d function breakpoints re-applied)",
 		applied, len(ds.functionBreakpoints))
 	return nil
 }

@@ -38,7 +38,18 @@ READY_TIMEOUT="${DLV_READY_TIMEOUT:-15}"
 # Override via MCP_DAP_SERVER_BIN env if you installed under a different name.
 MCP_BIN="${MCP_DAP_SERVER_BIN:-mcp-dap-server}"
 
-log() { echo "[dlv-k8s-mcp $(date +%H:%M:%S)] $*" >&2; }
+# Log to a per-PID file so multiple parallel wrappers don't overwrite each
+# other, and mirror to stderr for developer convenience. The stderr copy is
+# best-effort: Claude Code consumes stderr as part of the MCP transport, but
+# these lines are short and infrequent so no buffer-fill hang risk in practice.
+WRAPPER_LOG="/tmp/dlv-k8s-mcp.$$.log"
+: > "$WRAPPER_LOG"
+log() {
+  local line="[dlv-k8s-mcp $(date +%H:%M:%S.%3N)] $*"
+  echo "$line" >>"$WRAPPER_LOG"
+  echo "$line" >&2
+}
+log "wrapper started, log=$WRAPPER_LOG"
 
 # Port-forward supervisor loop — runs in background until parent exits.
 # Subshell installs its own trap that propagates termination to the currently

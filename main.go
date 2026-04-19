@@ -3,10 +3,14 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"io"
 	"log"
 	"os"
+	"os/signal"
 	"path/filepath"
+	"runtime/pprof"
+	"syscall"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
@@ -24,15 +28,14 @@ func main() {
 		addr = os.Getenv("DAP_CONNECT_ADDR")
 	}
 
-	// Log only to a file — never to stderr. With MCP stdio transport,
-	// stderr is a pipe to the MCP client. If the pipe buffer fills
-	// (from our logs or the DAP adapter's stderr), any write blocks
-	// the goroutine and hangs the server.
-	logPath := filepath.Join(os.TempDir(), "mcp-dap-server.log")
+	// Log to a per-PID file so multiple concurrent mcp-dap-server instances
+	// don't clobber each other's logs. Never write to stderr — with MCP stdio
+	// transport stderr is a pipe to the MCP client, and a full pipe buffer
+	// would block the logging goroutine and hang the server.
+	logPath := filepath.Join(os.TempDir(), fmt.Sprintf("mcp-dap-server.%d.log", os.Getpid()))
 	var logWriter io.Writer
-	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 	if err != nil {
-		// Discard logs if we can't open the file — do NOT fall back to stderr
 		logWriter = io.Discard
 		log.SetOutput(logWriter)
 	} else {
@@ -41,7 +44,45 @@ func main() {
 		defer logFile.Close()
 	}
 
-	log.Printf("mcp-dap-server starting (log file: %s, connect: %q)", logPath, addr)
+	// Microsecond-resolution timestamps make it possible to measure short
+	// DAP round-trips in the log. The prefix carries PID and (if present) the
+	// remote DAP target, so grep'ing across multiple session logs is useful.
+	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
+	prefix := fmt.Sprintf("[pid=%d", os.Getpid())
+	if addr != "" {
+		prefix += " addr=" + addr
+	}
+	prefix += "] "
+	log.SetPrefix(prefix)
+
+	log.Printf("mcp-dap-server starting (version=%s log=%s connect=%q level=%s)",
+		version, logPath, addr, currentLogLevel.String())
+
+	// Maintain a convenience "latest" symlink pointing at the active session's
+	// log. Best-effort — a failure here is noted but not fatal.
+	latestPath := filepath.Join(os.TempDir(), "mcp-dap-server.latest.log")
+	_ = os.Remove(latestPath)
+	if err := os.Symlink(logPath, latestPath); err != nil {
+		log.Printf("warn: could not create latest.log symlink: %v", err)
+	}
+
+	// SIGUSR1 handler: dumps a full goroutine profile to the log. Use when
+	// the server appears hung: `pkill -USR1 mcp-dap-server` surfaces where
+	// every goroutine is parked without terminating the process.
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGUSR1)
+	go func() {
+		for range sigCh {
+			log.Printf("=== SIGUSR1 goroutine dump ===")
+			if p := pprof.Lookup("goroutine"); p != nil {
+				// Level 2 gives verbose output including goroutine addresses
+				// and stacks — identical format to an unrecovered panic dump,
+				// which is what developers are used to reading.
+				_ = p.WriteTo(logFile, 2)
+			}
+			log.Printf("=== SIGUSR1 dump complete ===")
+		}
+	}()
 
 	// Create MCP server
 	implementation := mcp.Implementation{
