@@ -132,15 +132,21 @@ Set a targeted breakpoint at the function that produces wrong output:
 ```json
 breakpoint(function="packageName.FunctionName")
 continue()
+wait-for-stop(timeoutSec=60, pauseIfTimeout=true)
 ```
 
-When it hits, inspect inputs and internal state to find where the logic diverges.
+`continue` returns immediately with `{"status":"running"}` since v0.2.0;
+`wait-for-stop` blocks until the breakpoint is hit or until the timeout
+elapses. Set a longer `timeoutSec` (up to 300) when the action that would
+trigger the breakpoint depends on external events. When it hits, inspect
+inputs and internal state to find where the logic diverges.
 
 ### 5. Iterate
 
 Resume the process and let it run to your next observation point:
 ```json
 continue()
+wait-for-stop(timeoutSec=60, pauseIfTimeout=true)
 ```
 
 Or manually pause again:

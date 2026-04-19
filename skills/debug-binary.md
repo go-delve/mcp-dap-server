@@ -86,9 +86,11 @@ breakpoint(function="*0x00401234")
 
 Note: GDB uses `*0xADDR` syntax for address-based breakpoints.
 
-Then run to the breakpoint:
+Then run to the breakpoint (continue is non-blocking since v0.2.0;
+wait-for-stop receives the actual stop event):
 ```json
 continue()
+wait-for-stop(timeoutSec=30, pauseIfTimeout=true)
 ```
 
 ### 5. Inspect registers and memory
@@ -216,7 +218,7 @@ Identify interesting branch or call
     ↓
 Set breakpoint at target
     ↓
-continue() → arrive at target
+continue() + wait-for-stop(…) → arrive at target
     ↓
 inspect registers + disassemble again
 ```

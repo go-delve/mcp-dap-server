@@ -117,24 +117,28 @@ Tools are dynamically registered. Before a debug session, only `debug` is availa
 | `stop` | End the debugging session |
 | `breakpoint` | Set a breakpoint (file+line or function name) |
 | `clear-breakpoints` | Remove breakpoints (by file or all) |
-| `continue` | Continue execution (with optional run-to-cursor) |
-| `step` | Step over/in/out |
-| `pause` | Pause a running program |
+| `continue` | Start/resume execution; returns immediately with `{"status":"running"}`. Pair with `wait-for-stop`. |
+| `wait-for-stop` | Block until the program stops (breakpoint, terminate, pause). Supports `timeoutSec` and `pauseIfTimeout`. |
+| `step` | Step over/in/out (with optional `timeoutSec`, default 30s) |
+| `pause` | Pause a running program (runs in parallel with an in-flight continue since v0.2.0) |
 | `context` | Get full debugging context (location, stack, variables) |
 | `evaluate` | Evaluate an expression |
 | `info` | List threads, sources, or modules |
+| `reconnect` | Force or wait for a DAP reconnect cycle |
 | `set-variable` | Modify a variable value (capability-gated) |
 | `disassemble` | Disassemble at address (capability-gated) |
 | `restart` | Restart the session (capability-gated) |
 
 ### Typical Debugging Flow
 
-1. **debug** — Spawns debugger, connects, optionally sets breakpoints and continues to first hit
-2. **context** — Get location, stack trace, and variables at the stop point
-3. **breakpoint** / **clear-breakpoints** — Manage breakpoints
-4. **continue** / **step** — Navigate through execution
-5. **evaluate** — Inspect expressions
-6. **stop** — Clean up
+1. **debug** — Spawns debugger, connects, optionally sets breakpoints and runs to first hit
+2. **breakpoint** / **clear-breakpoints** — Manage breakpoints
+3. **continue** — Trigger execution (returns immediately with `{"status":"running"}`)
+4. **wait-for-stop** — Block until the program stops (breakpoint, terminate, pause). `pauseIfTimeout=true` to handle the no-hit case gracefully. Dispatch to a subagent for long waits.
+5. **context** — Full context at the current stop (location + stack + variables)
+6. **step** — Navigate step-by-step (with `timeoutSec` default 30s)
+7. **evaluate** — Inspect expressions
+8. **stop** — Clean up
 
 ## Testing Architecture
 
@@ -186,10 +190,12 @@ func TestSomething(t *testing.T) {
 - Only one debugger can be active per MCP server session
 - `ds.client == nil` checks protect against calling tools before debugger is started
 - Tools are dynamically registered/unregistered as sessions start/stop
+- Since v0.2.0, `continueExecution` releases `debuggerSession.mu` after the `ContinueResponse`, so `pause` and `wait-for-stop` can run in parallel while the program executes
 
 ### Response Handling
-- Some tools read multiple messages (events + responses) in a loop
-- `continue` and `step` (all modes) wait for `StoppedEvent` or `TerminatedEvent`
+- All DAP reads go through a single `readLoop` goroutine in `dap.go` (the event pump). Tool handlers use `SendRequest` / `AwaitResponse(ctx, seq)` (response registry matches by `request_seq`) or `Subscribe[T](since)` for events
+- `wait-for-stop` blocks via a typed event-bus subscription, not by calling `ReadMessage`
+- `step` (all modes) still blocks on a stop/terminated event subscription with a configurable `timeoutSec`
 - The `context` tool automatically fetches scopes and variables for the current frame
 
 ### Tool Naming Convention
@@ -202,11 +208,15 @@ func TestSomething(t *testing.T) {
 2. **Frame IDs vs Thread IDs**: Frame IDs come from stack traces, thread IDs from the threads request. Delve uses frame IDs starting at 1000.
 3. **Variables References**: The `variablesReference` in scopes/variables is a DAP protocol identifier, not a simple index. Delve uses frame_id+1 for locals scope (e.g., 1001 for frame 1000).
 4. **Stopped Event Format**: Contains `Reason` field ("breakpoint", "function breakpoint", "step", "entry", "pause", etc.) and `ThreadId`
-5. **Serialized Tool Calls**: All tool calls are serialized by a mutex. Concurrent MCP tool calls will queue rather than race. Long-running operations (continue, step) hold the lock until completion.
+5. **Lock Scope (post-v0.2.0)**: `continue` releases `ds.mu` after the `ContinueResponse`, so `pause` and `wait-for-stop` can execute in parallel while the debuggee is running. `step` still holds `ds.mu` for its entire duration because it is expected to complete within `timeoutSec` (default 30s).
 6. **Capability-Gated Tools**: `set-variable`, `disassemble`, and `restart` are only available when the DAP adapter reports support via capabilities
 7. **Test Binary Paths**: Must be absolute paths for the `debug` tool in binary mode
 8. **go-dap ErrorResponse Decoding**: go-dap decodes ALL failed responses (`success: false`) as `*dap.ErrorResponse` regardless of command. Response matching must use `request_seq`, not Go type
-9. **DAP Response Ordering**: GDB native DAP may send responses out of order (e.g., `StoppedEvent` before `ContinueResponse`). Out-of-order responses are skipped by `request_seq` matching
+9. **DAP Response Ordering**: GDB native DAP may send responses out of order (e.g., `StoppedEvent` before `ContinueResponse`). The event pump resolves this transparently — responses are routed by `request_seq` in the registry, events to the bus; tool code never sees out-of-order wire messages
+12. **Two-step continue (v0.2.0+)**: `continue` returns `{"status":"running"}` immediately; it does NOT wait for a stop event. Callers MUST invoke `wait-for-stop` afterward to receive the stop/terminate event. Forgetting `wait-for-stop` leaves the debuggee running indefinitely
+13. **Event replay ring is 64 entries**: `Subscribe[T](c, since)` replays recent matching events so a late subscription doesn't miss an event that arrived just before it was created. Don't rely on older-than-64-events being in the ring
+14. **SIGUSR1 for live diagnostics**: `pkill -USR1 mcp-dap-server` dumps every goroutine's stack into the log file via `runtime/pprof`. Useful when the server appears hung
+15. **Per-PID log file**: logs go to `/tmp/mcp-dap-server.$PID.log` (symlink `mcp-dap-server.latest.log` points at the most recent). Multiple parallel instances do not collide. Set `MCP_LOG_LEVEL=trace` for per-DAP-message logging
 10. **go-dap `omitempty` on FrameId**: `EvaluateArguments.FrameId` has `omitempty`, so `frameId=0` is silently dropped. `EvaluateRequest` uses raw JSON map to work around this
 11. **Never write logs to stderr**: MCP stdio transport uses stderr as a pipe to the client. If that pipe buffer fills — either from our logs or the DAP adapter's stderr — the writing goroutine blocks and the server hangs. All logging must go to the file opened in `main.go`; if the file can't be opened, the code intentionally discards logs rather than falling back to stderr
 
@@ -292,13 +302,20 @@ services running in Kubernetes pods.
 
 - Binary name unchanged (`mcp-dap-server`); the feature is enabled via
   the `--connect <addr>` CLI flag or the `DAP_CONNECT_ADDR` env var.
-- `Redialer` is a **separate optional interface** (NOT added to
-  `DebuggerBackend`) to keep the upstream interface unchanged —
-  important for upstream PR acceptance.
-- Lock ordering: always `ds.mu` → `DAPClient.mu`. `reinitialize` holds
-  `ds.mu` for the entire DAP handshake (see ADR-13).
+- `Redialer` is a separate optional interface (NOT added to
+  `DebuggerBackend`). This kept the upstream interface stable through
+  v0.1.x; starting with v0.2.0 the fork intentionally diverges from
+  `go-delve/mcp-dap-server` (event-pump refactor, non-blocking continue,
+  `wait-for-stop` tool — all fork-specific, no upstream PR planned).
+- Lock ordering: always `ds.mu` → `DAPClient.mu` → `DAPClient.registryMu`.
+  `reinitialize` holds `ds.mu` for the entire DAP handshake (see ADR-13 /
+  ADR-PUMP-3).
 - DAP `SetBreakpointsRequest` replaces all breakpoints for a file, so
   our session state tracks the full list to re-apply after reconnect.
+- Since v0.2.0 the DAP socket has a single reader (`DAPClient.readLoop`).
+  I/O errors close the response registry, broadcast a
+  `ConnectionLostEvent` to Subscribers, then park on `pumpResume` until
+  `replaceConn` hands in a fresh rwc.
 
 ### Workflow for adding/changing remote-debug code
 
