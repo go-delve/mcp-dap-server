@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "dlv-remote": {
+      "command": "/abs/path/to/dlv-k8s-mcp.sh",
+      "env": {
+        "DLV_NAMESPACE": "dev",
+        "DLV_SERVICE": "my-service",
+        "DLV_PORT": "24010"
+      }
+    }
+  }
+}
