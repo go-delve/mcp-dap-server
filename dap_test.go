@@ -554,12 +554,13 @@ func newPumpPipe(t *testing.T) *pumpPipe {
 }
 
 // sendResponse writes a DAP response to the server side of the pipe so the
-// client's readLoop can pick it up.
+// client's readLoop can pick it up. Mirrors the field layout used throughout
+// the existing test suite (Seq/Type are promoted from ProtocolMessage).
 func (p *pumpPipe) sendResponse(t *testing.T, seq, requestSeq int, command string, success bool) {
 	t.Helper()
 	resp := &dap.ErrorResponse{}
-	resp.Response.Type = "response"
-	resp.Response.Seq = seq
+	resp.Seq = seq
+	resp.Type = "response"
 	resp.Response.RequestSeq = requestSeq
 	resp.Response.Command = command
 	resp.Response.Success = success
@@ -568,12 +569,12 @@ func (p *pumpPipe) sendResponse(t *testing.T, seq, requestSeq int, command strin
 	}
 }
 
-// sendEvent writes a DAP StoppedEvent to the server side of the pipe.
+// sendStoppedEvent writes a DAP StoppedEvent to the server side of the pipe.
 func (p *pumpPipe) sendStoppedEvent(t *testing.T, seq int) {
 	t.Helper()
 	evt := &dap.StoppedEvent{}
-	evt.Event.Type = "event"
-	evt.Event.Seq = seq
+	evt.Seq = seq
+	evt.Type = "event"
 	evt.Event.Event = "stopped"
 	evt.Body.Reason = "breakpoint"
 	if err := dap.WriteProtocolMessage(p.serverConn, evt); err != nil {
