@@ -1017,3 +1017,110 @@ func TestPump_Concurrent_SendAndSubscribe_Race(t *testing.T) {
 
 	wg.Wait()
 }
+
+// ---------------------------------------------------------------------------
+// Phase 4 tests — reconnect integration
+// ---------------------------------------------------------------------------
+
+// TestPump_IOError_BroadcastsConnectionLostEvent verifies that when the read
+// side of the DAP connection returns an I/O error, the active readLoop
+// broadcasts a *ConnectionLostEvent to subscribers before waiting for resume.
+func TestPump_IOError_BroadcastsConnectionLostEvent(t *testing.T) {
+	t.Parallel()
+	serverConn, clientConn := net.Pipe()
+	c := newDAPClientFromRWC(clientConn)
+	defer c.Close()
+	c.startReadLoop()
+
+	// Subscribe to ConnectionLostEvent BEFORE triggering the drop so the
+	// replay ring covers the event even if it fires very quickly.
+	lostSub, cancel := Subscribe[*ConnectionLostEvent](c, time.Time{})
+	defer cancel()
+
+	// Trigger a read-side I/O error by closing the server side of the pipe.
+	_ = serverConn.Close()
+
+	select {
+	case lost, ok := <-lostSub:
+		if !ok {
+			t.Fatal("ConnectionLostEvent channel closed without delivering event")
+		}
+		if lost == nil {
+			t.Fatal("nil ConnectionLostEvent delivered")
+		}
+		if lost.Err == nil {
+			t.Fatal("ConnectionLostEvent has nil Err — expected the underlying I/O error")
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("timed out waiting for ConnectionLostEvent after I/O error")
+	}
+
+	if !c.stale.Load() {
+		t.Fatal("expected stale=true after readLoop observed I/O error")
+	}
+}
+
+// TestPump_ReplaceConn_ResumesReadLoop verifies that after an I/O error parked
+// readLoop on pumpResume, calling replaceConn with a fresh rwc wakes it and
+// subsequent responses flow through the registry again.
+func TestPump_ReplaceConn_ResumesReadLoop(t *testing.T) {
+	t.Parallel()
+	serverConn1, clientConn1 := net.Pipe()
+	c := newDAPClientFromRWC(clientConn1)
+	defer c.Close()
+	c.startReadLoop()
+
+	// Subscribe so we can observe the drop signal.
+	lostSub, lostCancel := Subscribe[*ConnectionLostEvent](c, time.Time{})
+	defer lostCancel()
+
+	// Drop the first connection.
+	_ = serverConn1.Close()
+	select {
+	case <-lostSub:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("readLoop did not broadcast ConnectionLostEvent on first drop")
+	}
+
+	// Install a second connection via replaceConn and ensure readLoop wakes.
+	serverConn2, clientConn2 := net.Pipe()
+	defer serverConn2.Close()
+	c.replaceConn(clientConn2)
+
+	// Push a response from the server side and verify AwaitResponse on the
+	// client picks it up, proving the pump is reading the new rwc.
+	type outRequest struct {
+		*dap.Request
+	}
+	req := c.newRequest("threads")
+	rMsg := &dap.ThreadsRequest{Request: *req}
+	// Register manually (we won't call sendAndRegister because rwc.Write on
+	// a net.Pipe blocks until read; we just want to simulate an awaiting
+	// caller whose response arrives over the new connection).
+	ch := make(chan dap.Message, 1)
+	c.registryMu.Lock()
+	c.responses[req.Seq] = ch
+	c.registryMu.Unlock()
+
+	// Write a response on the server side targeting this seq.
+	go func() {
+		resp := &dap.ThreadsResponse{}
+		resp.Response.Type = "response"
+		resp.Response.Command = "threads"
+		resp.Response.RequestSeq = req.Seq
+		resp.Response.Success = true
+		resp.Seq = req.Seq + 100
+		_ = dap.WriteProtocolMessage(serverConn2, resp)
+		_ = rMsg // silence unused
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	defer cancel()
+	msg, err := c.AwaitResponse(ctx, req.Seq)
+	if err != nil {
+		t.Fatalf("AwaitResponse after replaceConn: %v", err)
+	}
+	if _, ok := msg.(*dap.ThreadsResponse); !ok {
+		t.Fatalf("expected *dap.ThreadsResponse after replaceConn, got %T", msg)
+	}
+}

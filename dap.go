@@ -79,6 +79,7 @@ type DAPClient struct {
 	subscribers map[reflect.Type][]*subscription  // event fan-out by event type
 	replayRing  *eventRing                         // ring buffer of last 64 events for Subscribe(since)
 	pumpDone    chan struct{}                       // closed when readLoop exits; nil until Start()
+	pumpResume  chan struct{}                       // buffered size 1; signals readLoop to resume after I/O error once replaceConn has installed a new rwc (Phase 4)
 }
 
 // newDAPClient creates a new Client over a TCP connection.
@@ -141,6 +142,7 @@ func (c *DAPClient) Start() {
 // DAP socket; callers must not invoke readMessage directly on a Started client.
 func (c *DAPClient) startReadLoop() {
 	c.pumpDone = make(chan struct{})
+	c.pumpResume = make(chan struct{}, 1)
 	go c.readLoop()
 }
 
@@ -469,8 +471,19 @@ func (c *DAPClient) replaceConn(newRWC io.ReadWriteCloser) {
 	c.rwc = newRWC
 	c.reader = bufio.NewReader(newRWC)
 	c.mu.Unlock()
-	// Drain pending response channels so AwaitResponse callers see stale error.
+	// Drain any response channels that might still be keyed to the old
+	// connection. readLoop also calls closeRegistry on I/O error in Phase 4,
+	// but this double-call is idempotent (the first call empties the map; the
+	// second finds it empty and does nothing). The duplication defends against
+	// a force-reconnect path where readLoop hasn't yet observed the drop.
 	c.closeRegistry(ErrConnectionStale)
+	// Wake readLoop if it is blocked waiting for resume after an I/O error.
+	if c.pumpResume != nil {
+		select {
+		case c.pumpResume <- struct{}{}:
+		default:
+		}
+	}
 }
 
 // reconnectLoop runs in a dedicated goroutine for the DAPClient's entire
@@ -1266,9 +1279,20 @@ func (c *DAPClient) readLoop() {
 				// Normal shutdown via Close().
 				return
 			}
-			// I/O error — mark stale so reconnectLoop can recover.
+			// I/O error — the connection is gone. Tell pending callers and
+			// subscribers so they can stop waiting, then block until
+			// replaceConn installs a new rwc (or Close cancels us).
 			c.markStale()
-			return
+			c.closeRegistry(ErrConnectionStale)
+			c.broadcastEvent(newConnectionLostEvent(err))
+			log.Printf("DAPClient.readLoop: I/O error %v — waiting for reconnect", err)
+			select {
+			case <-c.ctx.Done():
+				return
+			case <-c.pumpResume:
+				// New rwc swapped in by replaceConn; loop around and read from it.
+				continue
+			}
 		}
 
 		switch m := msg.(type) {
