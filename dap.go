@@ -86,10 +86,19 @@ type DAPClient struct {
 // backend is optional — pass a Redialer-capable backend to enable auto-reconnect,
 // or nil for non-reconnectable backends (delve, gdb).
 // Call Close to close the connection.
+//
+// TCP keepalive is enabled so silently half-open connections (k8s port-forward
+// wedged on the API server side, ingress connections idled out by a firewall)
+// are surfaced as I/O errors within ~2 minutes rather than hanging readLoop
+// forever. Same rationale as ConnectBackend.Redial.
 func newDAPClient(addr string, backend Redialer) (*DAPClient, error) {
 	conn, err := net.Dial("tcp", addr)
 	if err != nil {
 		return nil, fmt.Errorf("connecting to DAP server at %s: %w", addr, err)
+	}
+	if tcpConn, ok := conn.(*net.TCPConn); ok {
+		_ = tcpConn.SetKeepAlive(true)
+		_ = tcpConn.SetKeepAlivePeriod(30 * time.Second)
 	}
 	return newDAPClientInternal(conn, addr, backend), nil
 }
@@ -287,6 +296,19 @@ func (c *DAPClient) rawSend(request dap.Message) error {
 	return dap.WriteProtocolMessage(c.rwc, request)
 }
 
+// traceRequest emits a trace-level log entry when a request is about to be
+// written to the socket. No-op unless MCP_LOG_LEVEL=trace.
+func traceRequest(request dap.Message, seq int) {
+	if currentLogLevel < LogTrace {
+		return
+	}
+	cmd := ""
+	if r, ok := request.(interface{ GetRequest() *dap.Request }); ok && r.GetRequest() != nil {
+		cmd = r.GetRequest().Command
+	}
+	log.Printf("dap send: %s seq=%d", cmd, seq)
+}
+
 // sendAndRegister registers a response channel for seq in the pump registry,
 // then writes msg to the socket via rawSend. Performs stale check before
 // sending. On write failure, cleans up the registry entry and marks stale.
@@ -301,6 +323,7 @@ func (c *DAPClient) sendAndRegister(seq int, request dap.Message) error {
 		return ErrConnectionStale
 	}
 	newlyRegistered := c.registerResponseIfAbsent(seq)
+	traceRequest(request, seq)
 	if err := c.rawSend(request); err != nil {
 		if newlyRegistered {
 			c.unregisterResponse(seq)
@@ -316,6 +339,7 @@ func (c *DAPClient) sendAndRegister(seq int, request dap.Message) error {
 // which runs while stale=true per the reconnect ordering invariant (ADR-14).
 func (c *DAPClient) sendAndRegisterRaw(seq int, request dap.Message) error {
 	newlyRegistered := c.registerResponseIfAbsent(seq)
+	traceRequest(request, seq)
 	if err := c.rawSend(request); err != nil {
 		if newlyRegistered {
 			c.unregisterResponse(seq)
@@ -1297,8 +1321,15 @@ func (c *DAPClient) readLoop() {
 
 		switch m := msg.(type) {
 		case dap.ResponseMessage:
+			if currentLogLevel >= LogTrace {
+				r := m.GetResponse()
+				log.Printf("dap recv: %T seq=%d request_seq=%d success=%v", m, r.Seq, r.RequestSeq, r.Success)
+			}
 			c.dispatchResponse(m)
 		case dap.EventMessage:
+			if currentLogLevel >= LogTrace {
+				log.Printf("dap recv: %T event=%s", m, m.GetEvent().Event)
+			}
 			c.dispatchEvent(m)
 		default:
 			log.Printf("DAPClient.readLoop: unexpected message type %T", msg)

@@ -57,16 +57,26 @@ func (b *ConnectBackend) AttachArgs(processID int) (map[string]any, error) {
 
 // Redial performs a fresh net.Dial on the stored Addr, used by
 // DAPClient.reconnectLoop after a TCP drop. Caller provides ctx for
-// cancellation/timeout.
+// cancellation/timeout. Enables TCP keepalive on the resulting connection
+// so a silently half-open socket (e.g. kubectl port-forward wedged on the
+// API server side) is detected by the kernel within ~30s–~2min instead of
+// hanging ReadMessage indefinitely.
 func (b *ConnectBackend) Redial(ctx context.Context) (io.ReadWriteCloser, error) {
 	timeout := b.DialTimeout
 	if timeout == 0 {
 		timeout = 5 * time.Second
 	}
-	d := net.Dialer{Timeout: timeout}
+	d := net.Dialer{Timeout: timeout, KeepAlive: 30 * time.Second}
 	conn, err := d.DialContext(ctx, "tcp", b.Addr)
 	if err != nil {
 		return nil, fmt.Errorf("ConnectBackend.Redial: %w", err)
+	}
+	// Belt-and-suspenders: Dialer.KeepAlive may be applied lazily, so set it
+	// explicitly as well. Failures are intentionally non-fatal — keepalive is
+	// an optimisation, not a correctness requirement.
+	if tcpConn, ok := conn.(*net.TCPConn); ok {
+		_ = tcpConn.SetKeepAlive(true)
+		_ = tcpConn.SetKeepAlivePeriod(30 * time.Second)
 	}
 	return conn, nil
 }
