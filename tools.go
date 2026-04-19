@@ -90,6 +90,7 @@ func (ds *debuggerSession) sessionToolNames() []string {
 		"breakpoint",
 		"clear-breakpoints",
 		"continue",
+		"wait-for-stop",
 		"step",
 		"pause",
 		"context",
@@ -136,15 +137,32 @@ Examples: {"file": "/path/to/main.go"} or {"all": true}`,
 	}, ds.clearBreakpoints)
 	mcp.AddTool(ds.server, &mcp.Tool{
 		Name: "continue",
-		Description: `Continue program execution until the next breakpoint or termination. Returns full context (location, stack trace, variables) when stopped.
+		Description: `Start or resume program execution. Returns IMMEDIATELY after the debugger acknowledges the continue request — does NOT wait for the program to hit a breakpoint or terminate.
+
+Returns: {"status":"running","threadId":N}
+
+To receive the stop event (breakpoint hit, program finished, pause), follow with 'wait-for-stop'. For long waits, consider dispatching 'wait-for-stop' to a subagent so your main agent can trigger the program (HTTP request, browser navigation, etc.) in parallel.
 
 Optionally specify 'to' for run-to-cursor: {"to": {"file": "/path/main.go", "line": 50}} or {"to": {"function": "main.Run"}}`,
 	}, ds.continueExecution)
 	mcp.AddTool(ds.server, &mcp.Tool{
+		Name: "wait-for-stop",
+		Description: `Wait for the program to stop (hit a breakpoint, terminate, or be paused). Returns full debugging context (location + stack trace + variables) when stopped.
+
+Call this AFTER 'continue' or after you have triggered the action that should hit a breakpoint.
+
+Parameters (all optional):
+- timeoutSec: max seconds to wait (default 30, max 300). On timeout, returns {"status":"still_running","elapsedSec":N} without side effects; calling wait-for-stop again continues waiting from the current moment.
+- pauseIfTimeout: if true, on timeout sends a pause request to the debuggee and returns the full context with reason="pause". Useful when a breakpoint was expected but not reached.
+- threadId: thread to watch (default: current stopped thread).`,
+	}, ds.waitForStop)
+	mcp.AddTool(ds.server, &mcp.Tool{
 		Name: "step",
 		Description: `Step through code one line at a time. Returns full context (location, stack trace, variables) at the new location.
 
-Modes: 'over' (execute current line, step over function calls), 'in' (step into function calls), 'out' (run until current function returns).`,
+Modes: 'over' (execute current line, step over function calls), 'in' (step into function calls), 'out' (run until current function returns).
+
+Optional 'timeoutSec' (default 30s) guards against steps that never complete (e.g. step into a blocking I/O call). On timeout returns an error; call 'pause' or 'wait-for-stop' to recover.`,
 	}, ds.step)
 	mcp.AddTool(ds.server, &mcp.Tool{
 		Name:        "pause",
@@ -259,8 +277,16 @@ type ContextParams struct {
 
 // StepParams defines the parameters for stepping through code.
 type StepParams struct {
-	Mode     string  `json:"mode" mcp:"'over' (next line), 'in' (into function), 'out' (out of function)"`
-	ThreadID FlexInt `json:"threadId,omitempty" mcp:"thread to step (default: current thread)"`
+	Mode       string  `json:"mode" mcp:"'over' (next line), 'in' (into function), 'out' (out of function)"`
+	ThreadID   FlexInt `json:"threadId,omitempty" mcp:"thread to step (default: current thread)"`
+	TimeoutSec FlexInt `json:"timeoutSec,omitempty" mcp:"maximum seconds to wait for stop after the step (default 30)"`
+}
+
+// WaitForStopParams defines the parameters for the wait-for-stop tool.
+type WaitForStopParams struct {
+	TimeoutSec     FlexInt `json:"timeoutSec,omitempty" mcp:"max seconds to wait (default 30, max 300)"`
+	PauseIfTimeout bool    `json:"pauseIfTimeout,omitempty" mcp:"on timeout send a pause request and return the resulting context"`
+	ThreadID       FlexInt `json:"threadId,omitempty" mcp:"thread to watch when pauseIfTimeout is true (default: current stopped thread)"`
 }
 
 // InfoParams defines parameters for getting program metadata.
@@ -466,11 +492,17 @@ type ContinueParams struct {
 	To       *BreakpointSpec `json:"to,omitempty" mcp:"location to run to (sets temporary breakpoint)"`
 }
 
-// continueExecution continues execution and returns full context when stopped.
+// continueExecution starts or resumes program execution and returns IMMEDIATELY
+// after the debugger acknowledges the ContinueRequest. It does NOT wait for the
+// program to hit a breakpoint or terminate — callers must invoke wait-for-stop
+// to block until a stop event.
+//
+// This is a BREAKING change relative to the pre-0.2.0 contract, where continue
+// blocked until StoppedEvent/TerminatedEvent. See ADR-PUMP-6 and CHANGELOG.md.
 func (ds *debuggerSession) continueExecution(ctx context.Context, _ *mcp.ServerSession, params *mcp.CallToolParamsFor[ContinueParams]) (*mcp.CallToolResultFor[any], error) {
 	ds.mu.Lock()
-	defer ds.mu.Unlock()
 	if ds.client == nil {
+		ds.mu.Unlock()
 		return nil, fmt.Errorf("debugger not started")
 	}
 
@@ -486,10 +518,12 @@ func (ds *debuggerSession) continueExecution(ctx context.Context, _ *mcp.ServerS
 			toSeq, err = ds.client.SetBreakpointsRequest(to.File, []int{to.Line})
 		}
 		if err != nil {
+			ds.mu.Unlock()
 			return nil, err
 		}
 		if toSeq != 0 {
 			if err := awaitResponseValidate(ctx, ds.client, toSeq, "unable to set run-to-cursor breakpoint"); err != nil {
+				ds.mu.Unlock()
 				return nil, err
 			}
 		}
@@ -500,30 +534,115 @@ func (ds *debuggerSession) continueExecution(ctx context.Context, _ *mcp.ServerS
 		threadID = ds.defaultThreadID()
 	}
 
-	// Capture since BEFORE sending so the pump's replay ring covers any
-	// stopped/terminated event that arrives between send and Subscribe.
-	since := time.Now()
 	continueSeq, err := ds.client.ContinueRequest(threadID)
 	if err != nil {
+		ds.mu.Unlock()
 		return nil, err
 	}
 	if err := awaitResponseValidate(ctx, ds.client, continueSeq, "continue failed"); err != nil {
+		ds.mu.Unlock()
 		return nil, err
+	}
+	// Release ds.mu BEFORE returning: the program is now running, and other
+	// tools (pause, wait-for-stop) must be able to acquire ds.mu in parallel
+	// without waiting for a stop event.
+	ds.mu.Unlock()
+
+	return &mcp.CallToolResultFor[any]{
+		Content: []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf(`{"status":"running","threadId":%d}`, threadID)}},
+	}, nil
+}
+
+// waitForStop waits for a StoppedEvent or TerminatedEvent from the debugger,
+// up to timeoutSec. On timeout returns {"status":"still_running"} unless
+// pauseIfTimeout is true, in which case a PauseRequest is sent and the full
+// context at the resulting pause-stop is returned.
+//
+// Introduced in v0.2.0 as the companion to the non-blocking continue. Replaces
+// the pre-0.2.0 semantics where continue itself blocked until stop.
+func (ds *debuggerSession) waitForStop(ctx context.Context, _ *mcp.ServerSession, params *mcp.CallToolParamsFor[WaitForStopParams]) (*mcp.CallToolResultFor[any], error) {
+	ds.mu.Lock()
+	client := ds.client
+	ds.mu.Unlock()
+	if client == nil {
+		return nil, fmt.Errorf("debugger not started")
 	}
 
-	// Phase 2 preserves blocking semantics: wait for stop or termination via
-	// event subscriptions. Phase 3 will split this into a separate wait-for-stop tool.
-	stopped, terminated, err := awaitStopOrTerminate(ctx, ds.client, since)
-	if err != nil {
-		return nil, err
+	timeout := params.Arguments.TimeoutSec.Int()
+	if timeout <= 0 {
+		timeout = 30
 	}
-	if terminated != nil {
+	if timeout > 300 {
+		timeout = 300
+	}
+
+	since := time.Now()
+	waitCtx, cancel := context.WithTimeout(ctx, time.Duration(timeout)*time.Second)
+	defer cancel()
+
+	stopped, terminated, err := awaitStopOrTerminate(waitCtx, client, since)
+	switch {
+	case err == nil && stopped != nil:
+		ds.mu.Lock()
+		ds.stoppedThreadID = stopped.Body.ThreadId
+		result, gerr := ds.getFullContext(ctx, stopped.Body.ThreadId, 0, 20)
+		ds.mu.Unlock()
+		return result, gerr
+	case err == nil && terminated != nil:
 		return &mcp.CallToolResultFor[any]{
 			Content: []mcp.Content{&mcp.TextContent{Text: "Program terminated"}},
 		}, nil
+	case errors.Is(err, context.DeadlineExceeded):
+		if !params.Arguments.PauseIfTimeout {
+			return &mcp.CallToolResultFor[any]{
+				Content: []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf(`{"status":"still_running","elapsedSec":%d}`, timeout)}},
+			}, nil
+		}
+		// Send a pause and wait (bounded) for the resulting stopped-event.
+		return ds.pauseAndCaptureContext(ctx, params.Arguments.ThreadID.Int())
+	default:
+		// Includes ctx.Err() from the caller's own deadline and any other error.
+		return nil, err
 	}
+}
+
+// pauseAndCaptureContext sends a PauseRequest on the given thread (or the
+// default one if 0), waits briefly for the resulting StoppedEvent, and returns
+// the full context captured at that stop.
+func (ds *debuggerSession) pauseAndCaptureContext(ctx context.Context, threadID int) (*mcp.CallToolResultFor[any], error) {
+	ds.mu.Lock()
+	if ds.client == nil {
+		ds.mu.Unlock()
+		return nil, fmt.Errorf("debugger not started")
+	}
+	if threadID == 0 {
+		threadID = ds.defaultThreadID()
+	}
+	since := time.Now()
+	pauseSeq, err := ds.client.PauseRequest(threadID)
+	if err != nil {
+		ds.mu.Unlock()
+		return nil, err
+	}
+	if err := awaitResponseValidate(ctx, ds.client, pauseSeq, "unable to pause"); err != nil {
+		ds.mu.Unlock()
+		return nil, err
+	}
+	ds.mu.Unlock()
+
+	// Bounded wait for the StoppedEvent produced by the pause.
+	waitCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	stopped, _, err := awaitStopOrTerminate(waitCtx, ds.client, since)
+	if err != nil {
+		return nil, fmt.Errorf("pause succeeded but no StoppedEvent within 10s: %w", err)
+	}
+
+	ds.mu.Lock()
 	ds.stoppedThreadID = stopped.Body.ThreadId
-	return ds.getFullContext(ctx, stopped.Body.ThreadId, 0, 20)
+	result, gerr := ds.getFullContext(ctx, stopped.Body.ThreadId, 0, 20)
+	ds.mu.Unlock()
+	return result, gerr
 }
 
 // PauseParams defines the parameters for pausing execution.
@@ -1249,9 +1368,19 @@ func (ds *debuggerSession) step(ctx context.Context, _ *mcp.ServerSession, param
 		return nil, err
 	}
 
+	timeout := params.Arguments.TimeoutSec.Int()
+	if timeout <= 0 {
+		timeout = 30
+	}
+	stepCtx, cancel := context.WithTimeout(ctx, time.Duration(timeout)*time.Second)
+	defer cancel()
+
 	// Wait for stopped or terminated event via pump subscriptions.
-	stopped, terminated, err := awaitStopOrTerminate(ctx, ds.client, since)
+	stopped, terminated, err := awaitStopOrTerminate(stepCtx, ds.client, since)
 	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) {
+			return nil, fmt.Errorf("step timed out after %ds; call 'pause' or 'wait-for-stop' to recover", timeout)
+		}
 		return nil, err
 	}
 	if terminated != nil {
