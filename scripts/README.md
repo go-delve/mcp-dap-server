@@ -26,6 +26,7 @@ See the `examples/.mcp.json` template for a copy-pasteable configuration.
 | `DLV_RELEASE` | no | `$DLV_NAMESPACE` | Helm release name (for building service DNS `{release}-{service}`) |
 | `DLV_RECONNECT_INTERVAL` | no | `2` | Seconds between port-forward retries |
 | `DLV_READY_TIMEOUT` | no | `15` | Max seconds to wait for localhost port to open on startup |
+| `MCP_DAP_SERVER_BIN` | no | `mcp-dap-server` | Name of the MCP server binary in `$PATH`. Override when using `go install` (which produces `mcp-dap-server-k8s-forward`) without a symlink. |
 
 ### Troubleshooting
 

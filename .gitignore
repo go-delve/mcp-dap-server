@@ -2,5 +2,6 @@ bin/
 .worktrees/
 .serena/
 mcp-dap-server
+mcp-dap-server-k8s-forward
 dist/
 .claude/

@@ -42,10 +42,29 @@ spawning, 13 MCP tools, 4 prompts):
 
 ### Setup
 
-1. Install the binary:
+1. Install the binary — two options:
+
+   **Option A — release binary** (recommended; installed as
+   `mcp-dap-server`):
+
+   ```bash
+   # Download from https://github.com/vajrock/mcp-dap-server-k8s-forward/releases
+   # …or via goreleaser artifacts. Binary name is `mcp-dap-server`.
+   ```
+
+   **Option B — `go install` from source** (installed as
+   `mcp-dap-server-k8s-forward`, which matches the Go module basename):
 
    ```bash
    go install github.com/vajrock/mcp-dap-server-k8s-forward@latest
+   ```
+
+   With Option B, either pass `MCP_DAP_SERVER_BIN=mcp-dap-server-k8s-forward`
+   in `.mcp.json` env, or create a short alias symlink:
+
+   ```bash
+   ln -sf "$(go env GOPATH)/bin/mcp-dap-server-k8s-forward" \
+          "$(go env GOPATH)/bin/mcp-dap-server"
    ```
 
 2. Copy the wrapper to a stable path:
@@ -518,10 +537,30 @@ MCP-сервер, связывающий Claude Code (и другие MCP-кли
 
 ### Установка
 
-1. Установите бинарник:
+1. Установите бинарник — два варианта:
+
+   **Вариант A — release-бинарник** (рекомендуется; ставится под
+   именем `mcp-dap-server`):
+
+   ```bash
+   # Скачать с https://github.com/vajrock/mcp-dap-server-k8s-forward/releases
+   # или через goreleaser-артефакты. Имя бинарника — `mcp-dap-server`.
+   ```
+
+   **Вариант B — `go install` из исходников** (ставится под именем
+   `mcp-dap-server-k8s-forward`, совпадает с basename Go-модуля):
 
    ```bash
    go install github.com/vajrock/mcp-dap-server-k8s-forward@latest
+   ```
+
+   С вариантом B — либо передайте в `.mcp.json` env
+   `MCP_DAP_SERVER_BIN=mcp-dap-server-k8s-forward`, либо сделайте
+   symlink с коротким именем:
+
+   ```bash
+   ln -sf "$(go env GOPATH)/bin/mcp-dap-server-k8s-forward" \
+          "$(go env GOPATH)/bin/mcp-dap-server"
    ```
 
 2. Скопируйте wrapper в стабильное место:
