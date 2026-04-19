@@ -95,6 +95,7 @@ func (ds *debuggerSession) sessionToolNames() []string {
 		"context",
 		"evaluate",
 		"info",
+		"reconnect",
 	}
 
 	// Capability-gated tools
@@ -179,6 +180,18 @@ For GDB commands (e.g. print/x), use context 'repl': {"expression": "print/x var
 		Name:        "info",
 		Description: infoDesc,
 	}, ds.info)
+	mcp.AddTool(ds.server, &mcp.Tool{
+		Name: "reconnect",
+		Description: `Force a reconnect cycle to the DAP server, or wait for an in-progress reconnect to finish.
+
+Use when:
+- You see "connection stale" errors from other tools → call reconnect() to wait for recovery
+- The DAP session appears hung → call reconnect(force=true) to force a new connection attempt
+
+Parameters are all optional. Default: wait up to 30 seconds for healthy state.
+
+For local (Spawn) debug sessions, reconnect is generally not applicable — if the dlv/gdb subprocess died, call 'stop' and start a new 'debug' session.`,
+	}, ds.reconnect)
 
 	// Capability-gated tools
 	if ds.capabilities.SupportsRestartRequest {
@@ -260,6 +273,12 @@ type BreakpointToolParams struct {
 	File     string  `json:"file,omitempty" mcp:"source file path (required if no function)"`
 	Line     FlexInt `json:"line,omitempty" mcp:"line number (required if file provided)"`
 	Function string  `json:"function,omitempty" mcp:"function name (alternative to file+line)"`
+}
+
+// ReconnectParams is the input for the `reconnect` MCP tool.
+type ReconnectParams struct {
+	Force          bool    `json:"force,omitempty" mcp:"if true, unconditionally mark connection as stale and trigger redial, even if currently healthy"`
+	WaitTimeoutSec FlexInt `json:"wait_timeout_sec,omitempty" mcp:"maximum seconds to wait for healthy state (default 30, max 300)"`
 }
 
 // readAndValidateResponse reads DAP messages until it receives the response
@@ -1517,4 +1536,92 @@ reinitInitialized:
 	log.Printf("reinitialize: completed (%d source breakpoints, %d function breakpoints re-applied)",
 		applied, len(ds.functionBreakpoints))
 	return nil
+}
+
+// reconnect is the handler for the `reconnect` MCP tool.
+// Semantics — see docs/design-feature/.../05-mcp-tool-api.md.
+func (ds *debuggerSession) reconnect(ctx context.Context, _ *mcp.ServerSession, params *mcp.CallToolParamsFor[ReconnectParams]) (*mcp.CallToolResultFor[any], error) {
+	ds.mu.Lock()
+	// NOTE: we DO NOT defer Unlock here — the polling loop below needs to
+	// release mu so that reconnectLoop (which calls reinitialize under mu)
+	// can make progress. We re-lock on exit paths explicitly.
+	client := ds.client
+	backend := ds.backend
+	ds.mu.Unlock()
+
+	if client == nil {
+		return nil, fmt.Errorf("debugger not started")
+	}
+
+	// Step 1: validate backend capability when caller explicitly asked for force redial.
+	_, supportsRedial := backend.(Redialer)
+	if params.Arguments.Force && !supportsRedial {
+		return nil, fmt.Errorf("reconnect: backend does not support redial (current backend is SpawnBackend; reconnect is only meaningful for ConnectBackend sessions)")
+	}
+
+	if params.Arguments.Force {
+		client.markStale()
+	}
+
+	// Step 2: if healthy, no-op (generic-safe for any backend).
+	if !client.stale.Load() {
+		return &mcp.CallToolResultFor[any]{
+			Content: []mcp.Content{&mcp.TextContent{Text: `{"status":"healthy"}`}},
+		}, nil
+	}
+
+	// Step 3: stale but backend can't redial — there's no reconnectLoop making progress.
+	if !supportsRedial {
+		return nil, fmt.Errorf("reconnect: connection stale but backend does not support redial; call 'stop' and start a new debug session")
+	}
+
+	// Step 4: observability snapshot.
+	attemptsBefore := client.reconnectAttempts.Load()
+	alreadyReconnecting := attemptsBefore > 0
+
+	// Step 5: poll stale flag with 100ms interval, up to wait_timeout_sec.
+	timeout := params.Arguments.WaitTimeoutSec.Int()
+	if timeout <= 0 {
+		timeout = 30
+	}
+	if timeout > 300 {
+		timeout = 300
+	}
+	deadline := time.Now().Add(time.Duration(timeout) * time.Second)
+	pollInterval := 100 * time.Millisecond
+	start := time.Now()
+
+	for client.stale.Load() && time.Now().Before(deadline) {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(pollInterval):
+		}
+	}
+
+	elapsed := time.Since(start)
+
+	// Step 6: return status with observability fields.
+	if client.stale.Load() {
+		lastErrRaw := client.lastReconnectError.Load()
+		lastErr := ""
+		if s, ok := lastErrRaw.(string); ok {
+			lastErr = s
+		}
+		attempts := client.reconnectAttempts.Load()
+		body := fmt.Sprintf(`{"status":"still_reconnecting","elapsed_sec":%d,"attempts":%d,"last_error":%q,"already_reconnecting":%t}`,
+			int(elapsed.Seconds()), attempts, lastErr, alreadyReconnecting)
+		return &mcp.CallToolResultFor[any]{
+			Content: []mcp.Content{&mcp.TextContent{Text: body}},
+		}, nil
+	}
+
+	// Success: healthy after wait.
+	attemptsNow := client.reconnectAttempts.Load()
+	attemptsBeforeSuccess := attemptsNow - attemptsBefore
+	body := fmt.Sprintf(`{"status":"healthy","recovered_in_sec":%d,"attempts_before_success":%d}`,
+		int(elapsed.Seconds()), attemptsBeforeSuccess)
+	return &mcp.CallToolResultFor[any]{
+		Content: []mcp.Content{&mcp.TextContent{Text: body}},
+	}, nil
 }
