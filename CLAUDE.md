@@ -268,3 +268,51 @@ features — read these when touching the corresponding subsystem:
 - `2026-03-02-gdb-support-*` — native GDB DAP backend (`gdb -i dap`) design notes
 
 Additional skill/spec material lives under `docs/superpowers/`.
+
+## Kubernetes Remote Debugging (fork-added)
+
+This fork extends upstream with remote-debugging capabilities for Go
+services running in Kubernetes pods.
+
+### Architecture overview
+
+- `ConnectBackend` (`connect_backend.go`) — implements `DebuggerBackend`
+  plus the optional `Redialer` (`redialer.go`). Connects via TCP to a
+  `dlv --headless --accept-multiclient` server.
+- `DAPClient` (`dap.go`) — extended with a mutex, a stale flag, and a
+  `reconnectLoop` goroutine. I/O errors mark the connection stale; the
+  loop calls `backend.Redial` with exponential backoff.
+- `debuggerSession` (`tools.go`) — extended with `breakpoints` and
+  `functionBreakpoints` fields and a `reinitialize(ctx)` method for
+  re-applying state after reconnect.
+- `reconnect` MCP tool — session-level; exposes manual reconnect/wait
+  with observability (attempts count, last error).
+
+### Key design decisions
+
+- Binary name unchanged (`mcp-dap-server`); the feature is enabled via
+  the `--connect <addr>` CLI flag or the `DAP_CONNECT_ADDR` env var.
+- `Redialer` is a **separate optional interface** (NOT added to
+  `DebuggerBackend`) to keep the upstream interface unchanged —
+  important for upstream PR acceptance.
+- Lock ordering: always `ds.mu` → `DAPClient.mu`. `reinitialize` holds
+  `ds.mu` for the entire DAP handshake (see ADR-13).
+- DAP `SetBreakpointsRequest` replaces all breakpoints for a file, so
+  our session state tracks the full list to re-apply after reconnect.
+
+### Workflow for adding/changing remote-debug code
+
+- Design docs: `docs/design-feature/mcp-delve-extension-for-k8s/`
+- Original baseline: `docs/mcp-dap-remote-design.md`
+- Research (upstream code analysis):
+  `docs/research/2026-04-18-mcp-dap-remote-current-state.md`
+
+When modifying `connect_backend.go`, the `dap.go` reconnect machinery,
+or `tools.go` session state — **always run**:
+
+```bash
+go test -v -race ./...
+```
+
+The race detector catches our lock-ordering invariants (ADR-13). Flaky
+races here are NOT acceptable.
