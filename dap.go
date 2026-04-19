@@ -40,10 +40,11 @@ const eventBufSize = 64
 // sequence number of the sent request, which callers use to match
 // the corresponding response via request_seq.
 //
-// Phase 1 adds an event pump: readLoop runs as a background goroutine,
-// routing incoming messages to the response registry (SendRequest/AwaitResponse)
-// and the event bus (Subscribe). The existing ReadMessage/send/rawSend paths
-// remain unchanged for backward compatibility during migration.
+// The event pump (added in Phase 1, migrated in Phase 2) runs readLoop as a
+// background goroutine that is the sole reader of the DAP connection. It
+// routes responses to the registry (AwaitResponse) and events to the bus
+// (Subscribe). All *Request / *RequestRaw methods register their response
+// channel via sendAndRegister / sendAndRegisterRaw before writing to the socket.
 type DAPClient struct {
 	// connection state — guarded by mu
 	mu     sync.Mutex
@@ -131,15 +132,13 @@ func newDAPClientInternal(rwc io.ReadWriteCloser, addr string, backend Redialer)
 // SendRequest/AwaitResponse/Subscribe API. For Phase 1, use startReadLoop
 // explicitly in pump-only code paths.
 func (c *DAPClient) Start() {
+	c.startReadLoop()
 	go c.reconnectLoop()
 }
 
 // startReadLoop initialises pumpDone and launches the readLoop goroutine.
-// Must only be called on clients that will NOT concurrently call ReadMessage —
-// readLoop and ReadMessage both read from the same connection and are mutually
-// exclusive. In Phase 1, this is called by pump unit tests only; tools.go
-// migrates to the pump API in Phase 2 at which point Start() will call this
-// directly.
+// Called from Start(). After Phase 2, readLoop is the single reader of the
+// DAP socket; callers must not invoke readMessage directly on a Started client.
 func (c *DAPClient) startReadLoop() {
 	c.pumpDone = make(chan struct{})
 	go c.readLoop()
@@ -164,7 +163,9 @@ func (c *DAPClient) Close() {
 }
 
 // InitializeRequest sends an 'initialize' request and returns the server's capabilities.
-func (c *DAPClient) InitializeRequest(adapterID string) (dap.Capabilities, error) {
+// Uses the pump: response is awaited via AwaitResponse. Events that arrive before
+// the response (e.g. OutputEvent) are routed to the event bus and do not interfere.
+func (c *DAPClient) InitializeRequest(ctx context.Context, adapterID string) (dap.Capabilities, error) {
 	req := c.newRequest("initialize")
 	request := &dap.InitializeRequest{Request: *req}
 	request.Arguments = dap.InitializeRequestArguments{
@@ -177,32 +178,35 @@ func (c *DAPClient) InitializeRequest(adapterID string) (dap.Capabilities, error
 		SupportsRunInTerminalRequest: false,
 		Locale:                       "en-us",
 	}
-	if err := c.send(request); err != nil {
+	if err := c.sendAndRegister(req.Seq, request); err != nil {
 		return dap.Capabilities{}, err
 	}
-	for {
-		msg, err := c.ReadMessage()
-		if err != nil {
-			return dap.Capabilities{}, err
+	msg, err := c.AwaitResponse(ctx, req.Seq)
+	if err != nil {
+		return dap.Capabilities{}, err
+	}
+	switch resp := msg.(type) {
+	case *dap.InitializeResponse:
+		if !resp.Success {
+			return dap.Capabilities{}, fmt.Errorf("initialize failed: %s", resp.Message)
 		}
-		switch resp := msg.(type) {
-		case *dap.InitializeResponse:
-			if !resp.Success {
-				return dap.Capabilities{}, fmt.Errorf("initialize failed: %s", resp.Message)
-			}
-			return resp.Body, nil
-		case dap.EventMessage:
-			// Skip events (e.g. OutputEvent) during initialization and keep reading
-			continue
-		default:
-			return dap.Capabilities{}, fmt.Errorf("expected InitializeResponse, got %T", msg)
+		return resp.Body, nil
+	case dap.ResponseMessage:
+		r := resp.GetResponse()
+		if !r.Success {
+			return dap.Capabilities{}, fmt.Errorf("initialize failed: %s", r.Message)
 		}
+		return dap.Capabilities{}, fmt.Errorf("expected InitializeResponse, got %T", msg)
+	default:
+		return dap.Capabilities{}, fmt.Errorf("expected InitializeResponse, got %T", msg)
 	}
 }
 
-// ReadMessage reads the next DAP message from the current connection.
+// readMessage reads the next DAP message from the current connection.
 // On I/O error, marks the client as stale so the reconnect loop can pick up.
-func (c *DAPClient) ReadMessage() (dap.Message, error) {
+// After Phase 2, only readLoop calls this method; tools.go and handlers use
+// the SendRequest/AwaitResponse/Subscribe API instead.
+func (c *DAPClient) readMessage() (dap.Message, error) {
 	c.mu.Lock()
 	reader := c.reader
 	c.mu.Unlock()
@@ -230,7 +234,7 @@ func (c *DAPClient) LaunchRequest(mode, program string, stopOnEntry bool, args [
 		launchArgs["args"] = args
 	}
 	request.Arguments = toRawMessage(launchArgs)
-	return req.Seq, c.send(request)
+	return req.Seq, c.sendAndRegister(req.Seq, request)
 }
 
 // CoreRequest sends a 'launch' request in core dump mode.
@@ -243,7 +247,7 @@ func (c *DAPClient) CoreRequest(program, coreFilePath string) (int, error) {
 		"program":      program,
 		"coreFilePath": coreFilePath,
 	})
-	return req.Seq, c.send(request)
+	return req.Seq, c.sendAndRegister(req.Seq, request)
 }
 
 // newRequest creates a new DAP request with an auto-incremented sequence number.
@@ -281,6 +285,65 @@ func (c *DAPClient) rawSend(request dap.Message) error {
 	return dap.WriteProtocolMessage(c.rwc, request)
 }
 
+// sendAndRegister registers a response channel for seq in the pump registry,
+// then writes msg to the socket via rawSend. Performs stale check before
+// sending. On write failure, cleans up the registry entry and marks stale.
+// Used by all standard (non-Raw) *Request methods. Callers use AwaitResponse
+// with the returned seq to retrieve the response.
+//
+// Idempotent re-registration is supported: if a channel is already registered
+// for seq (e.g. by SendRequest), the existing one is reused rather than
+// overwritten, so writes initiated by SendRequest stay compatible.
+func (c *DAPClient) sendAndRegister(seq int, request dap.Message) error {
+	if c.stale.Load() {
+		return ErrConnectionStale
+	}
+	newlyRegistered := c.registerResponseIfAbsent(seq)
+	if err := c.rawSend(request); err != nil {
+		if newlyRegistered {
+			c.unregisterResponse(seq)
+		}
+		c.markStale()
+		return err
+	}
+	return nil
+}
+
+// sendAndRegisterRaw is the raw variant of sendAndRegister: no stale check,
+// no markStale on error. Used by *RequestRaw methods inside reinitialize,
+// which runs while stale=true per the reconnect ordering invariant (ADR-14).
+func (c *DAPClient) sendAndRegisterRaw(seq int, request dap.Message) error {
+	newlyRegistered := c.registerResponseIfAbsent(seq)
+	if err := c.rawSend(request); err != nil {
+		if newlyRegistered {
+			c.unregisterResponse(seq)
+		}
+		return err
+	}
+	return nil
+}
+
+// registerResponseIfAbsent allocates a response channel for seq unless one is
+// already present. Returns true if a new channel was created (so the caller
+// can clean it up on error).
+func (c *DAPClient) registerResponseIfAbsent(seq int) bool {
+	c.registryMu.Lock()
+	defer c.registryMu.Unlock()
+	if _, exists := c.responses[seq]; exists {
+		return false
+	}
+	c.responses[seq] = make(chan dap.Message, 1)
+	return true
+}
+
+// unregisterResponse removes a seq's response channel from the registry.
+// Used for cleanup on send failure.
+func (c *DAPClient) unregisterResponse(seq int) {
+	c.registryMu.Lock()
+	defer c.registryMu.Unlock()
+	delete(c.responses, seq)
+}
+
 func toRawMessage(in any) json.RawMessage {
 	out, _ := json.Marshal(in)
 	return out
@@ -288,8 +351,10 @@ func toRawMessage(in any) json.RawMessage {
 
 // InitializeRequestRaw sends an 'initialize' request via rawSend (bypassing
 // stale check). Used by reinitialize, which runs while stale=true per the
-// Phase 3 ordering invariant (see ADR-14).
-func (c *DAPClient) InitializeRequestRaw(adapterID string) (dap.Capabilities, error) {
+// reconnect ordering invariant (see ADR-14). Response matching uses the pump
+// registry, so out-of-order events are routed to the event bus and the
+// response is returned directly.
+func (c *DAPClient) InitializeRequestRaw(ctx context.Context, adapterID string) (dap.Capabilities, error) {
 	req := c.newRequest("initialize")
 	request := &dap.InitializeRequest{Request: *req}
 	request.Arguments = dap.InitializeRequestArguments{
@@ -302,44 +367,27 @@ func (c *DAPClient) InitializeRequestRaw(adapterID string) (dap.Capabilities, er
 		SupportsRunInTerminalRequest: false,
 		Locale:                       "en-us",
 	}
-	if err := c.rawSend(request); err != nil {
+	if err := c.sendAndRegisterRaw(req.Seq, request); err != nil {
 		return dap.Capabilities{}, err
 	}
-	for {
-		msg, err := c.ReadMessage()
-		if err != nil {
-			return dap.Capabilities{}, err
+	msg, err := c.AwaitResponse(ctx, req.Seq)
+	if err != nil {
+		return dap.Capabilities{}, err
+	}
+	switch resp := msg.(type) {
+	case *dap.InitializeResponse:
+		if !resp.Success {
+			return dap.Capabilities{}, fmt.Errorf("initialize failed: %s", resp.Message)
 		}
-		switch resp := msg.(type) {
-		case *dap.InitializeResponse:
-			if resp.RequestSeq != req.Seq {
-				log.Printf("InitializeRequestRaw: skipping out-of-order InitializeResponse (request_seq=%d, waiting for %d)",
-					resp.RequestSeq, req.Seq)
-				continue
-			}
-			if !resp.Success {
-				return dap.Capabilities{}, fmt.Errorf("initialize failed: %s", resp.Message)
-			}
-			return resp.Body, nil
-		case dap.ResponseMessage:
-			// go-dap decodes failed responses as *dap.ErrorResponse regardless of
-			// command; match by request_seq before acting on the result so that any
-			// late response from a pre-reconnect request is skipped (Issue 3).
-			r := resp.GetResponse()
-			if r.RequestSeq != req.Seq {
-				log.Printf("InitializeRequestRaw: skipping out-of-order %T (request_seq=%d, waiting for %d)",
-					resp, r.RequestSeq, req.Seq)
-				continue
-			}
-			if !r.Success {
-				return dap.Capabilities{}, fmt.Errorf("initialize failed: %s", r.Message)
-			}
-			return dap.Capabilities{}, fmt.Errorf("expected InitializeResponse, got %T", msg)
-		case dap.EventMessage:
-			continue
-		default:
-			return dap.Capabilities{}, fmt.Errorf("expected InitializeResponse, got %T", msg)
+		return resp.Body, nil
+	case dap.ResponseMessage:
+		r := resp.GetResponse()
+		if !r.Success {
+			return dap.Capabilities{}, fmt.Errorf("initialize failed: %s", r.Message)
 		}
+		return dap.Capabilities{}, fmt.Errorf("expected InitializeResponse, got %T", msg)
+	default:
+		return dap.Capabilities{}, fmt.Errorf("expected InitializeResponse, got %T", msg)
 	}
 }
 
@@ -351,7 +399,7 @@ func (c *DAPClient) AttachRequestRaw(args map[string]any) (int, error) {
 	req := c.newRequest("attach")
 	request := &dap.AttachRequest{Request: *req}
 	request.Arguments = toRawMessage(args)
-	return req.Seq, c.rawSend(request)
+	return req.Seq, c.sendAndRegisterRaw(req.Seq, request)
 }
 
 // SetBreakpointsRequestRaw sends a 'setBreakpoints' request via rawSend and
@@ -371,7 +419,7 @@ func (c *DAPClient) SetBreakpointsRequestRaw(file string, lines []int) (int, err
 	for i, l := range lines {
 		request.Arguments.Breakpoints[i].Line = l
 	}
-	return req.Seq, c.rawSend(request)
+	return req.Seq, c.sendAndRegisterRaw(req.Seq, request)
 }
 
 // SetFunctionBreakpointsRequestRaw sends a 'setFunctionBreakpoints' request
@@ -387,7 +435,7 @@ func (c *DAPClient) SetFunctionBreakpointsRequestRaw(functions []string) (int, e
 	for i, f := range functions {
 		request.Arguments.Breakpoints[i].Name = f
 	}
-	return req.Seq, c.rawSend(request)
+	return req.Seq, c.sendAndRegisterRaw(req.Seq, request)
 }
 
 // ConfigurationDoneRequestRaw sends a 'configurationDone' request via rawSend
@@ -397,7 +445,7 @@ func (c *DAPClient) SetFunctionBreakpointsRequestRaw(functions []string) (int, e
 func (c *DAPClient) ConfigurationDoneRequestRaw() (int, error) {
 	req := c.newRequest("configurationDone")
 	request := &dap.ConfigurationDoneRequest{Request: *req}
-	return req.Seq, c.rawSend(request)
+	return req.Seq, c.sendAndRegisterRaw(req.Seq, request)
 }
 
 // markStale is idempotent. The first caller sets stale=true and signals
@@ -414,8 +462,8 @@ func (c *DAPClient) markStale() {
 // replaceConn atomically swaps the underlying transport under mu, then drains
 // the response registry so any pending AwaitResponse callers receive
 // ErrConnectionStale. The old rwc must be closed by the caller (doReconnect)
-// before calling replaceConn so that any blocked ReadMessage returns with an
-// error. seq is deliberately NOT reset here (ADR-11).
+// before calling replaceConn so that any blocked read in readLoop returns with
+// an error. seq is deliberately NOT reset here (ADR-11).
 func (c *DAPClient) replaceConn(newRWC io.ReadWriteCloser) {
 	c.mu.Lock()
 	c.rwc = newRWC
@@ -576,7 +624,7 @@ func (c *DAPClient) SetBreakpointsRequest(file string, lines []int) (int, error)
 	for i, l := range lines {
 		request.Arguments.Breakpoints[i].Line = l
 	}
-	return req.Seq, c.send(request)
+	return req.Seq, c.sendAndRegister(req.Seq, request)
 }
 
 // SetFunctionBreakpointsRequest sends a 'setFunctionBreakpoints' request.
@@ -589,14 +637,14 @@ func (c *DAPClient) SetFunctionBreakpointsRequest(functions []string) (int, erro
 	for i, f := range functions {
 		request.Arguments.Breakpoints[i].Name = f
 	}
-	return req.Seq, c.send(request)
+	return req.Seq, c.sendAndRegister(req.Seq, request)
 }
 
 // ConfigurationDoneRequest sends a 'configurationDone' request.
 func (c *DAPClient) ConfigurationDoneRequest() (int, error) {
 	req := c.newRequest("configurationDone")
 	request := &dap.ConfigurationDoneRequest{Request: *req}
-	return req.Seq, c.send(request)
+	return req.Seq, c.sendAndRegister(req.Seq, request)
 }
 
 // ContinueRequest sends a 'continue' request.
@@ -604,7 +652,7 @@ func (c *DAPClient) ContinueRequest(threadID int) (int, error) {
 	req := c.newRequest("continue")
 	request := &dap.ContinueRequest{Request: *req}
 	request.Arguments.ThreadId = threadID
-	return req.Seq, c.send(request)
+	return req.Seq, c.sendAndRegister(req.Seq, request)
 }
 
 // NextRequest sends a 'next' request.
@@ -612,7 +660,7 @@ func (c *DAPClient) NextRequest(threadID int) (int, error) {
 	req := c.newRequest("next")
 	request := &dap.NextRequest{Request: *req}
 	request.Arguments.ThreadId = threadID
-	return req.Seq, c.send(request)
+	return req.Seq, c.sendAndRegister(req.Seq, request)
 }
 
 // StepInRequest sends a 'stepIn' request.
@@ -620,7 +668,7 @@ func (c *DAPClient) StepInRequest(threadID int) (int, error) {
 	req := c.newRequest("stepIn")
 	request := &dap.StepInRequest{Request: *req}
 	request.Arguments.ThreadId = threadID
-	return req.Seq, c.send(request)
+	return req.Seq, c.sendAndRegister(req.Seq, request)
 }
 
 // StepOutRequest sends a 'stepOut' request.
@@ -628,7 +676,7 @@ func (c *DAPClient) StepOutRequest(threadID int) (int, error) {
 	req := c.newRequest("stepOut")
 	request := &dap.StepOutRequest{Request: *req}
 	request.Arguments.ThreadId = threadID
-	return req.Seq, c.send(request)
+	return req.Seq, c.sendAndRegister(req.Seq, request)
 }
 
 // PauseRequest sends a 'pause' request.
@@ -636,14 +684,14 @@ func (c *DAPClient) PauseRequest(threadID int) (int, error) {
 	req := c.newRequest("pause")
 	request := &dap.PauseRequest{Request: *req}
 	request.Arguments.ThreadId = threadID
-	return req.Seq, c.send(request)
+	return req.Seq, c.sendAndRegister(req.Seq, request)
 }
 
 // ThreadsRequest sends a 'threads' request.
 func (c *DAPClient) ThreadsRequest() (int, error) {
 	req := c.newRequest("threads")
 	request := &dap.ThreadsRequest{Request: *req}
-	return req.Seq, c.send(request)
+	return req.Seq, c.sendAndRegister(req.Seq, request)
 }
 
 // StackTraceRequest sends a 'stackTrace' request.
@@ -653,7 +701,7 @@ func (c *DAPClient) StackTraceRequest(threadID, startFrame, levels int) (int, er
 	request.Arguments.ThreadId = threadID
 	request.Arguments.StartFrame = startFrame
 	request.Arguments.Levels = levels
-	return req.Seq, c.send(request)
+	return req.Seq, c.sendAndRegister(req.Seq, request)
 }
 
 // ScopesRequest sends a 'scopes' request.
@@ -661,7 +709,7 @@ func (c *DAPClient) ScopesRequest(frameID int) (int, error) {
 	req := c.newRequest("scopes")
 	request := &dap.ScopesRequest{Request: *req}
 	request.Arguments.FrameId = frameID
-	return req.Seq, c.send(request)
+	return req.Seq, c.sendAndRegister(req.Seq, request)
 }
 
 // VariablesRequest sends a 'variables' request.
@@ -669,7 +717,7 @@ func (c *DAPClient) VariablesRequest(variablesReference int) (int, error) {
 	req := c.newRequest("variables")
 	request := &dap.VariablesRequest{Request: *req}
 	request.Arguments.VariablesReference = variablesReference
-	return req.Seq, c.send(request)
+	return req.Seq, c.sendAndRegister(req.Seq, request)
 }
 
 // EvaluateRequest sends an 'evaluate' request.
@@ -690,7 +738,7 @@ func (c *DAPClient) EvaluateRequest(expression string, frameID int, context stri
 		dap.Request
 		Arguments map[string]any `json:"arguments"`
 	}{Request: *req, Arguments: args}
-	return req.Seq, c.send(&msg)
+	return req.Seq, c.sendAndRegister(req.Seq, &msg)
 }
 
 // DisconnectRequest sends a 'disconnect' request.
@@ -700,7 +748,7 @@ func (c *DAPClient) DisconnectRequest(terminateDebuggee bool) (int, error) {
 	request.Arguments = &dap.DisconnectArguments{
 		TerminateDebuggee: terminateDebuggee,
 	}
-	return req.Seq, c.send(request)
+	return req.Seq, c.sendAndRegister(req.Seq, request)
 }
 
 // ExceptionInfoRequest sends an 'exceptionInfo' request.
@@ -708,7 +756,7 @@ func (c *DAPClient) ExceptionInfoRequest(threadID int) (int, error) {
 	req := c.newRequest("exceptionInfo")
 	request := &dap.ExceptionInfoRequest{Request: *req}
 	request.Arguments.ThreadId = threadID
-	return req.Seq, c.send(request)
+	return req.Seq, c.sendAndRegister(req.Seq, request)
 }
 
 // SetVariableRequest sends a 'setVariable' request.
@@ -718,7 +766,7 @@ func (c *DAPClient) SetVariableRequest(variablesRef int, name, value string) (in
 	request.Arguments.VariablesReference = variablesRef
 	request.Arguments.Name = name
 	request.Arguments.Value = value
-	return req.Seq, c.send(request)
+	return req.Seq, c.sendAndRegister(req.Seq, request)
 }
 
 // RestartRequest sends a 'restart' request with specified arguments, if provided.
@@ -728,14 +776,14 @@ func (c *DAPClient) RestartRequest(arguments map[string]any) (int, error) {
 	if arguments != nil {
 		request.Arguments = toRawMessage(arguments)
 	}
-	return req.Seq, c.send(request)
+	return req.Seq, c.sendAndRegister(req.Seq, request)
 }
 
 // TerminateRequest sends a 'terminate' request.
 func (c *DAPClient) TerminateRequest() (int, error) {
 	req := c.newRequest("terminate")
 	request := &dap.TerminateRequest{Request: *req}
-	return req.Seq, c.send(request)
+	return req.Seq, c.sendAndRegister(req.Seq, request)
 }
 
 // StepBackRequest sends a 'stepBack' request.
@@ -743,21 +791,21 @@ func (c *DAPClient) StepBackRequest(threadID int) (int, error) {
 	req := c.newRequest("stepBack")
 	request := &dap.StepBackRequest{Request: *req}
 	request.Arguments.ThreadId = threadID
-	return req.Seq, c.send(request)
+	return req.Seq, c.sendAndRegister(req.Seq, request)
 }
 
 // LoadedSourcesRequest sends a 'loadedSources' request.
 func (c *DAPClient) LoadedSourcesRequest() (int, error) {
 	req := c.newRequest("loadedSources")
 	request := &dap.LoadedSourcesRequest{Request: *req}
-	return req.Seq, c.send(request)
+	return req.Seq, c.sendAndRegister(req.Seq, request)
 }
 
 // ModulesRequest sends a 'modules' request.
 func (c *DAPClient) ModulesRequest() (int, error) {
 	req := c.newRequest("modules")
 	request := &dap.ModulesRequest{Request: *req}
-	return req.Seq, c.send(request)
+	return req.Seq, c.sendAndRegister(req.Seq, request)
 }
 
 // BreakpointLocationsRequest sends a 'breakpointLocations' request.
@@ -768,7 +816,7 @@ func (c *DAPClient) BreakpointLocationsRequest(source string, line int) (int, er
 		Path: source,
 	}
 	request.Arguments.Line = line
-	return req.Seq, c.send(request)
+	return req.Seq, c.sendAndRegister(req.Seq, request)
 }
 
 // CompletionsRequest sends a 'completions' request.
@@ -778,7 +826,7 @@ func (c *DAPClient) CompletionsRequest(text string, column int, frameID int) (in
 	request.Arguments.Text = text
 	request.Arguments.Column = column
 	request.Arguments.FrameId = frameID
-	return req.Seq, c.send(request)
+	return req.Seq, c.sendAndRegister(req.Seq, request)
 }
 
 // DisassembleRequest sends a 'disassemble' request.
@@ -788,7 +836,7 @@ func (c *DAPClient) DisassembleRequest(memoryReference string, instructionOffset
 	request.Arguments.MemoryReference = memoryReference
 	request.Arguments.InstructionOffset = instructionOffset
 	request.Arguments.InstructionCount = instructionCount
-	return req.Seq, c.send(request)
+	return req.Seq, c.sendAndRegister(req.Seq, request)
 }
 
 // SetExceptionBreakpointsRequest sends a 'setExceptionBreakpoints' request.
@@ -796,7 +844,7 @@ func (c *DAPClient) SetExceptionBreakpointsRequest(filters []string) (int, error
 	req := c.newRequest("setExceptionBreakpoints")
 	request := &dap.SetExceptionBreakpointsRequest{Request: *req}
 	request.Arguments.Filters = filters
-	return req.Seq, c.send(request)
+	return req.Seq, c.sendAndRegister(req.Seq, request)
 }
 
 // DataBreakpointInfoRequest sends a 'dataBreakpointInfo' request.
@@ -805,7 +853,7 @@ func (c *DAPClient) DataBreakpointInfoRequest(variablesRef int, name string) (in
 	request := &dap.DataBreakpointInfoRequest{Request: *req}
 	request.Arguments.VariablesReference = variablesRef
 	request.Arguments.Name = name
-	return req.Seq, c.send(request)
+	return req.Seq, c.sendAndRegister(req.Seq, request)
 }
 
 // SetDataBreakpointsRequest sends a 'setDataBreakpoints' request.
@@ -813,7 +861,7 @@ func (c *DAPClient) SetDataBreakpointsRequest(breakpoints []dap.DataBreakpoint) 
 	req := c.newRequest("setDataBreakpoints")
 	request := &dap.SetDataBreakpointsRequest{Request: *req}
 	request.Arguments.Breakpoints = breakpoints
-	return req.Seq, c.send(request)
+	return req.Seq, c.sendAndRegister(req.Seq, request)
 }
 
 // SourceRequest sends a 'source' request.
@@ -821,7 +869,7 @@ func (c *DAPClient) SourceRequest(sourceRef int) (int, error) {
 	req := c.newRequest("source")
 	request := &dap.SourceRequest{Request: *req}
 	request.Arguments.SourceReference = sourceRef
-	return req.Seq, c.send(request)
+	return req.Seq, c.sendAndRegister(req.Seq, request)
 }
 
 // AttachRequest sends an 'attach' request.
@@ -833,7 +881,7 @@ func (c *DAPClient) AttachRequest(mode string, processID int) (int, error) {
 		"mode":      mode,
 		"processId": processID,
 	})
-	return req.Seq, c.send(request)
+	return req.Seq, c.sendAndRegister(req.Seq, request)
 }
 
 // ---------------------------------------------------------------------------
@@ -1194,13 +1242,10 @@ func Subscribe[T dap.EventMessage](c *DAPClient, since time.Time) (<-chan T, fun
 // and routes them to the response registry or event bus. It exits when ctx is
 // cancelled (via Close()) or when the connection returns an I/O error.
 //
-// Invariant: no other code calls dap.ReadProtocolMessage on the live client
-// connection while readLoop is running (ADR-PUMP-1). The existing ReadMessage
-// method is still called by tools.go during Phase 1 (migration happens in
-// Phase 2); when Start() is called, tools.go code and readLoop would race.
-// For now, readLoop is started and the existing synchronous tools.go code is
-// not yet migrated — they co-exist in Phase 1 for unit test purposes only.
-// The readLoop is exercised exclusively via the new Pump unit tests.
+// Invariant: no other code calls dap.ReadProtocolMessage / readMessage on the
+// live client connection while readLoop is running (ADR-PUMP-1). The private
+// readMessage method is reserved for readLoop itself; all other callers use
+// the SendRequest/AwaitResponse/Subscribe API.
 func (c *DAPClient) readLoop() {
 	defer close(c.pumpDone)
 	for {

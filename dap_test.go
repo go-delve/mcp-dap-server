@@ -58,8 +58,9 @@ func TestNewDAPClientFromRWC(t *testing.T) {
 		_ = dap.WriteProtocolMessage(serverWriter, resp)
 	}()
 
-	// Read the response through the client
-	respMsg, err := client.ReadMessage()
+	// Read the response through the client (legacy test of the low-level reader;
+	// real code uses the pump via SendRequest/AwaitResponse — see TestPump_* tests).
+	respMsg, err := client.readMessage()
 	if err != nil {
 		t.Fatalf("failed to read response: %v", err)
 	}
@@ -172,7 +173,7 @@ func TestDAPClient_Send_IOError_MarksStale(t *testing.T) {
 	}
 }
 
-// TestDAPClient_Read_IOError_MarksStale verifies that ReadMessage marks stale
+// TestDAPClient_Read_IOError_MarksStale verifies that readMessage marks stale
 // when the underlying connection is closed.
 func TestDAPClient_Read_IOError_MarksStale(t *testing.T) {
 	t.Parallel()
@@ -183,9 +184,9 @@ func TestDAPClient_Read_IOError_MarksStale(t *testing.T) {
 	c := newDAPClientFromRWC(clientConn)
 	defer c.Close()
 
-	_, err := c.ReadMessage()
+	_, err := c.readMessage()
 	if err == nil {
-		t.Fatal("expected error from ReadMessage after connection closed")
+		t.Fatal("expected error from readMessage after connection closed")
 	}
 	if !c.stale.Load() {
 		t.Fatal("expected stale=true after read I/O error")
@@ -930,14 +931,14 @@ func TestPump_ReplaceConn_DrainsOldRegistry(t *testing.T) {
 }
 
 // TestPump_ReadLoop_ExitsOnContextCancel verifies that Close() causes readLoop
-// to exit within 100ms (pumpDone is closed). Uses startReadLoop directly since
-// in Phase 1 Start() does not start readLoop (tools.go still uses ReadMessage;
-// migration to pump API happens in Phase 2).
+// to exit within 100ms (pumpDone is closed). Uses startReadLoop directly to
+// exercise the pump without also launching the reconnectLoop (which Start
+// would do).
 func TestPump_ReadLoop_ExitsOnContextCancel(t *testing.T) {
 	t.Parallel()
 
 	p := newPumpPipe(t)
-	p.client.startReadLoop() // Phase 1: explicit pump start, not via Start()
+	p.client.startReadLoop() // pump only, skip reconnectLoop
 
 	done := make(chan struct{})
 	go func() {
