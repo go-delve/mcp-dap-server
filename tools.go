@@ -207,7 +207,7 @@ type BreakpointSpec struct {
 // DebugParams defines the parameters for starting a complete debug session.
 type DebugParams struct {
 	Mode         string           `json:"mode" mcp:"'source' (compile & debug), 'binary' (debug executable), 'core' (debug core dump), or 'attach' (connect to process)"`
-	Path         string           `json:"path,omitempty" mcp:"program path (required for source/binary/core modes)"`
+	Path         string           `json:"path,omitempty" mcp:"program path (required for source/binary modes; optional for core mode with GDB, which can auto-detect it)"`
 	Args         []string         `json:"args,omitempty" mcp:"command line arguments for the program"`
 	CoreFilePath string           `json:"coreFilePath,omitempty" mcp:"path to core dump file (required for core mode)"`
 	ProcessID    int              `json:"processId,omitempty" mcp:"process ID (required for attach mode)"`
@@ -806,13 +806,14 @@ func (ds *debuggerSession) debug(ctx context.Context, _ *mcp.ServerSession, para
 		if params.Arguments.ProcessID == 0 {
 			return nil, fmt.Errorf("processId is required for attach mode")
 		}
+	} else if mode == "core" {
+		if params.Arguments.CoreFilePath == "" {
+			return nil, fmt.Errorf("coreFilePath is required for core mode")
+		}
 	} else {
 		if params.Arguments.Path == "" {
 			return nil, fmt.Errorf("path is required for %s mode", mode)
 		}
-	}
-	if mode == "core" && params.Arguments.CoreFilePath == "" {
-		return nil, fmt.Errorf("coreFilePath is required for core mode")
 	}
 
 	// Select debugger backend
@@ -837,8 +838,13 @@ func (ds *debuggerSession) debug(ctx context.Context, _ *mcp.ServerSession, para
 		return nil, fmt.Errorf("unsupported debugger: %s (must be 'delve' or 'gdb')", debugger)
 	}
 
+
 	if params.Arguments.ToolLog != "" && debugger == "delve" {
 		log.Printf("warning: tool-level logging is not supported for Delve; Delve DAP logs go to the server log")
+	}
+
+	if mode == "core" && params.Arguments.Path == "" && debugger != "gdb" {
+		return nil, fmt.Errorf("path is required for core mode with %s (only GDB can auto-detect the executable from a core file)", debugger)
 	}
 
 	// Spawn DAP server via backend

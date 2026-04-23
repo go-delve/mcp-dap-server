@@ -78,15 +78,17 @@ claude mcp add mcp-dap-server /path/to/mcp-dap-server
 ### Session Management
 
 #### `debug`
-Start a debugging session. Supports three modes:
+Start a debugging session. Supports four modes:
 - **source**: Compile and debug Go source code
 - **binary**: Debug a pre-compiled executable
+- **core**: Debug a core dump file
 - **attach**: Attach to a running process
 
 **Parameters**:
-- `mode` (string, required): One of 'source', 'binary', or 'attach'
-- `path` (string): Path to source file or binary (required for source/binary modes)
+- `mode` (string, required): One of 'source', 'binary', 'core', or 'attach'
+- `path` (string): Path to source file or binary (required for source/binary modes; optional for core mode with GDB, which can auto-detect it)
 - `args` (array): Arguments to pass to the program
+- `coreFilePath` (string): Path to core dump file (required for core mode)
 - `processId` (number): Process ID (required for attach mode)
 - `breakpoints` (array): Breakpoints to set before running (file:line or function name)
 - `stopOnEntry` (boolean): Stop at program entry point
