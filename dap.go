@@ -22,8 +22,9 @@ type readWriteCloser struct {
 // sequence number of the sent request, which callers use to match
 // the corresponding response via request_seq.
 type DAPClient struct {
-	rwc    io.ReadWriteCloser
-	reader *bufio.Reader
+	rwc       io.ReadWriteCloser
+	reader    *bufio.Reader
+	logWriter io.Writer
 	// seq tracks the sequence number for each request sent to the server.
 	seq int
 }
@@ -51,6 +52,11 @@ func newDAPClientFromRWC(rwc io.ReadWriteCloser) *DAPClient {
 // Close closes the client connection.
 func (c *DAPClient) Close() {
 	c.rwc.Close()
+}
+
+// SetProtocolLogger sets a writer for logging all DAP messages sent and received.
+func (c *DAPClient) SetProtocolLogger(w io.Writer) {
+	c.logWriter = w
 }
 
 // InitializeRequest sends an 'initialize' request and returns the server's capabilities.
@@ -91,7 +97,16 @@ func (c *DAPClient) InitializeRequest(adapterID string) (dap.Capabilities, error
 }
 
 func (c *DAPClient) ReadMessage() (dap.Message, error) {
-	return dap.ReadProtocolMessage(c.reader)
+	msg, err := dap.ReadProtocolMessage(c.reader)
+	if err != nil {
+		return nil, err
+	}
+	if c.logWriter != nil {
+		if data, merr := json.Marshal(msg); merr == nil {
+			fmt.Fprintf(c.logWriter, "RECV: <<<%s>>>\n", data)
+		}
+	}
+	return msg, nil
 }
 
 // LaunchRequest sends a 'launch' request with the specified args.
@@ -137,6 +152,11 @@ func (c *DAPClient) newRequest(command string) *dap.Request {
 }
 
 func (c *DAPClient) send(request dap.Message) error {
+	if c.logWriter != nil {
+		if data, err := json.Marshal(request); err == nil {
+			fmt.Fprintf(c.logWriter, "SENT: <<<%s>>>\n", data)
+		}
+	}
 	return dap.WriteProtocolMessage(c.rwc, request)
 }
 
@@ -273,6 +293,11 @@ func (c *DAPClient) EvaluateRequest(expression string, frameID int, context stri
 		dap.Request
 		Arguments map[string]any `json:"arguments"`
 	}{Request: *req, Arguments: args}
+	if c.logWriter != nil {
+		if data, err := json.Marshal(&msg); err == nil {
+			fmt.Fprintf(c.logWriter, "SENT: <<<%s>>>\n", data)
+		}
+	}
 	return req.Seq, dap.WriteProtocolMessage(c.rwc, &msg)
 }
 
