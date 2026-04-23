@@ -140,9 +140,10 @@ func (b *delveBackend) AttachArgs(processID int) (map[string]any, error) {
 // gdbBackend implements DebuggerBackend for GDB's native DAP server.
 // Requires GDB 14+. Communicates over stdio.
 type gdbBackend struct {
-	gdbPath string // path to gdb binary (default: "gdb")
-	stdin   io.WriteCloser
-	stdout  io.ReadCloser
+	gdbPath     string // path to gdb binary (default: "gdb")
+	toolLogPath string // path for GDB's native DAP log file
+	stdin       io.WriteCloser
+	stdout      io.ReadCloser
 }
 
 // Spawn starts GDB in native DAP mode over stdio.
@@ -153,7 +154,11 @@ func (g *gdbBackend) Spawn(port string, stderrWriter io.Writer) (*exec.Cmd, stri
 	if gdbPath == "" {
 		gdbPath = "gdb"
 	}
-	cmd := exec.Command(gdbPath, "-i", "dap")
+	args := []string{"-i", "dap"}
+	if g.toolLogPath != "" {
+		args = append([]string{"-iex", "set debug dap-log-file " + g.toolLogPath}, args...)
+	}
+	cmd := exec.Command(gdbPath, args...)
 	cmd.Stderr = stderrWriter
 
 	stdin, err := cmd.StdinPipe()

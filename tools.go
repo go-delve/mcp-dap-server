@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"os"
 	"os/exec"
 	"strings"
 	"sync"
@@ -28,6 +29,7 @@ type debuggerSession struct {
 	coreFilePath    string           // path to core dump file (core mode only)
 	stoppedThreadID int              // thread ID from last StoppedEvent (for adapters that use non-sequential IDs)
 	lastFrameID     int              // frame ID from last getFullContext; -1 means not set (0 is valid for GDB)
+	protocolLogFile *os.File         // protocol log file (closed on cleanup)
 }
 
 // defaultThreadID returns the thread ID to use when none is specified.
@@ -212,8 +214,10 @@ type DebugParams struct {
 	Breakpoints  []BreakpointSpec `json:"breakpoints,omitempty" mcp:"initial breakpoints"`
 	StopOnEntry  bool             `json:"stopOnEntry,omitempty" mcp:"stop at program entry instead of running to first breakpoint"`
 	Port         string           `json:"port,omitempty" mcp:"port for DAP server (default: auto-assigned)"`
-	Debugger string `json:"debugger,omitempty" mcp:"debugger to use: 'delve' (default) or 'gdb'"`
-	GDBPath  string `json:"gdbPath,omitempty" mcp:"path to gdb binary (default: auto-detected from PATH). Requires GDB 14+."`
+	Debugger    string `json:"debugger,omitempty" mcp:"debugger to use: 'delve' (default) or 'gdb'"`
+	GDBPath     string `json:"gdbPath,omitempty" mcp:"path to gdb binary (default: auto-detected from PATH). Requires GDB 14+."`
+	ProtocolLog string `json:"protocolLog,omitempty" mcp:"file path for protocol-level DAP message logging (what the MCP server sends/receives)"`
+	ToolLog     string `json:"toolLog,omitempty" mcp:"file path for tool-level DAP logging (native debugger logging, GDB only)"`
 }
 
 // ContextParams defines the parameters for getting debugging context.
@@ -746,6 +750,10 @@ func (ds *debuggerSession) cleanup() {
 		ds.client.Close()
 		ds.client = nil
 	}
+	if ds.protocolLogFile != nil {
+		ds.protocolLogFile.Close()
+		ds.protocolLogFile = nil
+	}
 
 	if ds.cmd != nil && ds.cmd.Process != nil {
 		if err := ds.cmd.Process.Kill(); err != nil {
@@ -824,9 +832,13 @@ func (ds *debuggerSession) debug(ctx context.Context, _ *mcp.ServerSession, para
 				return nil, fmt.Errorf("GDB not found in PATH. Install GDB 14+ or set the gdbPath parameter")
 			}
 		}
-		ds.backend = &gdbBackend{gdbPath: gdbPath}
+		ds.backend = &gdbBackend{gdbPath: gdbPath, toolLogPath: params.Arguments.ToolLog}
 	default:
 		return nil, fmt.Errorf("unsupported debugger: %s (must be 'delve' or 'gdb')", debugger)
+	}
+
+	if params.Arguments.ToolLog != "" && debugger == "delve" {
+		log.Printf("warning: tool-level logging is not supported for Delve; Delve DAP logs go to the server log")
 	}
 
 	// Spawn DAP server via backend
@@ -854,6 +866,17 @@ func (ds *debuggerSession) debug(ctx context.Context, _ *mcp.ServerSession, para
 	default:
 		return nil, fmt.Errorf("unsupported transport mode: %s", ds.backend.TransportMode())
 	}
+
+	// Protocol-level DAP message logging
+	if params.Arguments.ProtocolLog != "" {
+		f, err := os.Create(params.Arguments.ProtocolLog)
+		if err != nil {
+			return nil, fmt.Errorf("unable to open protocol log file: %w", err)
+		}
+		ds.protocolLogFile = f
+		ds.client.SetProtocolLogger(f)
+	}
+
 	caps, err := ds.client.InitializeRequest(ds.backend.AdapterID())
 	if err != nil {
 		return nil, err
