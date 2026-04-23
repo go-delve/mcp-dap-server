@@ -31,6 +31,11 @@ type DebuggerBackend interface {
 	// CoreArgs builds the debugger-specific arguments map for core dump debugging.
 	CoreArgs(programPath, coreFilePath string) (map[string]any, error)
 
+	// CoreRequestType returns the DAP request type ("launch" or "attach")
+	// to use for core dump debugging. Different debuggers handle core files
+	// via different DAP requests.
+	CoreRequestType() string
+
 	// AttachArgs builds the debugger-specific arguments map for attaching to a process.
 	AttachArgs(processID int) (map[string]any, error)
 }
@@ -116,6 +121,11 @@ func (b *delveBackend) LaunchArgs(mode, programPath string, stopOnEntry bool, pr
 		args["args"] = programArgs
 	}
 	return args, nil
+}
+
+// CoreRequestType returns "launch" because Delve handles core dumps via the launch request.
+func (b *delveBackend) CoreRequestType() string {
+	return "launch"
 }
 
 // CoreArgs builds the Delve-specific argument map for core dump debugging.
@@ -216,12 +226,21 @@ func (g *gdbBackend) LaunchArgs(mode, programPath string, stopOnEntry bool, prog
 	return args, nil
 }
 
+// CoreRequestType returns "attach" because GDB handles core dumps via the attach request.
+func (g *gdbBackend) CoreRequestType() string {
+	return "attach"
+}
+
 // CoreArgs builds the GDB native DAP argument map for core dump debugging.
+// programPath is optional — GDB can auto-detect the executable from the core file.
 func (g *gdbBackend) CoreArgs(programPath, coreFilePath string) (map[string]any, error) {
-	return map[string]any{
-		"program":  programPath,
+	args := map[string]any{
 		"coreFile": coreFilePath,
-	}, nil
+	}
+	if programPath != "" {
+		args["program"] = programPath
+	}
+	return args, nil
 }
 
 // AttachArgs builds the GDB native DAP argument map for attaching to a process.

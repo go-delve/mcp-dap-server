@@ -11,7 +11,7 @@ description: |
 ## Pre-flight checklist
 
 Before starting, confirm:
-1. **Absolute path** to the binary that crashed (must be the exact same build)
+1. **Absolute path** to the binary that crashed (required for Delve; optional for GDB, which can auto-detect it from the core file)
 2. **Absolute path** to the core dump file (usually `core`, `core.<PID>`, or `core.XXXX`)
 3. **Language** (Go → Delve; C/C++ → GDB)
 4. **Do the binary and core match?** A rebuilt binary won't match the core dump.
@@ -29,9 +29,14 @@ Before starting, confirm:
 debug(mode="core", path="/abs/path/to/binary", coreFilePath="/abs/path/to/core", debugger="delve")
 ```
 
-**C/C++:**
+**C/C++ (with explicit binary):**
 ```json
 debug(mode="core", path="/abs/path/to/binary", coreFilePath="/abs/path/to/core", debugger="gdb")
+```
+
+**C/C++ (auto-detect binary from core file):**
+```json
+debug(mode="core", coreFilePath="/abs/path/to/core", debugger="gdb")
 ```
 
 Expected: The debugger loads the core and positions at the crash frame. You see the crash location, stack trace, and local variables.

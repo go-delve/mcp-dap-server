@@ -102,7 +102,7 @@ flowchart TD
 **Key tools:** `debug`, `context`, `evaluate`, `info`, `stop`
 
 **Typical sequence:**
-1. `debug(mode="core", path="/path/to/binary", coreFilePath="/path/to/core")`
+1. `debug(mode="core", path="/path/to/binary", coreFilePath="/path/to/core")` (path is optional for GDB)
 2. `context()` — crash frame and signal
 3. `evaluate(expression="suspiciousVar")` — inspect values
 4. `context(frameId=1)`, `context(frameId=2)` — walk the stack
