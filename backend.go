@@ -232,11 +232,15 @@ func (g *gdbBackend) CoreRequestType() string {
 }
 
 // CoreArgs builds the GDB native DAP argument map for core dump debugging.
+// programPath is optional — GDB can auto-detect the executable from the core file.
 func (g *gdbBackend) CoreArgs(programPath, coreFilePath string) (map[string]any, error) {
-	return map[string]any{
-		"program":  programPath,
+	args := map[string]any{
 		"coreFile": coreFilePath,
-	}, nil
+	}
+	if programPath != "" {
+		args["program"] = programPath
+	}
+	return args, nil
 }
 
 // AttachArgs builds the GDB native DAP argument map for attaching to a process.
