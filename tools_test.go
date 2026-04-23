@@ -1082,6 +1082,53 @@ func TestGDBEvaluateWatchContext(t *testing.T) {
 }
 
 // TestGDBFullFlow exercises a realistic multi-step debugging session with GDB:
+func TestGDBCoreDump(t *testing.T) {
+	requireGDBDeps(t)
+
+	ts := setupMCPServerAndClient(t)
+	defer ts.cleanup()
+
+	binaryPath, cleanupBinary := compileTestCProgram(t, ts.cwd, "coredump")
+	defer cleanupBinary()
+
+	corePath := generateCoreDump(t, binaryPath)
+	defer os.Remove(corePath)
+
+	result, err := ts.session.CallTool(ts.ctx, &mcp.CallToolParams{
+		Name: "debug",
+		Arguments: map[string]any{
+			"debugger":     "gdb",
+			"mode":         "core",
+			"path":         binaryPath,
+			"coreFilePath": corePath,
+		},
+	})
+	if err != nil {
+		t.Fatalf("Failed to start GDB core debug session: %v", err)
+	}
+	if result.IsError {
+		errorMsg := ""
+		if len(result.Content) > 0 {
+			if tc, ok := result.Content[0].(*mcp.TextContent); ok {
+				errorMsg = tc.Text
+			}
+		}
+		t.Fatalf("GDB core debug session returned error: %s", errorMsg)
+	}
+
+	contextStr := ts.getContextContent(t)
+	t.Logf("GDB core dump context:\n%s", contextStr)
+
+	if !strings.Contains(contextStr, "crash") {
+		t.Errorf("Expected stack trace to contain 'crash', got:\n%s", contextStr)
+	}
+	if !strings.Contains(contextStr, "main") {
+		t.Errorf("Expected stack trace to contain 'main', got:\n%s", contextStr)
+	}
+
+	ts.stopDebugger(t)
+}
+
 // start with breakpoint → context → set another breakpoint → continue → context
 // → step → context → evaluate → info → continue to end.
 // This is a regression test for DAP response ordering issues where out-of-order

@@ -885,9 +885,17 @@ func (ds *debuggerSession) debug(ctx context.Context, _ *mcp.ServerSession, para
 		if err != nil {
 			return nil, err
 		}
-		req := ds.client.newRequest("launch")
-		request := &dap.LaunchRequest{Request: *req}
-		request.Arguments = toRawMessage(coreArgs)
+		rawArgs := toRawMessage(coreArgs)
+		var request dap.Message
+		if ds.backend.CoreRequestType() == "attach" {
+			req := ds.client.newRequest("attach")
+			request = &dap.AttachRequest{Request: *req, Arguments: rawArgs}
+		} else if ds.backend.CoreRequestType() == "launch" {
+			req := ds.client.newRequest("launch")
+			request = &dap.LaunchRequest{Request: *req, Arguments: rawArgs}
+		} else {
+			return nil, fmt.Errorf("unsupported core request type: %s", ds.backend.CoreRequestType())
+		}
 		if err := ds.client.send(request); err != nil {
 			return nil, err
 		}
