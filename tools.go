@@ -327,42 +327,42 @@ type StopParams struct {
 }
 
 // clearBreakpoints removes breakpoints.
-func (ds *debuggerSession) clearBreakpoints(ctx context.Context, _ *mcp.ServerSession, params *mcp.CallToolParamsFor[ClearBreakpointsParams]) (*mcp.CallToolResultFor[any], error) {
+func (ds *debuggerSession) clearBreakpoints(ctx context.Context, _ *mcp.CallToolRequest, params ClearBreakpointsParams) (*mcp.CallToolResult, any, error) {
 	ds.mu.Lock()
 	defer ds.mu.Unlock()
 	if ds.client == nil {
-		return nil, fmt.Errorf("debugger not started")
+		return nil, nil, fmt.Errorf("debugger not started")
 	}
 
-	if params.Arguments.All {
+	if params.All {
 		// Clear all function breakpoints
 		seq, err := ds.client.SetFunctionBreakpointsRequest([]string{})
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		if err := readAndValidateResponse(ds.client, seq, "unable to clear breakpoints"); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
-		return &mcp.CallToolResultFor[any]{
+		return &mcp.CallToolResult{
 			Content: []mcp.Content{&mcp.TextContent{Text: "Cleared all breakpoints"}},
-		}, nil
+		}, nil, nil
 	}
 
-	if params.Arguments.File != "" {
+	if params.File != "" {
 		// Clear breakpoints in specific file by setting empty list
-		seq, err := ds.client.SetBreakpointsRequest(params.Arguments.File, []int{})
+		seq, err := ds.client.SetBreakpointsRequest(params.File, []int{})
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		if err := readAndValidateResponse(ds.client, seq, "unable to clear breakpoints"); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
-		return &mcp.CallToolResultFor[any]{
-			Content: []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf("Cleared breakpoints in: %s", params.Arguments.File)}},
-		}, nil
+		return &mcp.CallToolResult{
+			Content: []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf("Cleared breakpoints in: %s", params.File)}},
+		}, nil, nil
 	}
 
-	return nil, fmt.Errorf("specify 'file' or 'all'")
+	return nil, nil, fmt.Errorf("specify 'file' or 'all'")
 }
 
 // ContinueParams defines the parameters for continuing execution.
@@ -372,43 +372,43 @@ type ContinueParams struct {
 }
 
 // continueExecution continues execution and returns full context when stopped.
-func (ds *debuggerSession) continueExecution(ctx context.Context, _ *mcp.ServerSession, params *mcp.CallToolParamsFor[ContinueParams]) (*mcp.CallToolResultFor[any], error) {
+func (ds *debuggerSession) continueExecution(ctx context.Context, _ *mcp.CallToolRequest, params ContinueParams) (*mcp.CallToolResult, any, error) {
 	ds.mu.Lock()
 	defer ds.mu.Unlock()
 	if ds.client == nil {
-		return nil, fmt.Errorf("debugger not started")
+		return nil, nil, fmt.Errorf("debugger not started")
 	}
 
 	// If "to" is specified, set a temporary breakpoint
-	if params.Arguments.To != nil {
-		to := params.Arguments.To
+	if params.To != nil {
+		to := params.To
 		if to.Function != "" {
 			if _, err := ds.client.SetFunctionBreakpointsRequest([]string{to.Function}); err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 		} else if to.File != "" && to.Line > 0 {
 			if _, err := ds.client.SetBreakpointsRequest(to.File, []int{to.Line}); err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 		}
 		if _, err := ds.client.ReadMessage(); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 	}
 
-	threadID := params.Arguments.ThreadID.Int()
+	threadID := params.ThreadID.Int()
 	if threadID == 0 {
 		threadID = ds.defaultThreadID()
 	}
 	continueSeq, err := ds.client.ContinueRequest(threadID)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	for {
 		msg, err := ds.client.ReadMessage()
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		switch resp := msg.(type) {
 		case dap.ResponseMessage:
@@ -418,15 +418,16 @@ func (ds *debuggerSession) continueExecution(ctx context.Context, _ *mcp.ServerS
 				continue
 			}
 			if !r.Success {
-				return nil, fmt.Errorf("continue failed: %s", r.Message)
+				return nil, nil, fmt.Errorf("continue failed: %s", r.Message)
 			}
 		case *dap.StoppedEvent:
 			ds.stoppedThreadID = resp.Body.ThreadId
-			return ds.getFullContext(resp.Body.ThreadId, 0, 20)
+			result, err := ds.getFullContext(resp.Body.ThreadId, 0, 20)
+			return result, nil, err
 		case *dap.TerminatedEvent:
-			return &mcp.CallToolResultFor[any]{
+			return &mcp.CallToolResult{
 				Content: []mcp.Content{&mcp.TextContent{Text: "Program terminated"}},
-			}, nil
+			}, nil, nil
 		}
 	}
 }
@@ -437,23 +438,23 @@ type PauseParams struct {
 }
 
 // pauseExecution pauses execution of a thread.
-func (ds *debuggerSession) pauseExecution(ctx context.Context, _ *mcp.ServerSession, params *mcp.CallToolParamsFor[PauseParams]) (*mcp.CallToolResultFor[any], error) {
+func (ds *debuggerSession) pauseExecution(ctx context.Context, _ *mcp.CallToolRequest, params PauseParams) (*mcp.CallToolResult, any, error) {
 	ds.mu.Lock()
 	defer ds.mu.Unlock()
 	if ds.client == nil {
-		return nil, fmt.Errorf("debugger not started")
+		return nil, nil, fmt.Errorf("debugger not started")
 	}
-	seq, err := ds.client.PauseRequest(params.Arguments.ThreadID.Int())
+	seq, err := ds.client.PauseRequest(params.ThreadID.Int())
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if err := readAndValidateResponse(ds.client, seq, "unable to pause execution"); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
-	return &mcp.CallToolResultFor[any]{
+	return &mcp.CallToolResult{
 		Content: []mcp.Content{&mcp.TextContent{Text: "Paused execution"}},
-	}, nil
+	}, nil, nil
 }
 
 // EvaluateParams defines the parameters for evaluating an expression.
@@ -464,53 +465,53 @@ type EvaluateParams struct {
 }
 
 // evaluateExpression evaluates an expression in the context of a stack frame.
-func (ds *debuggerSession) evaluateExpression(ctx context.Context, _ *mcp.ServerSession, params *mcp.CallToolParamsFor[EvaluateParams]) (*mcp.CallToolResultFor[any], error) {
+func (ds *debuggerSession) evaluateExpression(ctx context.Context, _ *mcp.CallToolRequest, params EvaluateParams) (*mcp.CallToolResult, any, error) {
 	ds.mu.Lock()
 	defer ds.mu.Unlock()
 	if ds.client == nil {
-		return nil, fmt.Errorf("debugger not started")
+		return nil, nil, fmt.Errorf("debugger not started")
 	}
 
-	evalContext := params.Arguments.Context
+	evalContext := params.Context
 	if evalContext == "" {
 		evalContext = "watch"
 	}
 
 	var frameID int
-	if params.Arguments.FrameID != nil {
-		frameID = params.Arguments.FrameID.Int()
+	if params.FrameID != nil {
+		frameID = params.FrameID.Int()
 	} else if ds.lastFrameID >= 0 {
 		frameID = ds.lastFrameID
 	}
-	log.Printf("evaluate: expression=%q frameID=%d context=%q", params.Arguments.Expression, frameID, evalContext)
+	log.Printf("evaluate: expression=%q frameID=%d context=%q", params.Expression, frameID, evalContext)
 
-	evalSeq, err := ds.client.EvaluateRequest(params.Arguments.Expression, frameID, evalContext)
+	evalSeq, err := ds.client.EvaluateRequest(params.Expression, frameID, evalContext)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	for {
 		msg, err := ds.client.ReadMessage()
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		switch resp := msg.(type) {
 		case *dap.EvaluateResponse:
 			if !resp.Success {
-				return nil, fmt.Errorf("unable to evaluate expression: %s", resp.Message)
+				return nil, nil, fmt.Errorf("unable to evaluate expression: %s", resp.Message)
 			}
 			result := resp.Body.Result
 			if resp.Body.Type != "" {
 				result = fmt.Sprintf("%s (type: %s)", resp.Body.Result, resp.Body.Type)
 			}
-			return &mcp.CallToolResultFor[any]{
+			return &mcp.CallToolResult{
 				Content: []mcp.Content{&mcp.TextContent{Text: result}},
-			}, nil
+			}, nil, nil
 		case dap.ResponseMessage:
 			r := resp.GetResponse()
 			if r.RequestSeq == evalSeq {
 				if !r.Success {
-					return nil, fmt.Errorf("unable to evaluate expression: %s", r.Message)
+					return nil, nil, fmt.Errorf("unable to evaluate expression: %s", r.Message)
 				}
 			}
 			log.Printf("evaluate: skipping out-of-order %T response (request_seq=%d, waiting for %d)",
@@ -530,22 +531,22 @@ type SetVariableParams struct {
 }
 
 // setVariable sets the value of a variable in the debugged program.
-func (ds *debuggerSession) setVariable(ctx context.Context, _ *mcp.ServerSession, params *mcp.CallToolParamsFor[SetVariableParams]) (*mcp.CallToolResultFor[any], error) {
+func (ds *debuggerSession) setVariable(ctx context.Context, _ *mcp.CallToolRequest, params SetVariableParams) (*mcp.CallToolResult, any, error) {
 	ds.mu.Lock()
 	defer ds.mu.Unlock()
 	if ds.client == nil {
-		return nil, fmt.Errorf("debugger not started")
+		return nil, nil, fmt.Errorf("debugger not started")
 	}
-	seq, err := ds.client.SetVariableRequest(params.Arguments.VariablesReference.Int(), params.Arguments.Name, params.Arguments.Value)
+	seq, err := ds.client.SetVariableRequest(params.VariablesReference.Int(), params.Name, params.Value)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if err := readAndValidateResponse(ds.client, seq, "unable to set variable"); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return &mcp.CallToolResultFor[any]{
-		Content: []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf("Set variable %s to %s", params.Arguments.Name, params.Arguments.Value)}},
-	}, nil
+	return &mcp.CallToolResult{
+		Content: []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf("Set variable %s to %s", params.Name, params.Value)}},
+	}, nil, nil
 }
 
 // RestartParams defines the parameters for restarting the debugger.
@@ -554,42 +555,42 @@ type RestartParams struct {
 }
 
 // restartDebugger restarts the debugging session.
-func (ds *debuggerSession) restartDebugger(ctx context.Context, _ *mcp.ServerSession, params *mcp.CallToolParamsFor[RestartParams]) (*mcp.CallToolResultFor[any], error) {
+func (ds *debuggerSession) restartDebugger(ctx context.Context, _ *mcp.CallToolRequest, params RestartParams) (*mcp.CallToolResult, any, error) {
 	ds.mu.Lock()
 	defer ds.mu.Unlock()
 	if ds.client == nil {
-		return nil, fmt.Errorf("debugger not started")
+		return nil, nil, fmt.Errorf("debugger not started")
 	}
 	seq, err := ds.client.RestartRequest(map[string]any{
 		"arguments": map[string]any{
 			"request":     "launch",
 			"mode":        "exec",
 			"stopOnEntry": false,
-			"args":        params.Arguments.Args,
+			"args":        params.Args,
 			"rebuild":     false,
 		},
 	})
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if err := readAndValidateResponse(ds.client, seq, "unable to restart debugger"); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
-	return &mcp.CallToolResultFor[any]{
+	return &mcp.CallToolResult{
 		Content: []mcp.Content{&mcp.TextContent{Text: "Restarted debugging session"}},
-	}, nil
+	}, nil, nil
 }
 
 // info returns program metadata.
-func (ds *debuggerSession) info(ctx context.Context, _ *mcp.ServerSession, params *mcp.CallToolParamsFor[InfoParams]) (*mcp.CallToolResultFor[any], error) {
+func (ds *debuggerSession) info(ctx context.Context, _ *mcp.CallToolRequest, params InfoParams) (*mcp.CallToolResult, any, error) {
 	ds.mu.Lock()
 	defer ds.mu.Unlock()
 	if ds.client == nil {
-		return nil, fmt.Errorf("debugger not started")
+		return nil, nil, fmt.Errorf("debugger not started")
 	}
 
-	infoType := params.Arguments.Type
+	infoType := params.Type
 	if infoType == "" {
 		if ds.capabilities.SupportsLoadedSourcesRequest {
 			infoType = "sources"
@@ -602,65 +603,65 @@ func (ds *debuggerSession) info(ctx context.Context, _ *mcp.ServerSession, param
 	case "threads":
 		seq, err := ds.client.ThreadsRequest()
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		resp, err := readTypedResponse[*dap.ThreadsResponse](ds.client, seq)
 		if err != nil {
-			return nil, fmt.Errorf("failed to get threads: %w", err)
+			return nil, nil, fmt.Errorf("failed to get threads: %w", err)
 		}
 		var threads strings.Builder
 		threads.WriteString("Threads:\n")
 		for _, t := range resp.Body.Threads {
 			fmt.Fprintf(&threads, "  Thread %d: %s\n", t.Id, t.Name)
 		}
-		return &mcp.CallToolResultFor[any]{
+		return &mcp.CallToolResult{
 			Content: []mcp.Content{&mcp.TextContent{Text: threads.String()}},
-		}, nil
+		}, nil, nil
 
 	case "sources":
 		if !ds.capabilities.SupportsLoadedSourcesRequest {
-			return nil, fmt.Errorf("loaded sources not supported by this debug adapter")
+			return nil, nil, fmt.Errorf("loaded sources not supported by this debug adapter")
 		}
 		seq, err := ds.client.LoadedSourcesRequest()
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		resp, err := readTypedResponse[*dap.LoadedSourcesResponse](ds.client, seq)
 		if err != nil {
-			return nil, fmt.Errorf("failed to get loaded sources: %w", err)
+			return nil, nil, fmt.Errorf("failed to get loaded sources: %w", err)
 		}
 		var sources strings.Builder
 		sources.WriteString("Loaded Sources:\n")
 		for _, src := range resp.Body.Sources {
 			fmt.Fprintf(&sources, "  %s\n", src.Path)
 		}
-		return &mcp.CallToolResultFor[any]{
+		return &mcp.CallToolResult{
 			Content: []mcp.Content{&mcp.TextContent{Text: sources.String()}},
-		}, nil
+		}, nil, nil
 
 	case "modules":
 		if !ds.capabilities.SupportsModulesRequest {
-			return nil, fmt.Errorf("modules not supported by this debug adapter")
+			return nil, nil, fmt.Errorf("modules not supported by this debug adapter")
 		}
 		seq, err := ds.client.ModulesRequest()
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		resp, err := readTypedResponse[*dap.ModulesResponse](ds.client, seq)
 		if err != nil {
-			return nil, fmt.Errorf("failed to get modules: %w", err)
+			return nil, nil, fmt.Errorf("failed to get modules: %w", err)
 		}
 		var modules strings.Builder
 		modules.WriteString("Loaded Modules:\n")
 		for _, mod := range resp.Body.Modules {
 			fmt.Fprintf(&modules, "  %s (%s)\n", mod.Name, mod.Path)
 		}
-		return &mcp.CallToolResultFor[any]{
+		return &mcp.CallToolResult{
 			Content: []mcp.Content{&mcp.TextContent{Text: modules.String()}},
-		}, nil
+		}, nil, nil
 
 	default:
-		return nil, fmt.Errorf("invalid type: %s (must be 'threads', 'sources', or 'modules')", infoType)
+		return nil, nil, fmt.Errorf("invalid type: %s (must be 'threads', 'sources', or 'modules')", infoType)
 	}
 }
 
@@ -672,25 +673,25 @@ type DisassembleParams struct {
 }
 
 // disassembleCode disassembles code at a memory reference.
-func (ds *debuggerSession) disassembleCode(ctx context.Context, _ *mcp.ServerSession, params *mcp.CallToolParamsFor[DisassembleParams]) (*mcp.CallToolResultFor[any], error) {
+func (ds *debuggerSession) disassembleCode(ctx context.Context, _ *mcp.CallToolRequest, params DisassembleParams) (*mcp.CallToolResult, any, error) {
 	ds.mu.Lock()
 	defer ds.mu.Unlock()
-	log.Printf("disassemble: address=%s offset=%d", params.Arguments.Address, params.Arguments.Offset.Int())
+	log.Printf("disassemble: address=%s offset=%d", params.Address, params.Offset.Int())
 	if ds.client == nil {
-		return nil, fmt.Errorf("debugger not started")
+		return nil, nil, fmt.Errorf("debugger not started")
 	}
-	count := params.Arguments.Count.Int()
+	count := params.Count.Int()
 	if count == 0 {
 		count = 20
 	}
-	seq, err := ds.client.DisassembleRequest(params.Arguments.Address, params.Arguments.Offset.Int(), count)
+	seq, err := ds.client.DisassembleRequest(params.Address, params.Offset.Int(), count)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	disResp, err := readTypedResponse[*dap.DisassembleResponse](ds.client, seq)
 	if err != nil {
-		return nil, fmt.Errorf("unable to disassemble: %w", err)
+		return nil, nil, fmt.Errorf("unable to disassemble: %w", err)
 	}
 
 	var result strings.Builder
@@ -702,25 +703,25 @@ func (ds *debuggerSession) disassembleCode(ctx context.Context, _ *mcp.ServerSes
 		}
 		result.WriteString("\n")
 	}
-	return &mcp.CallToolResultFor[any]{
+	return &mcp.CallToolResult{
 		Content: []mcp.Content{&mcp.TextContent{Text: result.String()}},
-	}, nil
+	}, nil, nil
 }
 
 // stop ends the debugging session.
 // If params.Detach is true, a DAP disconnect request is sent with terminateDebuggee=false
 // so the debuggee keeps running after the adapter disconnects.
-func (ds *debuggerSession) stop(ctx context.Context, _ *mcp.ServerSession, params *mcp.CallToolParamsFor[StopParams]) (*mcp.CallToolResultFor[any], error) {
+func (ds *debuggerSession) stop(ctx context.Context, _ *mcp.CallToolRequest, params StopParams) (*mcp.CallToolResult, any, error) {
 	ds.mu.Lock()
 	defer ds.mu.Unlock()
 	log.Printf("stop")
 	if ds.cmd == nil && ds.client == nil {
-		return &mcp.CallToolResultFor[any]{
+		return &mcp.CallToolResult{
 			Content: []mcp.Content{&mcp.TextContent{Text: "No debug session active"}},
-		}, nil
+		}, nil, nil
 	}
 
-	if params.Arguments.Detach && ds.client != nil {
+	if params.Detach && ds.client != nil {
 		// Send disconnect with terminateDebuggee=false so the debuggee keeps running.
 		seq, err := ds.client.DisconnectRequest(false)
 		if err != nil {
@@ -731,16 +732,16 @@ func (ds *debuggerSession) stop(ctx context.Context, _ *mcp.ServerSession, param
 			}
 		}
 		ds.cleanup()
-		return &mcp.CallToolResultFor[any]{
+		return &mcp.CallToolResult{
 			Content: []mcp.Content{&mcp.TextContent{Text: "Detached from process (debuggee still running)"}},
-		}, nil
+		}, nil, nil
 	}
 
 	ds.cleanup()
 
-	return &mcp.CallToolResultFor[any]{
+	return &mcp.CallToolResult{
 		Content: []mcp.Content{&mcp.TextContent{Text: "Debug session stopped"}},
-	}, nil
+	}, nil, nil
 }
 
 // cleanup kills the DAP adapter process and resets session state.
@@ -777,14 +778,14 @@ func (ds *debuggerSession) cleanup() {
 
 // debug starts a complete debugging session.
 // It starts the debugger, loads the program, sets initial breakpoints, and runs to the first breakpoint.
-func (ds *debuggerSession) debug(ctx context.Context, _ *mcp.ServerSession, params *mcp.CallToolParamsFor[DebugParams]) (*mcp.CallToolResultFor[any], error) {
+func (ds *debuggerSession) debug(ctx context.Context, _ *mcp.CallToolRequest, params DebugParams) (*mcp.CallToolResult, any, error) {
 	ds.mu.Lock()
 	defer ds.mu.Unlock()
 	// Clean up any existing session before starting a new one
 	ds.cleanup()
 
 	// Default port
-	port := params.Arguments.Port
+	port := params.Port
 	if port == "" {
 		port = "0"
 	}
@@ -793,31 +794,31 @@ func (ds *debuggerSession) debug(ctx context.Context, _ *mcp.ServerSession, para
 	}
 
 	// Validate mode
-	mode := params.Arguments.Mode
+	mode := params.Mode
 	switch mode {
 	case "source", "binary", "core", "attach":
 		// valid
 	default:
-		return nil, fmt.Errorf("invalid mode: %s (must be 'source', 'binary', 'core', or 'attach')", mode)
+		return nil, nil, fmt.Errorf("invalid mode: %s (must be 'source', 'binary', 'core', or 'attach')", mode)
 	}
 
 	// Validate required parameters
 	if mode == "attach" {
-		if params.Arguments.ProcessID == 0 {
-			return nil, fmt.Errorf("processId is required for attach mode")
+		if params.ProcessID == 0 {
+			return nil, nil, fmt.Errorf("processId is required for attach mode")
 		}
 	} else if mode == "core" {
-		if params.Arguments.CoreFilePath == "" {
-			return nil, fmt.Errorf("coreFilePath is required for core mode")
+		if params.CoreFilePath == "" {
+			return nil, nil, fmt.Errorf("coreFilePath is required for core mode")
 		}
 	} else {
-		if params.Arguments.Path == "" {
-			return nil, fmt.Errorf("path is required for %s mode", mode)
+		if params.Path == "" {
+			return nil, nil, fmt.Errorf("path is required for %s mode", mode)
 		}
 	}
 
 	// Select debugger backend
-	debugger := params.Arguments.Debugger
+	debugger := params.Debugger
 	if debugger == "" {
 		debugger = "delve"
 	}
@@ -825,32 +826,31 @@ func (ds *debuggerSession) debug(ctx context.Context, _ *mcp.ServerSession, para
 	case "delve":
 		ds.backend = &delveBackend{}
 	case "gdb":
-		gdbPath := params.Arguments.GDBPath
+		gdbPath := params.GDBPath
 		if gdbPath == "" {
 			var err error
 			gdbPath, err = exec.LookPath("gdb")
 			if err != nil {
-				return nil, fmt.Errorf("GDB not found in PATH. Install GDB 14+ or set the gdbPath parameter")
+				return nil, nil, fmt.Errorf("GDB not found in PATH. Install GDB 14+ or set the gdbPath parameter")
 			}
 		}
-		ds.backend = &gdbBackend{gdbPath: gdbPath, toolLogPath: params.Arguments.ToolLog}
+		ds.backend = &gdbBackend{gdbPath: gdbPath, toolLogPath: params.ToolLog}
 	default:
-		return nil, fmt.Errorf("unsupported debugger: %s (must be 'delve' or 'gdb')", debugger)
+		return nil, nil, fmt.Errorf("unsupported debugger: %s (must be 'delve' or 'gdb')", debugger)
 	}
 
-
-	if params.Arguments.ToolLog != "" && debugger == "delve" {
+	if params.ToolLog != "" && debugger == "delve" {
 		log.Printf("warning: tool-level logging is not supported for Delve; Delve DAP logs go to the server log")
 	}
 
-	if mode == "core" && params.Arguments.Path == "" && debugger != "gdb" {
-		return nil, fmt.Errorf("path is required for core mode with %s (only GDB can auto-detect the executable from a core file)", debugger)
+	if mode == "core" && params.Path == "" && debugger != "gdb" {
+		return nil, nil, fmt.Errorf("path is required for core mode with %s (only GDB can auto-detect the executable from a core file)", debugger)
 	}
 
 	// Spawn DAP server via backend
 	cmd, listenAddr, err := ds.backend.Spawn(port, ds.logWriter)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	ds.cmd = cmd
 
@@ -859,7 +859,7 @@ func (ds *debuggerSession) debug(ctx context.Context, _ *mcp.ServerSession, para
 	case "tcp":
 		client, err := newDAPClient(listenAddr)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		ds.client = client
 	case "stdio":
@@ -870,14 +870,14 @@ func (ds *debuggerSession) debug(ctx context.Context, _ *mcp.ServerSession, para
 			WriteCloser: stdin,
 		})
 	default:
-		return nil, fmt.Errorf("unsupported transport mode: %s", ds.backend.TransportMode())
+		return nil, nil, fmt.Errorf("unsupported transport mode: %s", ds.backend.TransportMode())
 	}
 
 	// Protocol-level DAP message logging
-	if params.Arguments.ProtocolLog != "" {
-		f, err := os.Create(params.Arguments.ProtocolLog)
+	if params.ProtocolLog != "" {
+		f, err := os.Create(params.ProtocolLog)
 		if err != nil {
-			return nil, fmt.Errorf("unable to open protocol log file: %w", err)
+			return nil, nil, fmt.Errorf("unable to open protocol log file: %w", err)
 		}
 		ds.protocolLogFile = f
 		ds.client.SetProtocolLogger(f)
@@ -885,34 +885,34 @@ func (ds *debuggerSession) debug(ctx context.Context, _ *mcp.ServerSession, para
 
 	caps, err := ds.client.InitializeRequest(ds.backend.AdapterID())
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	ds.capabilities = caps
 
 	// Store session state
 	ds.launchMode = mode
-	ds.programPath = params.Arguments.Path
-	ds.programArgs = params.Arguments.Args
-	ds.coreFilePath = params.Arguments.CoreFilePath
+	ds.programPath = params.Path
+	ds.programArgs = params.Args
+	ds.coreFilePath = params.CoreFilePath
 
 	// Launch or attach using backend-specific args
-	stopOnEntry := params.Arguments.StopOnEntry || len(params.Arguments.Breakpoints) == 0
+	stopOnEntry := params.StopOnEntry || len(params.Breakpoints) == 0
 	switch mode {
 	case "source", "binary":
-		launchArgs, err := ds.backend.LaunchArgs(mode, params.Arguments.Path, stopOnEntry, params.Arguments.Args)
+		launchArgs, err := ds.backend.LaunchArgs(mode, params.Path, stopOnEntry, params.Args)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		req := ds.client.newRequest("launch")
 		request := &dap.LaunchRequest{Request: *req}
 		request.Arguments = toRawMessage(launchArgs)
 		if err := ds.client.send(request); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 	case "core":
-		coreArgs, err := ds.backend.CoreArgs(params.Arguments.Path, params.Arguments.CoreFilePath)
+		coreArgs, err := ds.backend.CoreArgs(params.Path, params.CoreFilePath)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		rawArgs := toRawMessage(coreArgs)
 		var request dap.Message
@@ -923,21 +923,21 @@ func (ds *debuggerSession) debug(ctx context.Context, _ *mcp.ServerSession, para
 			req := ds.client.newRequest("launch")
 			request = &dap.LaunchRequest{Request: *req, Arguments: rawArgs}
 		} else {
-			return nil, fmt.Errorf("unsupported core request type: %s", ds.backend.CoreRequestType())
+			return nil, nil, fmt.Errorf("unsupported core request type: %s", ds.backend.CoreRequestType())
 		}
 		if err := ds.client.send(request); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 	case "attach":
-		attachArgs, err := ds.backend.AttachArgs(params.Arguments.ProcessID)
+		attachArgs, err := ds.backend.AttachArgs(params.ProcessID)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		req := ds.client.newRequest("attach")
 		request := &dap.AttachRequest{Request: *req}
 		request.Arguments = toRawMessage(attachArgs)
 		if err := ds.client.send(request); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 	}
 	// After sending the launch/attach request, we must handle two DAP patterns:
@@ -954,12 +954,12 @@ func (ds *debuggerSession) debug(ctx context.Context, _ *mcp.ServerSession, para
 	for {
 		msg, err := ds.client.ReadMessage()
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		switch resp := msg.(type) {
 		case dap.ResponseMessage:
 			if !resp.GetResponse().Success {
-				return nil, fmt.Errorf("unable to start debug session: %s", resp.GetResponse().Message)
+				return nil, nil, fmt.Errorf("unable to start debug session: %s", resp.GetResponse().Message)
 			}
 			// Launch response consumed; continue reading for initialized event
 		case *dap.InitializedEvent:
@@ -970,22 +970,22 @@ func (ds *debuggerSession) debug(ctx context.Context, _ *mcp.ServerSession, para
 initialized:
 
 	// Set breakpoints
-	for _, bp := range params.Arguments.Breakpoints {
+	for _, bp := range params.Breakpoints {
 		if bp.Function != "" {
 			seq, err := ds.client.SetFunctionBreakpointsRequest([]string{bp.Function})
 			if err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 			if err := readAndValidateResponse(ds.client, seq, "unable to set function breakpoint"); err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 		} else if bp.File != "" && bp.Line > 0 {
 			seq, err := ds.client.SetBreakpointsRequest(bp.File, []int{bp.Line})
 			if err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 			if err := readAndValidateResponse(ds.client, seq, "unable to set breakpoint"); err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 		}
 	}
@@ -993,10 +993,10 @@ initialized:
 	// Configuration done
 	configSeq, err := ds.client.ConfigurationDoneRequest()
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if err := readAndValidateResponse(ds.client, configSeq, "unable to complete configuration"); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	// If the launch response was deferred (arrived after the initialized event),
@@ -1013,7 +1013,7 @@ initialized:
 		for {
 			msg, err := ds.client.ReadMessage()
 			if err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 			switch ev := msg.(type) {
 			case *dap.StoppedEvent:
@@ -1021,7 +1021,8 @@ initialized:
 				if ds.stoppedThreadID == 0 {
 					ds.stoppedThreadID = 1
 				}
-				return ds.getFullContext(ds.stoppedThreadID, 0, 20)
+				result, err := ds.getFullContext(ds.stoppedThreadID, 0, 20)
+				return result, nil, err
 			case dap.EventMessage:
 				continue
 			}
@@ -1039,19 +1040,19 @@ initialized:
 	//
 	// We handle both by reading the first StoppedEvent. If it's an entry stop,
 	// we send ContinueRequest and wait for the next stop.
-	if len(params.Arguments.Breakpoints) > 0 && !params.Arguments.StopOnEntry {
+	if len(params.Breakpoints) > 0 && !params.StopOnEntry {
 		var stoppedThreadID int
 		for {
 			msg, err := ds.client.ReadMessage()
 			if err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 			switch ev := msg.(type) {
 			case *dap.StoppedEvent:
 				if ev.Body.Reason == "entry" {
 					// Stopped at entry — send continue to reach the breakpoint
 					if _, err := ds.client.ContinueRequest(ev.Body.ThreadId); err != nil {
-						return nil, err
+						return nil, nil, err
 					}
 					continue
 				}
@@ -1067,41 +1068,42 @@ initialized:
 			stoppedThreadID = 1
 		}
 		// Return full context when stopped at breakpoint
-		return ds.getFullContext(stoppedThreadID, 0, 20)
+		result, err := ds.getFullContext(stoppedThreadID, 0, 20)
+		return result, nil, err
 	}
 
 	// Return simple success message when stopped on entry.
 	// The StoppedEvent from the adapter (if any) will be consumed by the
 	// next readTypedResponse call, which skips EventMessages.
-	return &mcp.CallToolResultFor[any]{
-		Content: []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf("Debug session started for %s. Use 'breakpoint' to set breakpoints and 'continue' to run.", params.Arguments.Path)}},
-	}, nil
+	return &mcp.CallToolResult{
+		Content: []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf("Debug session started for %s. Use 'breakpoint' to set breakpoints and 'continue' to run.", params.Path)}},
+	}, nil, nil
 }
 
 // context returns the full debugging context at the current location.
-func (ds *debuggerSession) context(ctx context.Context, _ *mcp.ServerSession, params *mcp.CallToolParamsFor[ContextParams]) (*mcp.CallToolResultFor[any], error) {
+func (ds *debuggerSession) context(ctx context.Context, _ *mcp.CallToolRequest, params ContextParams) (*mcp.CallToolResult, any, error) {
 	ds.mu.Lock()
 	defer ds.mu.Unlock()
-	threadID := params.Arguments.ThreadID.Int()
+	threadID := params.ThreadID.Int()
 	if threadID == 0 {
 		threadID = ds.defaultThreadID()
 	}
-	maxFrames := params.Arguments.MaxFrames.Int()
+	maxFrames := params.MaxFrames.Int()
 	if maxFrames == 0 {
 		maxFrames = 20
 	}
-	result, err := ds.getFullContext(threadID, params.Arguments.FrameID.Int(), maxFrames)
+	result, err := ds.getFullContext(threadID, params.FrameID.Int(), maxFrames)
 	if err != nil {
 		// If the thread ID was invalid, try to help by listing available threads
 		if strings.Contains(err.Error(), "threadId") || strings.Contains(err.Error(), "thread") {
 			threadList := ds.getThreadList()
 			if threadList != "" {
-				return nil, fmt.Errorf("%w\n\nAvailable threads (use info tool with type 'threads' to refresh):\n%s", err, threadList)
+				return nil, nil, fmt.Errorf("%w\n\nAvailable threads (use info tool with type 'threads' to refresh):\n%s", err, threadList)
 			}
 		}
-		return nil, err
+		return nil, nil, err
 	}
-	return result, nil
+	return result, nil, nil
 }
 
 // getThreadList returns a formatted string of available threads, or empty string on error.
@@ -1125,66 +1127,67 @@ func (ds *debuggerSession) getThreadList() string {
 }
 
 // step executes a step command and returns the full context at the new location.
-func (ds *debuggerSession) step(ctx context.Context, _ *mcp.ServerSession, params *mcp.CallToolParamsFor[StepParams]) (*mcp.CallToolResultFor[any], error) {
+func (ds *debuggerSession) step(ctx context.Context, _ *mcp.CallToolRequest, params StepParams) (*mcp.CallToolResult, any, error) {
 	ds.mu.Lock()
 	defer ds.mu.Unlock()
 	if ds.client == nil {
-		return nil, fmt.Errorf("debugger not started")
+		return nil, nil, fmt.Errorf("debugger not started")
 	}
 
-	threadID := params.Arguments.ThreadID.Int()
+	threadID := params.ThreadID.Int()
 	if threadID == 0 {
 		threadID = ds.defaultThreadID()
 	}
 
 	// Execute the appropriate step command
-	switch params.Arguments.Mode {
+	switch params.Mode {
 	case "over":
 		stepSeq, err := ds.client.NextRequest(threadID)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		_ = stepSeq
 	case "in":
 		stepSeq, err := ds.client.StepInRequest(threadID)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		_ = stepSeq
 	case "out":
 		stepSeq, err := ds.client.StepOutRequest(threadID)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		_ = stepSeq
 	default:
-		return nil, fmt.Errorf("invalid step mode: %s (must be 'over', 'in', or 'out')", params.Arguments.Mode)
+		return nil, nil, fmt.Errorf("invalid step mode: %s (must be 'over', 'in', or 'out')", params.Mode)
 	}
 
 	// Wait for stopped or terminated event
 	for {
 		msg, err := ds.client.ReadMessage()
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		switch resp := msg.(type) {
 		case dap.ResponseMessage:
 			if !resp.GetResponse().Success {
-				return nil, fmt.Errorf("step failed: %s", resp.GetResponse().Message)
+				return nil, nil, fmt.Errorf("step failed: %s", resp.GetResponse().Message)
 			}
 		case *dap.StoppedEvent:
 			ds.stoppedThreadID = resp.Body.ThreadId
-			return ds.getFullContext(resp.Body.ThreadId, 0, 20)
+			result, err := ds.getFullContext(resp.Body.ThreadId, 0, 20)
+			return result, nil, err
 		case *dap.TerminatedEvent:
-			return &mcp.CallToolResultFor[any]{
+			return &mcp.CallToolResult{
 				Content: []mcp.Content{&mcp.TextContent{Text: "Program terminated"}},
-			}, nil
+			}, nil, nil
 		}
 	}
 }
 
 // getFullContext returns a complete context dump including location, stack trace, scopes, and variables.
-func (ds *debuggerSession) getFullContext(threadID, frameID, maxFrames int) (*mcp.CallToolResultFor[any], error) {
+func (ds *debuggerSession) getFullContext(threadID, frameID, maxFrames int) (*mcp.CallToolResult, error) {
 	if ds.client == nil {
 		return nil, fmt.Errorf("debugger not started")
 	}
@@ -1220,6 +1223,9 @@ func (ds *debuggerSession) getFullContext(threadID, frameID, maxFrames int) (*mc
 		if frame.Source != nil && frame.Source.Path != "" {
 			fmt.Fprintf(&result, " at %s:%d", frame.Source.Path, frame.Line)
 		}
+		if frame.InstructionPointerReference != "" {
+			fmt.Fprintf(&result, " [ip: %s]", frame.InstructionPointerReference)
+		}
 		if frame.PresentationHint == "subtle" {
 			result.WriteString(" (runtime)")
 		}
@@ -1237,7 +1243,7 @@ func (ds *debuggerSession) getFullContext(threadID, frameID, maxFrames int) (*mc
 	// Get scopes and variables
 	ds.writeScopesAndVariables(&result, targetFrameID)
 
-	return &mcp.CallToolResultFor[any]{
+	return &mcp.CallToolResult{
 		Content: []mcp.Content{&mcp.TextContent{Text: result.String()}},
 	}, nil
 }
@@ -1290,47 +1296,47 @@ func (ds *debuggerSession) writeScopesAndVariables(result *strings.Builder, fram
 }
 
 // breakpoint sets a breakpoint at the specified location.
-func (ds *debuggerSession) breakpoint(ctx context.Context, _ *mcp.ServerSession, params *mcp.CallToolParamsFor[BreakpointToolParams]) (*mcp.CallToolResultFor[any], error) {
+func (ds *debuggerSession) breakpoint(ctx context.Context, _ *mcp.CallToolRequest, params BreakpointToolParams) (*mcp.CallToolResult, any, error) {
 	ds.mu.Lock()
 	defer ds.mu.Unlock()
 	if ds.client == nil {
-		return nil, fmt.Errorf("debugger not started")
+		return nil, nil, fmt.Errorf("debugger not started")
 	}
 
-	if params.Arguments.Function != "" {
-		seq, err := ds.client.SetFunctionBreakpointsRequest([]string{params.Arguments.Function})
+	if params.Function != "" {
+		seq, err := ds.client.SetFunctionBreakpointsRequest([]string{params.Function})
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		if err := readAndValidateResponse(ds.client, seq, "unable to set function breakpoint"); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
-		return &mcp.CallToolResultFor[any]{
-			Content: []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf("Breakpoint set on function: %s", params.Arguments.Function)}},
-		}, nil
+		return &mcp.CallToolResult{
+			Content: []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf("Breakpoint set on function: %s", params.Function)}},
+		}, nil, nil
 	}
 
-	if params.Arguments.File == "" || params.Arguments.Line.Int() == 0 {
-		return nil, fmt.Errorf("either function or file+line is required")
+	if params.File == "" || params.Line.Int() == 0 {
+		return nil, nil, fmt.Errorf("either function or file+line is required")
 	}
 
-	bpSeq, err := ds.client.SetBreakpointsRequest(params.Arguments.File, []int{params.Arguments.Line.Int()})
+	bpSeq, err := ds.client.SetBreakpointsRequest(params.File, []int{params.Line.Int()})
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	resp, err := readTypedResponse[*dap.SetBreakpointsResponse](ds.client, bpSeq)
 	if err != nil {
-		return nil, fmt.Errorf("unable to set breakpoint: %w", err)
+		return nil, nil, fmt.Errorf("unable to set breakpoint: %w", err)
 	}
 	if len(resp.Body.Breakpoints) == 0 {
-		return nil, fmt.Errorf("no breakpoints returned")
+		return nil, nil, fmt.Errorf("no breakpoints returned")
 	}
 	bp := resp.Body.Breakpoints[0]
 	if !bp.Verified {
-		return nil, fmt.Errorf("breakpoint not verified: %s", bp.Message)
+		return nil, nil, fmt.Errorf("breakpoint not verified: %s", bp.Message)
 	}
-	return &mcp.CallToolResultFor[any]{
-		Content: []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf("Breakpoint %d set at %s:%d", bp.Id, params.Arguments.File, bp.Line)}},
-	}, nil
+	return &mcp.CallToolResult{
+		Content: []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf("Breakpoint %d set at %s:%d", bp.Id, params.File, bp.Line)}},
+	}, nil, nil
 }

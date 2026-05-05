@@ -3,3 +3,6 @@ bin/
 .serena/
 mcp-dap-server
 dist/
+testdata/**/*.dSYM/
+testdata/**/debugprog
+.claude
