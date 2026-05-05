@@ -44,7 +44,7 @@ func main() {
 
 	registerPrompts(server)
 
-	if err := server.Run(context.Background(), mcp.NewStdioTransport()); err != nil {
+	if err := server.Run(context.Background(), &mcp.StdioTransport{}); err != nil {
 		log.Fatalf("server error: %v", err)
 	}
 }

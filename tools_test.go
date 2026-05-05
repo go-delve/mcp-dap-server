@@ -76,7 +76,7 @@ func setupMCPServerAndClient(t *testing.T) *testSetup {
 	getServer := func(request *http.Request) *mcp.Server {
 		return server
 	}
-	sseHandler := mcp.NewSSEHandler(getServer)
+	sseHandler := mcp.NewSSEHandler(getServer, nil)
 	testServer := httptest.NewServer(sseHandler)
 
 	// Create MCP client
@@ -88,8 +88,8 @@ func setupMCPServerAndClient(t *testing.T) *testSetup {
 
 	// Connect client to server
 	ctx := context.Background()
-	transport := mcp.NewSSEClientTransport(testServer.URL, &mcp.SSEClientTransportOptions{})
-	session, err := client.Connect(ctx, transport)
+	transport := &mcp.SSEClientTransport{Endpoint: testServer.URL}
+	session, err := client.Connect(ctx, transport, nil)
 	if err != nil {
 		t.Fatalf("Failed to connect client to server: %v", err)
 	}
@@ -261,6 +261,7 @@ func compileTestCProgram(t *testing.T, cwd, name string) (binaryPath string, cle
 
 	cleanup = func() {
 		os.Remove(binaryPath)
+		os.RemoveAll(binaryPath + ".dSYM")
 	}
 
 	return binaryPath, cleanup
@@ -328,7 +329,7 @@ func TestBasic(t *testing.T) {
 		Name: "evaluate",
 		Arguments: map[string]any{
 			"expression": "greeting",
-			"frameID":    1000,
+			"frameId":    1000,
 			"context":    "repl",
 		},
 	})
@@ -432,7 +433,7 @@ func TestRestart(t *testing.T) {
 		Name: "evaluate",
 		Arguments: map[string]any{
 			"expression": "greeting",
-			"frameID":    1000,
+			"frameId":    1000,
 			"context":    "repl",
 		},
 	})
@@ -1450,56 +1451,35 @@ func TestDisassemble(t *testing.T) {
 
 	ts.startDebugSession(t, "0", binaryPath, nil)
 
-	// Hit a breakpoint so we're in a stopped state
-	f := filepath.Join(ts.cwd, "testdata", "go", "step", "main.go")
-	ts.setBreakpointAndContinue(t, f, 13)
+	// Disassemble main.main by function name via a breakpoint to get its address,
+	// then use the instruction pointer from the stopped frame.
+	text, isErr := ts.callTool(t, "breakpoint", map[string]any{
+		"function": "main.main",
+	})
+	if isErr {
+		t.Fatalf("Failed to set breakpoint on main.main: %s", text)
+	}
 
-	// Use evaluate to get the program counter via a runtime expression.
-	// Try multiple approaches to get a hex address for disassembly.
+	ts.callTool(t, "continue", map[string]any{})
+
+	contextStr := ts.getContextContent(t)
 	var addr string
-	expressions := []string{
-		"runtime.firstmoduledata.text",
-	}
-	for _, expr := range expressions {
-		addrText, isErr := ts.callTool(t, "evaluate", map[string]any{
-			"expression": expr,
-			"context":    "repl",
-		})
-		t.Logf("Evaluate %q: %s (isErr=%v)", expr, addrText, isErr)
-		if isErr {
-			continue
-		}
-		for _, word := range strings.Fields(addrText) {
-			if strings.HasPrefix(word, "0x") {
-				addr = word
+	for _, line := range strings.Split(contextStr, "\n") {
+		if idx := strings.Index(line, "[ip: "); idx >= 0 {
+			rest := line[idx+5:]
+			if end := strings.Index(rest, "]"); end >= 0 {
+				addr = rest[:end]
 				break
 			}
 		}
-		if addr != "" {
-			break
-		}
-		// Check if the result itself is a number we can use
-		addrText = strings.TrimSpace(addrText)
-		if len(addrText) > 0 && addrText[0] >= '0' && addrText[0] <= '9' {
-			// It's a numeric value — format as hex
-			addr = fmt.Sprintf("0x%x", func() int64 {
-				var n int64
-				fmt.Sscanf(addrText, "%d", &n)
-				return n
-			}())
-			if addr != "0x0" {
-				break
-			}
-			addr = ""
-		}
 	}
-
 	if addr == "" {
 		t.Skip("Could not determine instruction address for disassemble test")
 	}
+	t.Logf("Using instruction pointer address for main.main: %s", addr)
 
 	// Call disassemble with the address
-	text, isErr := ts.callTool(t, "disassemble", map[string]any{
+	text, isErr = ts.callTool(t, "disassemble", map[string]any{
 		"address": addr,
 		"count":   5,
 	})
