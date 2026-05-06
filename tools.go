@@ -41,7 +41,7 @@ func (ds *debuggerSession) defaultThreadID() int {
 	return 1
 }
 
-const debugToolDescription = `Start a complete debugging session. Returns full context at first breakpoint.
+const debugToolDescription = `Start a complete debugging session.
 
 Modes: 'source' (compile & debug), 'binary' (debug executable), 'core' (debug core dump), 'attach' (connect to process).
 
@@ -49,7 +49,9 @@ Debugger selection (via 'debugger' parameter):
 - 'delve' (default): For Go programs only. Requires dlv to be installed.
 - 'gdb': For C/C++/Rust and other compiled languages. Requires GDB 14+ with native DAP support (gdb -i dap). GDB does not support 'source' mode; compile your program with debug symbols (gcc -g -O0) and use 'binary' mode.
 
-Choose the debugger based on the language of the program being debugged: use 'delve' for Go, use 'gdb' for C/C++/Rust.`
+Choose the debugger based on the language of the program being debugged: use 'delve' for Go, use 'gdb' for C/C++/Rust.
+
+By default, when stopped at a breakpoint returns a compact stop summary (location only). Set fullContext: true only if you need variables immediately — leave it false unless you plan to call 'context' right after anyway.`
 
 // registerTools registers the debugger tools with the MCP server.
 // logWriter is used to redirect adapter stderr output; pass io.Discard to suppress.
@@ -116,13 +118,17 @@ Examples: {"file": "/path/to/main.go"} or {"all": true}`,
 	}, ds.clearBreakpoints)
 	mcp.AddTool(ds.server, &mcp.Tool{
 		Name: "continue",
-		Description: `Continue program execution until the next breakpoint or termination. Returns full context (location, stack trace, variables) when stopped.
+		Description: `Continue program execution until the next breakpoint or termination.
+
+By default returns a compact stop summary (location only). Set fullContext: true only if you need variables immediately — it saves a separate 'context' call but returns much more data. Leave fullContext false (the default) unless you know you need variables right away.
 
 Optionally specify 'to' for run-to-cursor: {"to": {"file": "/path/main.go", "line": 50}} or {"to": {"function": "main.Run"}}`,
 	}, ds.continueExecution)
 	mcp.AddTool(ds.server, &mcp.Tool{
 		Name: "step",
-		Description: `Step through code one line at a time. Returns full context (location, stack trace, variables) at the new location.
+		Description: `Step through code one line at a time.
+
+By default returns a compact stop summary (location only). Set fullContext: true only if you need variables immediately — it saves a separate 'context' call but returns much more data. Leave fullContext false (the default) unless you know you need variables right away.
 
 Modes: 'over' (execute current line, step over function calls), 'in' (step into function calls), 'out' (run until current function returns).`,
 	}, ds.step)
@@ -155,6 +161,7 @@ For GDB commands (e.g. print/x), use context 'repl': {"expression": "print/x var
 	if ds.capabilities.SupportsModulesRequest {
 		infoTypes += ", 'modules' (loaded modules/libraries)"
 	}
+	infoTypes += ", 'registers' (CPU register values at current frame, GDB only)"
 	infoDesc := fmt.Sprintf("List program metadata. Type: %s.", infoTypes)
 	mcp.AddTool(ds.server, &mcp.Tool{
 		Name:        "info",
@@ -218,6 +225,7 @@ type DebugParams struct {
 	GDBPath     string `json:"gdbPath,omitempty" mcp:"path to gdb binary (default: auto-detected from PATH). Requires GDB 14+."`
 	ProtocolLog string `json:"protocolLog,omitempty" mcp:"file path for protocol-level DAP message logging (what the MCP server sends/receives)"`
 	ToolLog     string `json:"toolLog,omitempty" mcp:"file path for tool-level DAP logging (native debugger logging, GDB only)"`
+	FullContext bool   `json:"fullContext,omitempty" mcp:"if true, return full context (stack trace and variables) when stopped at a breakpoint; if false (default), return a compact stop summary — leave false unless you need variables immediately"`
 }
 
 // ContextParams defines the parameters for getting debugging context.
@@ -229,13 +237,14 @@ type ContextParams struct {
 
 // StepParams defines the parameters for stepping through code.
 type StepParams struct {
-	Mode     string  `json:"mode" mcp:"'over' (next line), 'in' (into function), 'out' (out of function)"`
-	ThreadID FlexInt `json:"threadId,omitempty" mcp:"thread to step (default: current thread)"`
+	Mode        string  `json:"mode" mcp:"'over' (next line), 'in' (into function), 'out' (out of function)"`
+	ThreadID    FlexInt `json:"threadId,omitempty" mcp:"thread to step (default: current thread)"`
+	FullContext bool    `json:"fullContext,omitempty" mcp:"if true, return full context (stack trace and variables) when stopped; if false (default), return a compact stop summary — leave false unless you need variables immediately"`
 }
 
 // InfoParams defines parameters for getting program metadata.
 type InfoParams struct {
-	Type string `json:"type,omitempty" mcp:"'threads' (list threads), 'sources' (loaded source files, default), or 'modules' (loaded modules)"`
+	Type string `json:"type,omitempty" mcp:"'threads' (list threads), 'sources' (loaded source files), 'modules' (loaded modules), or 'registers' (CPU register values at current frame, GDB only)"`
 }
 
 // BreakpointToolParams defines parameters for setting a breakpoint.
@@ -367,8 +376,9 @@ func (ds *debuggerSession) clearBreakpoints(ctx context.Context, _ *mcp.CallTool
 
 // ContinueParams defines the parameters for continuing execution.
 type ContinueParams struct {
-	ThreadID FlexInt         `json:"threadId,omitempty" mcp:"thread to continue (default: all threads)"`
-	To       *BreakpointSpec `json:"to,omitempty" mcp:"location to run to (sets temporary breakpoint)"`
+	ThreadID    FlexInt         `json:"threadId,omitempty" mcp:"thread to continue (default: all threads)"`
+	To          *BreakpointSpec `json:"to,omitempty" mcp:"location to run to (sets temporary breakpoint)"`
+	FullContext bool            `json:"fullContext,omitempty" mcp:"if true, return full context (stack trace and variables) when stopped; if false (default), return a compact stop summary — leave false unless you need variables immediately"`
 }
 
 // continueExecution continues execution and returns full context when stopped.
@@ -423,7 +433,10 @@ func (ds *debuggerSession) continueExecution(ctx context.Context, _ *mcp.CallToo
 		case *dap.StoppedEvent:
 			ds.stoppedThreadID = resp.Body.ThreadId
 			result, err := ds.getFullContext(resp.Body.ThreadId, 0, 20)
-			return result, nil, err
+			if err != nil || params.FullContext {
+				return result, nil, err
+			}
+			return stopSummary(result, resp.Body.Reason), nil, nil
 		case *dap.TerminatedEvent:
 			return &mcp.CallToolResult{
 				Content: []mcp.Content{&mcp.TextContent{Text: "Program terminated"}},
@@ -660,8 +673,48 @@ func (ds *debuggerSession) info(ctx context.Context, _ *mcp.CallToolRequest, par
 			Content: []mcp.Content{&mcp.TextContent{Text: modules.String()}},
 		}, nil, nil
 
+	case "registers":
+		if ds.lastFrameID < 0 {
+			return nil, nil, fmt.Errorf("no frame available; call 'context' first to stop at a location")
+		}
+		scopesSeq, err := ds.client.ScopesRequest(ds.lastFrameID)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to get scopes: %w", err)
+		}
+		scopesResp, err := readTypedResponse[*dap.ScopesResponse](ds.client, scopesSeq)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to get scopes: %w", err)
+		}
+		for _, scope := range scopesResp.Body.Scopes {
+			if scope.Name != "Registers" {
+				continue
+			}
+			if scope.VariablesReference <= 0 {
+				return &mcp.CallToolResult{
+					Content: []mcp.Content{&mcp.TextContent{Text: "No registers available"}},
+				}, nil, nil
+			}
+			varSeq, err := ds.client.VariablesRequest(scope.VariablesReference)
+			if err != nil {
+				return nil, nil, fmt.Errorf("failed to get registers: %w", err)
+			}
+			varResp, err := readTypedResponse[*dap.VariablesResponse](ds.client, varSeq)
+			if err != nil {
+				return nil, nil, fmt.Errorf("failed to get registers: %w", err)
+			}
+			var regs strings.Builder
+			regs.WriteString("Registers:\n")
+			for _, v := range varResp.Body.Variables {
+				fmt.Fprintf(&regs, "  %s = %s\n", v.Name, v.Value)
+			}
+			return &mcp.CallToolResult{
+				Content: []mcp.Content{&mcp.TextContent{Text: regs.String()}},
+			}, nil, nil
+		}
+		return nil, nil, fmt.Errorf("registers not available (adapter did not report a Registers scope)")
+
 	default:
-		return nil, nil, fmt.Errorf("invalid type: %s (must be 'threads', 'sources', or 'modules')", infoType)
+		return nil, nil, fmt.Errorf("invalid type: %s (must be 'threads', 'sources', 'modules', or 'registers')", infoType)
 	}
 }
 
@@ -1022,7 +1075,10 @@ initialized:
 					ds.stoppedThreadID = 1
 				}
 				result, err := ds.getFullContext(ds.stoppedThreadID, 0, 20)
-				return result, nil, err
+				if err != nil || params.FullContext {
+					return result, nil, err
+				}
+				return stopSummary(result, ev.Body.Reason), nil, nil
 			case dap.EventMessage:
 				continue
 			}
@@ -1067,9 +1123,11 @@ initialized:
 		if stoppedThreadID == 0 {
 			stoppedThreadID = 1
 		}
-		// Return full context when stopped at breakpoint
 		result, err := ds.getFullContext(stoppedThreadID, 0, 20)
-		return result, nil, err
+		if err != nil || params.FullContext {
+			return result, nil, err
+		}
+		return stopSummary(result, "breakpoint"), nil, nil
 	}
 
 	// Return simple success message when stopped on entry.
@@ -1177,7 +1235,10 @@ func (ds *debuggerSession) step(ctx context.Context, _ *mcp.CallToolRequest, par
 		case *dap.StoppedEvent:
 			ds.stoppedThreadID = resp.Body.ThreadId
 			result, err := ds.getFullContext(resp.Body.ThreadId, 0, 20)
-			return result, nil, err
+			if err != nil || params.FullContext {
+				return result, nil, err
+			}
+			return stopSummary(result, resp.Body.Reason), nil, nil
 		case *dap.TerminatedEvent:
 			return &mcp.CallToolResult{
 				Content: []mcp.Content{&mcp.TextContent{Text: "Program terminated"}},
@@ -1248,6 +1309,30 @@ func (ds *debuggerSession) getFullContext(threadID, frameID, maxFrames int) (*mc
 	}, nil
 }
 
+// stopSummary extracts a compact stop message from a full context result,
+// showing just the current location and a prompt to call 'context'.
+func stopSummary(full *mcp.CallToolResult, reason string) *mcp.CallToolResult {
+	text := ""
+	if len(full.Content) > 0 {
+		if tc, ok := full.Content[0].(*mcp.TextContent); ok {
+			text = tc.Text
+		}
+	}
+	var summary strings.Builder
+	if reason != "" {
+		fmt.Fprintf(&summary, "Stopped: %s\n", reason)
+	}
+	for _, line := range strings.Split(text, "\n") {
+		if strings.HasPrefix(line, "Function:") || strings.HasPrefix(line, "File:") {
+			summary.WriteString(line + "\n")
+		}
+	}
+	summary.WriteString("Call 'context' to inspect stack trace and variables.")
+	return &mcp.CallToolResult{
+		Content: []mcp.Content{&mcp.TextContent{Text: summary.String()}},
+	}
+}
+
 // writeScopesAndVariables fetches scopes and their variables for the given
 // frame and writes them to the result builder. Errors are written inline
 // rather than propagated, since partial context is better than none.
@@ -1271,6 +1356,9 @@ func (ds *debuggerSession) writeScopesAndVariables(result *strings.Builder, fram
 
 	result.WriteString("## Variables\n")
 	for _, scope := range scopes {
+		if scope.Name == "Registers" {
+			continue
+		}
 		fmt.Fprintf(result, "### %s\n", scope.Name)
 		if scope.VariablesReference <= 0 {
 			continue
