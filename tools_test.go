@@ -371,9 +371,6 @@ func TestBasic(t *testing.T) {
 }
 
 func TestRestart(t *testing.T) {
-	if os.Getenv("GITHUB_ACTIONS") == "true" {
-		t.Skip("Skipping test in Github CI: relies on unreleased feature of Delve DAP server.")
-	}
 	// Setup test infrastructure
 	ts := setupMCPServerAndClient(t)
 	defer ts.cleanup()
@@ -499,6 +496,10 @@ func TestContext(t *testing.T) {
 		t.Errorf("Expected context to contain 'greeting' variable, got: %s", contextStr)
 	}
 
+	if !strings.Contains(contextStr, `"hello, world"`) {
+		t.Errorf("Expected context to contain greeting value 'hello, world', got: %s", contextStr)
+	}
+
 	// Stop debugger
 	ts.stopDebugger(t)
 }
@@ -529,9 +530,12 @@ func TestVariables(t *testing.T) {
 		t.Errorf("Expected to be in processCollection function")
 	}
 
-	// Verify collection parameters and locals
+	// Verify collection parameters and locals (names and values)
 	if !strings.Contains(contextStr, "nums") {
 		t.Errorf("Expected to find parameter 'nums' (slice)")
+	}
+	if !strings.Contains(contextStr, "len: 5") {
+		t.Errorf("Expected nums slice to have len: 5, got: %s", contextStr)
 	}
 	if !strings.Contains(contextStr, "dict") {
 		t.Errorf("Expected to find parameter 'dict' (map)")
@@ -539,8 +543,14 @@ func TestVariables(t *testing.T) {
 	if !strings.Contains(contextStr, "sum") {
 		t.Errorf("Expected to find local variable 'sum'")
 	}
+	if !strings.Contains(contextStr, "= 15") {
+		t.Errorf("Expected sum to equal 15, got: %s", contextStr)
+	}
 	if !strings.Contains(contextStr, "count") {
 		t.Errorf("Expected to find local variable 'count'")
+	}
+	if !strings.Contains(contextStr, "= 3") {
+		t.Errorf("Expected count to equal 3, got: %s", contextStr)
 	}
 
 	// Stop debugger
