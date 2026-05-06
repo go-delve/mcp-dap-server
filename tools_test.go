@@ -1595,10 +1595,11 @@ func TestStepIn(t *testing.T) {
 	f := filepath.Join(ts.cwd, "testdata", "go", "step", "main.go")
 	ts.setBreakpointAndContinue(t, f, 16)
 
-	// Step in — should step into fmt.Sprintf
+	// Step in — should step into fmt.Sprintf; fullContext needed to check function name
 	text, isErr := ts.callTool(t, "step", map[string]any{
-		"mode":     "in",
-		"threadId": 1,
+		"mode":        "in",
+		"threadId":    1,
+		"fullContext": true,
 	})
 	if isErr {
 		t.Fatalf("step in returned error: %s", text)
