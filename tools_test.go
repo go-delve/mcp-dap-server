@@ -207,14 +207,14 @@ func (ts *testSetup) getContextContent(t *testing.T) string {
 	}
 
 	// Extract context content
-	contextStr := ""
+	var contextStr strings.Builder
 	for _, content := range contextResult.Content {
 		if textContent, ok := content.(*mcp.TextContent); ok {
-			contextStr += textContent.Text
+			contextStr.WriteString(textContent.Text)
 		}
 	}
 
-	return contextStr
+	return contextStr.String()
 }
 
 // stopDebugger stops the debugger
@@ -355,15 +355,15 @@ func TestBasic(t *testing.T) {
 	}
 
 	// Check if the result contains "hello, world"
-	resultStr := ""
+	var resultStr strings.Builder
 	for _, content := range evaluateResult.Content {
 		if textContent, ok := content.(*mcp.TextContent); ok {
-			resultStr += textContent.Text
+			resultStr.WriteString(textContent.Text)
 		}
 	}
 
-	if !strings.Contains(resultStr, "hello, world") {
-		t.Errorf("Expected evaluation to contain 'hello, world', got: %s", resultStr)
+	if !strings.Contains(resultStr.String(), "hello, world") {
+		t.Errorf("Expected evaluation to contain 'hello, world', got: %s", resultStr.String())
 	}
 
 	// Stop debugger
@@ -440,15 +440,15 @@ func TestRestart(t *testing.T) {
 	t.Logf("Evaluate after restart result: %v", evaluateResult2)
 
 	// Verify the evaluation result still contains "hello, world"
-	resultStr := ""
+	var resultStr strings.Builder
 	for _, content := range evaluateResult2.Content {
 		if textContent, ok := content.(*mcp.TextContent); ok {
-			resultStr += textContent.Text
+			resultStr.WriteString(textContent.Text)
 		}
 	}
 
-	if !strings.Contains(resultStr, "hello me, its me again") {
-		t.Errorf("Expected evaluation after restart to contain 'hello me, its me again', got: %s", resultStr)
+	if !strings.Contains(resultStr.String(), "hello me, its me again") {
+		t.Errorf("Expected evaluation after restart to contain 'hello me, its me again', got: %s", resultStr.String())
 	}
 
 	// Stop debugger
@@ -995,14 +995,14 @@ func TestGDBEvaluate(t *testing.T) {
 	}
 	t.Logf("Evaluate result: %v", evalResult)
 
-	resultStr := ""
+	var resultStr strings.Builder
 	for _, content := range evalResult.Content {
 		if tc, ok := content.(*mcp.TextContent); ok {
-			resultStr += tc.Text
+			resultStr.WriteString(tc.Text)
 		}
 	}
-	if !strings.Contains(resultStr, "30") {
-		t.Errorf("Expected evaluation to contain '30', got: %s", resultStr)
+	if !strings.Contains(resultStr.String(), "30") {
+		t.Errorf("Expected evaluation to contain '30', got: %s", resultStr.String())
 	}
 
 	ts.stopDebugger(t)
@@ -1342,13 +1342,13 @@ func (ts *testSetup) callTool(t *testing.T, name string, args map[string]any) (s
 	if err != nil {
 		t.Fatalf("Failed to call tool %s: %v", name, err)
 	}
-	var text string
+	var text strings.Builder
 	for _, content := range result.Content {
 		if tc, ok := content.(*mcp.TextContent); ok {
-			text += tc.Text
+			text.WriteString(tc.Text)
 		}
 	}
-	return text, result.IsError
+	return text.String(), result.IsError
 }
 
 func TestClearBreakpoints(t *testing.T) {
@@ -1474,11 +1474,11 @@ func TestDisassemble(t *testing.T) {
 
 	contextStr := ts.getContextContent(t)
 	var addr string
-	for _, line := range strings.Split(contextStr, "\n") {
-		if idx := strings.Index(line, "[ip: "); idx >= 0 {
-			rest := line[idx+5:]
-			if end := strings.Index(rest, "]"); end >= 0 {
-				addr = rest[:end]
+	for line := range strings.SplitSeq(contextStr, "\n") {
+		if _, after, ok := strings.Cut(line, "[ip: "); ok {
+			rest := after
+			if before, _, ok := strings.Cut(rest, "]"); ok {
+				addr = before
 				break
 			}
 		}
