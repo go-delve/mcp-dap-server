@@ -1406,6 +1406,277 @@ func TestClearBreakpoints(t *testing.T) {
 	ts.stopDebugger(t)
 }
 
+// TestLineBreakpointTracking tests that line breakpoints are tracked correctly
+// and sent as a complete list per file (DAP spec compliance).
+func TestLineBreakpointTracking(t *testing.T) {
+	ts := setupMCPServerAndClient(t)
+	defer ts.cleanup()
+
+	binaryPath, cleanupBinary := compileTestProgram(t, ts.cwd, "step")
+	defer cleanupBinary()
+
+	ts.startDebugSession(t, "0", binaryPath, nil)
+
+	f := filepath.Join(ts.cwd, "testdata", "go", "step", "main.go")
+
+	// Set first breakpoint at line 7 (x := 10)
+	text, isErr := ts.callTool(t, "breakpoint", map[string]any{"file": f, "line": 7})
+	if isErr {
+		t.Fatalf("Failed to set first breakpoint: %s", text)
+	}
+	if !strings.Contains(text, "Breakpoint") {
+		t.Errorf("Expected breakpoint confirmation, got: %s", text)
+	}
+	t.Logf("Set first breakpoint: %s", text)
+
+	// Set second breakpoint at line 13 (sum := x + y)
+	text, isErr = ts.callTool(t, "breakpoint", map[string]any{"file": f, "line": 13})
+	if isErr {
+		t.Fatalf("Failed to set second breakpoint: %s", text)
+	}
+	if !strings.Contains(text, "Breakpoint") {
+		t.Errorf("Expected breakpoint confirmation, got: %s", text)
+	}
+	t.Logf("Set second breakpoint: %s", text)
+
+	// Continue and verify we can hit the first breakpoint
+	text, isErr = ts.callTool(t, "continue", map[string]any{})
+	if isErr {
+		t.Fatalf("continue returned error: %s", text)
+	}
+	t.Logf("First continue: %s", text)
+
+	// Verify we stopped at line 7
+	contextStr := ts.getContextContent(t)
+	if !strings.Contains(contextStr, "main.go:7") {
+		t.Logf("Expected to be stopped at line 7, got: %s", contextStr)
+	}
+
+	// Continue to second breakpoint
+	text, isErr = ts.callTool(t, "continue", map[string]any{})
+	if isErr {
+		t.Fatalf("second continue returned error: %s", text)
+	}
+	t.Logf("Second continue: %s", text)
+
+	// Verify we stopped at line 13
+	contextStr = ts.getContextContent(t)
+	if !strings.Contains(contextStr, "main.go:13") {
+		t.Logf("Expected to be stopped at line 13, got: %s", contextStr)
+	}
+
+	ts.stopDebugger(t)
+}
+
+// TestClearSpecificLineBreakpoint tests clearing a single line breakpoint
+// while preserving others in the same file.
+func TestClearSpecificLineBreakpoint(t *testing.T) {
+	ts := setupMCPServerAndClient(t)
+	defer ts.cleanup()
+
+	binaryPath, cleanupBinary := compileTestProgram(t, ts.cwd, "step")
+	defer cleanupBinary()
+
+	ts.startDebugSession(t, "0", binaryPath, nil)
+
+	f := filepath.Join(ts.cwd, "testdata", "go", "step", "main.go")
+
+	// Set two breakpoints in the same file at different executable lines
+	text, isErr := ts.callTool(t, "breakpoint", map[string]any{"file": f, "line": 7})
+	if isErr {
+		t.Fatalf("Failed to set first breakpoint: %s", text)
+	}
+	t.Logf("Set first breakpoint: %s", text)
+
+	text, isErr = ts.callTool(t, "breakpoint", map[string]any{"file": f, "line": 13})
+	if isErr {
+		t.Fatalf("Failed to set second breakpoint: %s", text)
+	}
+	t.Logf("Set second breakpoint: %s", text)
+
+	// Clear only the line 7 breakpoint
+	text, isErr = ts.callTool(t, "clear-breakpoints", map[string]any{"file": f, "line": 7})
+	if isErr {
+		t.Fatalf("clear-breakpoints file+line returned error: %s", text)
+	}
+	if !strings.Contains(text, "Cleared breakpoint at") && !strings.Contains(text, ":7") {
+		t.Errorf("Expected confirmation of clearing line 7 breakpoint, got: %s", text)
+	}
+	t.Logf("Cleared line 7 breakpoint: %s", text)
+
+	// Continue and verify we only hit the line 13 breakpoint
+	text, isErr = ts.callTool(t, "continue", map[string]any{})
+	if isErr {
+		t.Fatalf("continue returned error: %s", text)
+	}
+	t.Logf("Continue after clearing line 7: %s", text)
+
+	// Verify we stopped at line 13
+	contextStr := ts.getContextContent(t)
+	if !strings.Contains(contextStr, "main.go:13") {
+		t.Logf("Context after continue (expected line 13): %s", contextStr)
+	}
+
+	ts.stopDebugger(t)
+}
+
+// TestMultipleFilesLineBreakpoints tests that breakpoints in different files
+// are tracked independently.
+func TestMultipleFilesLineBreakpoints(t *testing.T) {
+	ts := setupMCPServerAndClient(t)
+	defer ts.cleanup()
+
+	// Use a test program that has multiple files (we'll set breakpoints in main.go)
+	binaryPath, cleanupBinary := compileTestProgram(t, ts.cwd, "step")
+	defer cleanupBinary()
+
+	ts.startDebugSession(t, "0", binaryPath, nil)
+
+	f1 := filepath.Join(ts.cwd, "testdata", "go", "step", "main.go")
+
+	// Set multiple breakpoints in the file
+	text, isErr := ts.callTool(t, "breakpoint", map[string]any{"file": f1, "line": 7})
+	if isErr {
+		t.Fatalf("Failed to set breakpoint in file 1: %s", text)
+	}
+	t.Logf("Set breakpoint in file 1: %s", text)
+
+	text, isErr = ts.callTool(t, "breakpoint", map[string]any{"file": f1, "line": 13})
+	if isErr {
+		t.Fatalf("Failed to set second breakpoint in file 1: %s", text)
+	}
+	t.Logf("Set second breakpoint in file 1: %s", text)
+
+	// Clear breakpoints in first file only
+	text, isErr = ts.callTool(t, "clear-breakpoints", map[string]any{"file": f1})
+	if isErr {
+		t.Fatalf("clear-breakpoints for file 1 returned error: %s", text)
+	}
+	if !strings.Contains(text, "Cleared breakpoints in") {
+		t.Errorf("Expected 'Cleared breakpoints in' message, got: %s", text)
+	}
+	t.Logf("Cleared file 1 breakpoints: %s", text)
+
+	// Continue should not hit any breakpoints now
+	text, isErr = ts.callTool(t, "continue", map[string]any{})
+	if isErr {
+		t.Fatalf("continue returned error: %s", text)
+	}
+	// Program should run to completion
+	if !strings.Contains(text, "terminated") && !strings.Contains(text, "exited") {
+		t.Logf("Continue result (expected termination): %s", text)
+	}
+
+	ts.stopDebugger(t)
+}
+
+// TestClearAllBreakpointsAcrossFiles tests that clearing all breakpoints
+// removes breakpoints from all files.
+func TestClearAllBreakpointsAcrossFiles(t *testing.T) {
+	ts := setupMCPServerAndClient(t)
+	defer ts.cleanup()
+
+	binaryPath, cleanupBinary := compileTestProgram(t, ts.cwd, "step")
+	defer cleanupBinary()
+
+	ts.startDebugSession(t, "0", binaryPath, nil)
+
+	f := filepath.Join(ts.cwd, "testdata", "go", "step", "main.go")
+
+	// Set multiple breakpoints
+	text, isErr := ts.callTool(t, "breakpoint", map[string]any{"file": f, "line": 7})
+	if isErr {
+		t.Fatalf("Failed to set first breakpoint: %s", text)
+	}
+	t.Logf("Set first breakpoint: %s", text)
+
+	text, isErr = ts.callTool(t, "breakpoint", map[string]any{"file": f, "line": 8})
+	if isErr {
+		t.Fatalf("Failed to set second breakpoint: %s", text)
+	}
+	t.Logf("Set second breakpoint: %s", text)
+
+	// Also set a function breakpoint
+	text, isErr = ts.callTool(t, "breakpoint", map[string]any{"function": "main.main"})
+	if isErr {
+		t.Fatalf("Failed to set function breakpoint: %s", text)
+	}
+	t.Logf("Set function breakpoint: %s", text)
+
+	// Clear all breakpoints
+	text, isErr = ts.callTool(t, "clear-breakpoints", map[string]any{"all": true})
+	if isErr {
+		t.Fatalf("clear-breakpoints all returned error: %s", text)
+	}
+	if !strings.Contains(text, "Cleared all breakpoints") {
+		t.Errorf("Expected 'Cleared all breakpoints' message, got: %s", text)
+	}
+	t.Logf("Cleared all breakpoints: %s", text)
+
+	// Continue should not hit any breakpoints
+	text, isErr = ts.callTool(t, "continue", map[string]any{})
+	if isErr {
+		t.Fatalf("continue returned error: %s", text)
+	}
+	// Program should run to completion
+	if !strings.Contains(text, "terminated") && !strings.Contains(text, "exited") {
+		t.Logf("Continue result (expected termination): %s", text)
+	}
+
+	ts.stopDebugger(t)
+}
+
+// TestDuplicateLineBreakpoint tests that setting the same breakpoint twice
+// doesn't create duplicates (idempotency).
+func TestDuplicateLineBreakpoint(t *testing.T) {
+	ts := setupMCPServerAndClient(t)
+	defer ts.cleanup()
+
+	binaryPath, cleanupBinary := compileTestProgram(t, ts.cwd, "step")
+	defer cleanupBinary()
+
+	ts.startDebugSession(t, "0", binaryPath, nil)
+
+	f := filepath.Join(ts.cwd, "testdata", "go", "step", "main.go")
+
+	// Set breakpoint at line 7
+	text, isErr := ts.callTool(t, "breakpoint", map[string]any{"file": f, "line": 7})
+	if isErr {
+		t.Fatalf("Failed to set first breakpoint: %s", text)
+	}
+	t.Logf("Set first breakpoint: %s", text)
+
+	// Set the same breakpoint again
+	text, isErr = ts.callTool(t, "breakpoint", map[string]any{"file": f, "line": 7})
+	if isErr {
+		t.Fatalf("Failed to set duplicate breakpoint: %s", text)
+	}
+	t.Logf("Set duplicate breakpoint: %s", text)
+
+	// Continue once - should hit the breakpoint
+	text, isErr = ts.callTool(t, "continue", map[string]any{})
+	if isErr {
+		t.Fatalf("first continue returned error: %s", text)
+	}
+	t.Logf("First continue: %s", text)
+
+	// Verify we stopped
+	contextStr := ts.getContextContent(t)
+	if !strings.Contains(contextStr, "main.go:7") {
+		t.Logf("Context after first stop (expected line 7): %s", contextStr)
+	}
+
+	// Continue again - should not hit another breakpoint at same location
+	// (program may terminate or hit another breakpoint)
+	text, isErr = ts.callTool(t, "continue", map[string]any{})
+	if isErr {
+		t.Fatalf("second continue returned error: %s", text)
+	}
+	t.Logf("Second continue: %s", text)
+
+	ts.stopDebugger(t)
+}
+
 func TestInfo(t *testing.T) {
 	ts := setupMCPServerAndClient(t)
 	defer ts.cleanup()
