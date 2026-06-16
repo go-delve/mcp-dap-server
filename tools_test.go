@@ -1590,7 +1590,7 @@ func TestClearAllBreakpointsAcrossFiles(t *testing.T) {
 	}
 	t.Logf("Set first breakpoint: %s", text)
 
-	text, isErr = ts.callTool(t, "breakpoint", map[string]any{"file": f, "line": 8})
+	text, isErr = ts.callTool(t, "breakpoint", map[string]any{"file": f, "line": 10})
 	if isErr {
 		t.Fatalf("Failed to set second breakpoint: %s", text)
 	}
@@ -1673,6 +1673,72 @@ func TestDuplicateLineBreakpoint(t *testing.T) {
 		t.Fatalf("second continue returned error: %s", text)
 	}
 	t.Logf("Second continue: %s", text)
+
+	ts.stopDebugger(t)
+}
+
+// TestRunToCursorCleansUpBreakpoint verifies that a run-to-cursor breakpoint
+// is removed after the program stops, so it doesn't trigger on subsequent continues.
+func TestRunToCursorCleansUpBreakpoint(t *testing.T) {
+	ts := setupMCPServerAndClient(t)
+	defer ts.cleanup()
+
+	binaryPath, cleanupBinary := compileTestProgram(t, ts.cwd, "step")
+	defer cleanupBinary()
+
+	ts.startDebugSession(t, "0", binaryPath, nil)
+
+	f := filepath.Join(ts.cwd, "testdata", "go", "step", "main.go")
+
+	// Set a persistent breakpoint at line 7 (x := 10)
+	text, isErr := ts.callTool(t, "breakpoint", map[string]any{"file": f, "line": 7})
+	if isErr {
+		t.Fatalf("Failed to set breakpoint: %s", text)
+	}
+	t.Logf("Set breakpoint at line 7: %s", text)
+
+	// Continue to hit the breakpoint at line 7
+	text, isErr = ts.callTool(t, "continue", map[string]any{})
+	if isErr {
+		t.Fatalf("continue returned error: %s", text)
+	}
+	contextStr := ts.getContextContent(t)
+	if !strings.Contains(contextStr, "main.go:7") {
+		t.Fatalf("Expected to be stopped at line 7, got: %s", contextStr)
+	}
+	t.Logf("Stopped at line 7")
+
+	// Run-to-cursor to line 13 (sum := x + y) — this should set a temporary breakpoint
+	text, isErr = ts.callTool(t, "continue", map[string]any{
+		"to": map[string]any{"file": f, "line": 13},
+	})
+	if isErr {
+		t.Fatalf("run-to-cursor returned error: %s", text)
+	}
+	contextStr = ts.getContextContent(t)
+	if !strings.Contains(contextStr, "main.go:13") {
+		t.Fatalf("Expected to be stopped at line 13, got: %s", contextStr)
+	}
+	t.Logf("Run-to-cursor stopped at line 13")
+
+	// Now clear the persistent breakpoint at line 7
+	text, isErr = ts.callTool(t, "clear-breakpoints", map[string]any{"file": f, "line": 7})
+	if isErr {
+		t.Fatalf("clear-breakpoints returned error: %s", text)
+	}
+	t.Logf("Cleared persistent breakpoint at line 7: %s", text)
+
+	// Continue — if the run-to-cursor breakpoint at line 13 was properly cleaned up,
+	// the program should run to completion. If it wasn't cleaned up, we'd stop at
+	// line 13 again (which would be wrong).
+	text, isErr = ts.callTool(t, "continue", map[string]any{})
+	if isErr {
+		t.Fatalf("final continue returned error: %s", text)
+	}
+	if !strings.Contains(text, "terminated") && !strings.Contains(text, "exited") {
+		t.Errorf("Expected program to terminate (run-to-cursor breakpoint should have been cleaned up), got: %s", text)
+	}
+	t.Logf("Final continue result: %s", text)
 
 	ts.stopDebugger(t)
 }
