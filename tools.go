@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"slices"
 	"strings"
 	"sync"
 
@@ -16,20 +17,22 @@ import (
 )
 
 type debuggerSession struct {
-	mu              sync.Mutex       // serializes DAP requests to prevent concurrent read races
-	cmd             *exec.Cmd
-	client          *DAPClient
-	server          *mcp.Server      // MCP server for dynamic tool registration
-	logWriter       io.Writer        // writer for adapter stderr (log file or io.Discard)
-	backend         DebuggerBackend  // debugger-specific backend (delve, gdb, etc.)
-	capabilities    dap.Capabilities // capabilities reported by DAP server
-	launchMode      string           // "source", "binary", "core", or "attach"
-	programPath     string           // path to program being debugged
-	programArgs     []string         // command line arguments
-	coreFilePath    string           // path to core dump file (core mode only)
-	stoppedThreadID int              // thread ID from last StoppedEvent (for adapters that use non-sequential IDs)
-	lastFrameID     int              // frame ID from last getFullContext; -1 means not set (0 is valid for GDB)
-	protocolLogFile *os.File         // protocol log file (closed on cleanup)
+	mu                  sync.Mutex // serializes DAP requests to prevent concurrent read races
+	cmd                 *exec.Cmd
+	client              *DAPClient
+	server              *mcp.Server      // MCP server for dynamic tool registration
+	logWriter           io.Writer        // writer for adapter stderr (log file or io.Discard)
+	backend             DebuggerBackend  // debugger-specific backend (delve, gdb, etc.)
+	capabilities        dap.Capabilities // capabilities reported by DAP server
+	launchMode          string           // "source", "binary", "core", or "attach"
+	programPath         string           // path to program being debugged
+	programArgs         []string         // command line arguments
+	coreFilePath        string           // path to core dump file (core mode only)
+	stoppedThreadID     int              // thread ID from last StoppedEvent (for adapters that use non-sequential IDs)
+	lastFrameID         int              // frame ID from last getFullContext; -1 means not set (0 is valid for GDB)
+	protocolLogFile     *os.File         // protocol log file (closed on cleanup)
+	functionBreakpoints []string         // tracked function breakpoints (DAP replaces all on each request)
+	lineBreakpoints     map[string][]int // tracked line breakpoints per file (DAP replaces all on each setBreakpoints call)
 }
 
 // defaultThreadID returns the thread ID to use when none is specified.
@@ -39,6 +42,107 @@ func (ds *debuggerSession) defaultThreadID() int {
 		return ds.stoppedThreadID
 	}
 	return 1
+}
+
+// addFunctionBreakpoint appends a function breakpoint (if not already tracked)
+// and sends the full list to the DAP server. Caller must hold ds.mu.
+// Returns (seq, alreadyExists, error). When alreadyExists is true, no DAP
+// request was sent and seq is 0.
+func (ds *debuggerSession) addFunctionBreakpoint(name string) (int, bool, error) {
+	if slices.Contains(ds.functionBreakpoints, name) {
+		return 0, true, nil
+	}
+	ds.functionBreakpoints = append(ds.functionBreakpoints, name)
+	seq, err := ds.client.SetFunctionBreakpointsRequest(ds.functionBreakpoints)
+	if err != nil {
+		ds.functionBreakpoints = ds.functionBreakpoints[:len(ds.functionBreakpoints)-1]
+		return 0, false, err
+	}
+	return seq, false, nil
+}
+
+// removeFunctionBreakpoint removes a function breakpoint by name
+// and sends the updated list to the DAP server. Caller must hold ds.mu.
+func (ds *debuggerSession) removeFunctionBreakpoint(name string) (int, error) {
+	ds.functionBreakpoints = slices.DeleteFunc(ds.functionBreakpoints, func(fn string) bool {
+		return fn == name
+	})
+	return ds.client.SetFunctionBreakpointsRequest(ds.functionBreakpoints)
+}
+
+// clearFunctionBreakpoints removes all tracked function breakpoints
+// and sends an empty list to the DAP server. Caller must hold ds.mu.
+func (ds *debuggerSession) clearFunctionBreakpoints() (int, error) {
+	ds.functionBreakpoints = nil
+	return ds.client.SetFunctionBreakpointsRequest([]string{})
+}
+
+// addLineBreakpoint adds a line breakpoint for the given file and sends the
+// full list for that file to the DAP server. Caller must hold ds.mu.
+// Returns (seq, alreadyExists, error). When alreadyExists is true, no DAP
+// request was sent and seq is 0.
+func (ds *debuggerSession) addLineBreakpoint(file string, line int) (int, bool, error) {
+	if ds.lineBreakpoints == nil {
+		ds.lineBreakpoints = make(map[string][]int)
+	}
+	lines := ds.lineBreakpoints[file]
+	if slices.Contains(lines, line) {
+		return 0, true, nil
+	}
+	lines = append(lines, line)
+	ds.lineBreakpoints[file] = lines
+	seq, err := ds.client.SetBreakpointsRequest(file, ds.lineBreakpoints[file])
+	if err != nil {
+		// Roll back: remove the line we just appended
+		ds.lineBreakpoints[file] = ds.lineBreakpoints[file][:len(ds.lineBreakpoints[file])-1]
+		if len(ds.lineBreakpoints[file]) == 0 {
+			delete(ds.lineBreakpoints, file)
+		}
+		return 0, false, err
+	}
+	return seq, false, nil
+}
+
+// removeLineBreakpoint removes a line breakpoint for the given file and sends
+// the updated list to the DAP server. Caller must hold ds.mu.
+func (ds *debuggerSession) removeLineBreakpoint(file string, line int) (int, error) {
+	if ds.lineBreakpoints != nil {
+		ds.lineBreakpoints[file] = slices.DeleteFunc(ds.lineBreakpoints[file], func(l int) bool {
+			return l == line
+		})
+		if len(ds.lineBreakpoints[file]) == 0 {
+			delete(ds.lineBreakpoints, file)
+		}
+	}
+	return ds.client.SetBreakpointsRequest(file, ds.lineBreakpoints[file])
+}
+
+// clearLineBreakpoints removes all tracked line breakpoints for a file and
+// sends an empty list to the DAP server. Caller must hold ds.mu.
+func (ds *debuggerSession) clearLineBreakpoints(file string) (int, error) {
+	if ds.lineBreakpoints != nil {
+		delete(ds.lineBreakpoints, file)
+	}
+	return ds.client.SetBreakpointsRequest(file, []int{})
+}
+
+// clearAllLineBreakpoints removes all tracked line breakpoints across all files.
+// Caller must hold ds.mu.
+func (ds *debuggerSession) clearAllLineBreakpoints() error {
+	if ds.lineBreakpoints == nil {
+		return nil
+	}
+	for file := range ds.lineBreakpoints {
+		seq, err := ds.client.SetBreakpointsRequest(file, []int{})
+		if err != nil {
+			return err
+		}
+		if err := readAndValidateResponse(ds.client, seq, "unable to clear breakpoints"); err != nil {
+			return err
+		}
+	}
+	ds.lineBreakpoints = nil
+	return nil
 }
 
 const debugToolDescription = `Start a complete debugging session.
@@ -112,9 +216,9 @@ Examples: {"file": "/path/to/main.go", "line": 42} or {"function": "main.process
 	}, ds.breakpoint)
 	mcp.AddTool(ds.server, &mcp.Tool{
 		Name: "clear-breakpoints",
-		Description: `Remove breakpoints. Provide 'file' to clear breakpoints in a specific file, or 'all': true to clear all breakpoints.
+		Description: `Remove breakpoints. Provide 'file' to clear all breakpoints in a file, 'file'+'line' to clear a specific line breakpoint, 'function' to clear a function breakpoint, or 'all': true to clear all breakpoints.
 
-Examples: {"file": "/path/to/main.go"} or {"all": true}`,
+Examples: {"file": "/path/to/main.go"} or {"file": "/path/to/main.go", "line": 42} or {"function": "main.processData"} or {"all": true}`,
 	}, ds.clearBreakpoints)
 	mcp.AddTool(ds.server, &mcp.Tool{
 		Name: "continue",
@@ -221,11 +325,11 @@ type DebugParams struct {
 	Breakpoints  []BreakpointSpec `json:"breakpoints,omitempty" mcp:"initial breakpoints"`
 	StopOnEntry  bool             `json:"stopOnEntry,omitempty" mcp:"stop at program entry instead of running to first breakpoint"`
 	Port         string           `json:"port,omitempty" mcp:"port for DAP server (default: auto-assigned)"`
-	Debugger    string `json:"debugger,omitempty" mcp:"debugger to use: 'delve' (default) or 'gdb'"`
-	GDBPath     string `json:"gdbPath,omitempty" mcp:"path to gdb binary (default: auto-detected from PATH). Requires GDB 14+."`
-	ProtocolLog string `json:"protocolLog,omitempty" mcp:"file path for protocol-level DAP message logging (what the MCP server sends/receives)"`
-	ToolLog     string `json:"toolLog,omitempty" mcp:"file path for tool-level DAP logging (native debugger logging, GDB only)"`
-	FullContext bool   `json:"fullContext,omitempty" mcp:"if true, return full context (stack trace and variables) when stopped at a breakpoint; if false (default), return a compact stop summary — leave false unless you need variables immediately"`
+	Debugger     string           `json:"debugger,omitempty" mcp:"debugger to use: 'delve' (default) or 'gdb'"`
+	GDBPath      string           `json:"gdbPath,omitempty" mcp:"path to gdb binary (default: auto-detected from PATH). Requires GDB 14+."`
+	ProtocolLog  string           `json:"protocolLog,omitempty" mcp:"file path for protocol-level DAP message logging (what the MCP server sends/receives)"`
+	ToolLog      string           `json:"toolLog,omitempty" mcp:"file path for tool-level DAP logging (native debugger logging, GDB only)"`
+	FullContext  bool             `json:"fullContext,omitempty" mcp:"if true, return full context (stack trace and variables) when stopped at a breakpoint; if false (default), return a compact stop summary — leave false unless you need variables immediately"`
 }
 
 // ContextParams defines the parameters for getting debugging context.
@@ -326,8 +430,10 @@ func readTypedResponse[T dap.ResponseMessage](client *DAPClient, requestSeq int)
 
 // ClearBreakpointsParams defines parameters for clearing breakpoints.
 type ClearBreakpointsParams struct {
-	File string `json:"file,omitempty" mcp:"clear all breakpoints in this file"`
-	All  bool   `json:"all,omitempty" mcp:"clear all breakpoints"`
+	File     string  `json:"file,omitempty" mcp:"clear all breakpoints in this file, or a specific line if 'line' is also provided"`
+	Line     FlexInt `json:"line,omitempty" mcp:"clear the breakpoint at this line (requires 'file')"`
+	Function string  `json:"function,omitempty" mcp:"clear a function breakpoint by name"`
+	All      bool    `json:"all,omitempty" mcp:"clear all breakpoints"`
 }
 
 // StopParams defines parameters for stopping the debug session.
@@ -344,8 +450,12 @@ func (ds *debuggerSession) clearBreakpoints(ctx context.Context, _ *mcp.CallTool
 	}
 
 	if params.All {
+		// Clear all line breakpoints across all files
+		if err := ds.clearAllLineBreakpoints(); err != nil {
+			return nil, nil, err
+		}
 		// Clear all function breakpoints
-		seq, err := ds.client.SetFunctionBreakpointsRequest([]string{})
+		seq, err := ds.clearFunctionBreakpoints()
 		if err != nil {
 			return nil, nil, err
 		}
@@ -357,9 +467,33 @@ func (ds *debuggerSession) clearBreakpoints(ctx context.Context, _ *mcp.CallTool
 		}, nil, nil
 	}
 
+	if params.Function != "" {
+		seq, err := ds.removeFunctionBreakpoint(params.Function)
+		if err != nil {
+			return nil, nil, err
+		}
+		if err := readAndValidateResponse(ds.client, seq, "unable to clear function breakpoint"); err != nil {
+			return nil, nil, err
+		}
+		return &mcp.CallToolResult{
+			Content: []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf("Cleared function breakpoint: %s", params.Function)}},
+		}, nil, nil
+	}
+
 	if params.File != "" {
-		// Clear breakpoints in specific file by setting empty list
-		seq, err := ds.client.SetBreakpointsRequest(params.File, []int{})
+		if params.Line.Int() > 0 {
+			seq, err := ds.removeLineBreakpoint(params.File, params.Line.Int())
+			if err != nil {
+				return nil, nil, err
+			}
+			if err := readAndValidateResponse(ds.client, seq, "unable to clear breakpoint"); err != nil {
+				return nil, nil, err
+			}
+			return &mcp.CallToolResult{
+				Content: []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf("Cleared breakpoint at %s:%d", params.File, params.Line.Int())}},
+			}, nil, nil
+		}
+		seq, err := ds.clearLineBreakpoints(params.File)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -371,7 +505,7 @@ func (ds *debuggerSession) clearBreakpoints(ctx context.Context, _ *mcp.CallTool
 		}, nil, nil
 	}
 
-	return nil, nil, fmt.Errorf("specify 'file' or 'all'")
+	return nil, nil, fmt.Errorf("specify 'file' (optionally with 'line'), 'function', or 'all'")
 }
 
 // ContinueParams defines the parameters for continuing execution.
@@ -390,19 +524,45 @@ func (ds *debuggerSession) continueExecution(ctx context.Context, _ *mcp.CallToo
 	}
 
 	// If "to" is specified, set a temporary breakpoint
+	var cleanupRunToCursor func() error
 	if params.To != nil {
 		to := params.To
+		var alreadyExists bool
 		if to.Function != "" {
-			if _, err := ds.client.SetFunctionBreakpointsRequest([]string{to.Function}); err != nil {
+			var err error
+			_, alreadyExists, err = ds.addFunctionBreakpoint(to.Function)
+			if err != nil {
 				return nil, nil, err
+			}
+			if !alreadyExists {
+				cleanupRunToCursor = func() error {
+					seq, err := ds.removeFunctionBreakpoint(to.Function)
+					if err != nil {
+						return err
+					}
+					return readAndValidateResponse(ds.client, seq, "unable to remove run-to-cursor function breakpoint")
+				}
 			}
 		} else if to.File != "" && to.Line > 0 {
-			if _, err := ds.client.SetBreakpointsRequest(to.File, []int{to.Line}); err != nil {
+			var err error
+			_, alreadyExists, err = ds.addLineBreakpoint(to.File, to.Line)
+			if err != nil {
 				return nil, nil, err
 			}
+			if !alreadyExists {
+				cleanupRunToCursor = func() error {
+					seq, err := ds.removeLineBreakpoint(to.File, to.Line)
+					if err != nil {
+						return err
+					}
+					return readAndValidateResponse(ds.client, seq, "unable to remove run-to-cursor line breakpoint")
+				}
+			}
 		}
-		if _, err := ds.client.ReadMessage(); err != nil {
-			return nil, nil, err
+		if !alreadyExists {
+			if _, err := ds.client.ReadMessage(); err != nil {
+				return nil, nil, err
+			}
 		}
 	}
 
@@ -415,6 +575,8 @@ func (ds *debuggerSession) continueExecution(ctx context.Context, _ *mcp.CallToo
 		return nil, nil, err
 	}
 
+	var result *mcp.CallToolResult
+	var resultErr error
 	for {
 		msg, err := ds.client.ReadMessage()
 		if err != nil {
@@ -432,17 +594,27 @@ func (ds *debuggerSession) continueExecution(ctx context.Context, _ *mcp.CallToo
 			}
 		case *dap.StoppedEvent:
 			ds.stoppedThreadID = resp.Body.ThreadId
-			result, err := ds.getFullContext(resp.Body.ThreadId, 0, 20)
-			if err != nil || params.FullContext {
-				return result, nil, err
+			result, resultErr = ds.getFullContext(resp.Body.ThreadId, 0, 20)
+			if resultErr == nil && !params.FullContext {
+				result = stopSummary(result, resp.Body.Reason)
 			}
-			return stopSummary(result, resp.Body.Reason), nil, nil
+			goto done
 		case *dap.TerminatedEvent:
-			return &mcp.CallToolResult{
+			result = &mcp.CallToolResult{
 				Content: []mcp.Content{&mcp.TextContent{Text: "Program terminated"}},
-			}, nil, nil
+			}
+			goto done
 		}
 	}
+
+done:
+	// Remove the temporary run-to-cursor breakpoint if one was added
+	if cleanupRunToCursor != nil {
+		if err := cleanupRunToCursor(); err != nil {
+			log.Printf("continueExecution: failed to clean up run-to-cursor breakpoint: %v", err)
+		}
+	}
+	return result, nil, resultErr
 }
 
 // PauseParams defines the parameters for pausing execution.
@@ -539,8 +711,8 @@ func (ds *debuggerSession) evaluateExpression(ctx context.Context, _ *mcp.CallTo
 // SetVariableParams defines the parameters for setting a variable.
 type SetVariableParams struct {
 	VariablesReference FlexInt `json:"variablesReference" mcp:"reference to the variable container"`
-	Name               string `json:"name" mcp:"name of the variable to set"`
-	Value              string `json:"value" mcp:"new value for the variable"`
+	Name               string  `json:"name" mcp:"name of the variable to set"`
+	Value              string  `json:"value" mcp:"new value for the variable"`
 }
 
 // setVariable sets the value of a variable in the debugged program.
@@ -826,6 +998,8 @@ func (ds *debuggerSession) cleanup() {
 	ds.capabilities = dap.Capabilities{}
 	ds.stoppedThreadID = 0
 	ds.lastFrameID = -1
+	ds.functionBreakpoints = nil
+	ds.lineBreakpoints = nil
 	ds.unregisterSessionTools()
 }
 
@@ -1025,20 +1199,24 @@ initialized:
 	// Set breakpoints
 	for _, bp := range params.Breakpoints {
 		if bp.Function != "" {
-			seq, err := ds.client.SetFunctionBreakpointsRequest([]string{bp.Function})
+			seq, alreadyExists, err := ds.addFunctionBreakpoint(bp.Function)
 			if err != nil {
 				return nil, nil, err
 			}
-			if err := readAndValidateResponse(ds.client, seq, "unable to set function breakpoint"); err != nil {
-				return nil, nil, err
+			if !alreadyExists {
+				if err := readAndValidateResponse(ds.client, seq, "unable to set function breakpoint"); err != nil {
+					return nil, nil, err
+				}
 			}
 		} else if bp.File != "" && bp.Line > 0 {
-			seq, err := ds.client.SetBreakpointsRequest(bp.File, []int{bp.Line})
+			seq, alreadyExists, err := ds.addLineBreakpoint(bp.File, bp.Line)
 			if err != nil {
 				return nil, nil, err
 			}
-			if err := readAndValidateResponse(ds.client, seq, "unable to set breakpoint"); err != nil {
-				return nil, nil, err
+			if !alreadyExists {
+				if err := readAndValidateResponse(ds.client, seq, "unable to set breakpoint"); err != nil {
+					return nil, nil, err
+				}
 			}
 		}
 	}
@@ -1322,7 +1500,7 @@ func stopSummary(full *mcp.CallToolResult, reason string) *mcp.CallToolResult {
 	if reason != "" {
 		fmt.Fprintf(&summary, "Stopped: %s\n", reason)
 	}
-	for _, line := range strings.Split(text, "\n") {
+	for line := range strings.SplitSeq(text, "\n") {
 		if strings.HasPrefix(line, "Function:") || strings.HasPrefix(line, "File:") {
 			summary.WriteString(line + "\n")
 		}
@@ -1392,15 +1570,56 @@ func (ds *debuggerSession) breakpoint(ctx context.Context, _ *mcp.CallToolReques
 	}
 
 	if params.Function != "" {
-		seq, err := ds.client.SetFunctionBreakpointsRequest([]string{params.Function})
+		seq, alreadyExists, err := ds.addFunctionBreakpoint(params.Function)
 		if err != nil {
 			return nil, nil, err
 		}
-		if err := readAndValidateResponse(ds.client, seq, "unable to set function breakpoint"); err != nil {
-			return nil, nil, err
+		if alreadyExists {
+			return &mcp.CallToolResult{
+				Content: []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf("Breakpoint already set on function: %s", params.Function)}},
+			}, nil, nil
+		}
+		resp, err := readTypedResponse[*dap.SetFunctionBreakpointsResponse](ds.client, seq)
+		if err != nil {
+			return nil, nil, fmt.Errorf("unable to set function breakpoint: %w", err)
+		}
+		// The response breakpoints array corresponds 1:1 with the request array.
+		// We appended the new function last, so our breakpoint is the last element.
+		if len(resp.Body.Breakpoints) == 0 {
+			return nil, nil, fmt.Errorf("no breakpoints returned")
+		}
+		bp := resp.Body.Breakpoints[len(resp.Body.Breakpoints)-1]
+		if !bp.Verified {
+			if bp.Reason == "pending" {
+				// Pending breakpoints may be verified later (e.g. when a shared library loads).
+				// Keep them in the tracked list.
+				msg := fmt.Sprintf("Breakpoint set on function %s (pending — will resolve when the source is loaded)", params.Function)
+				if bp.Message != "" {
+					msg = fmt.Sprintf("Breakpoint set on function %s (pending: %s)", params.Function, bp.Message)
+				}
+				return &mcp.CallToolResult{
+					Content: []mcp.Content{&mcp.TextContent{Text: msg}},
+				}, nil, nil
+			}
+			// Failed or unknown reason — remove from both our tracking and the adapter.
+			removeSeq, removeErr := ds.removeFunctionBreakpoint(params.Function)
+			if removeErr != nil {
+				log.Printf("breakpoint: failed to remove unverified function breakpoint %q: %v", params.Function, removeErr)
+			} else if removeErr = readAndValidateResponse(ds.client, removeSeq, "unable to remove unverified function breakpoint"); removeErr != nil {
+				log.Printf("breakpoint: failed to remove unverified function breakpoint %q: %v", params.Function, removeErr)
+			}
+			return nil, nil, fmt.Errorf("function breakpoint not verified: %s", bp.Message)
+		}
+		var result string
+		if bp.Source != nil {
+			result = fmt.Sprintf("Breakpoint %d set at %s:%d (function %s)", bp.Id, bp.Source.Path, bp.Line, params.Function)
+		} else if bp.Line > 0 {
+			result = fmt.Sprintf("Breakpoint %d set at line %d (function %s)", bp.Id, bp.Line, params.Function)
+		} else {
+			result = fmt.Sprintf("Breakpoint %d set on function: %s", bp.Id, params.Function)
 		}
 		return &mcp.CallToolResult{
-			Content: []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf("Breakpoint set on function: %s", params.Function)}},
+			Content: []mcp.Content{&mcp.TextContent{Text: result}},
 		}, nil, nil
 	}
 
@@ -1408,20 +1627,45 @@ func (ds *debuggerSession) breakpoint(ctx context.Context, _ *mcp.CallToolReques
 		return nil, nil, fmt.Errorf("either function or file+line is required")
 	}
 
-	bpSeq, err := ds.client.SetBreakpointsRequest(params.File, []int{params.Line.Int()})
+	bpSeq, alreadyExists, err := ds.addLineBreakpoint(params.File, params.Line.Int())
 	if err != nil {
 		return nil, nil, err
+	}
+	if alreadyExists {
+		return &mcp.CallToolResult{
+			Content: []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf("Breakpoint already set at %s:%d", params.File, params.Line.Int())}},
+		}, nil, nil
 	}
 
 	resp, err := readTypedResponse[*dap.SetBreakpointsResponse](ds.client, bpSeq)
 	if err != nil {
 		return nil, nil, fmt.Errorf("unable to set breakpoint: %w", err)
 	}
+	// The response breakpoints array corresponds 1:1 with the request array.
+	// We appended the new line last, so our breakpoint is the last element.
 	if len(resp.Body.Breakpoints) == 0 {
 		return nil, nil, fmt.Errorf("no breakpoints returned")
 	}
-	bp := resp.Body.Breakpoints[0]
+	bp := resp.Body.Breakpoints[len(resp.Body.Breakpoints)-1]
 	if !bp.Verified {
+		if bp.Reason == "pending" {
+			// Pending breakpoints may be verified later (e.g. when a shared library loads).
+			// Keep them in the tracked list.
+			msg := fmt.Sprintf("Breakpoint set at %s:%d (pending — will resolve when the source is loaded)", params.File, params.Line.Int())
+			if bp.Message != "" {
+				msg = fmt.Sprintf("Breakpoint set at %s:%d (pending: %s)", params.File, params.Line.Int(), bp.Message)
+			}
+			return &mcp.CallToolResult{
+				Content: []mcp.Content{&mcp.TextContent{Text: msg}},
+			}, nil, nil
+		}
+		// Failed or unknown reason — remove from both our tracking and the adapter.
+		removeSeq, removeErr := ds.removeLineBreakpoint(params.File, params.Line.Int())
+		if removeErr != nil {
+			log.Printf("breakpoint: failed to remove unverified breakpoint at %s:%d: %v", params.File, params.Line.Int(), removeErr)
+		} else if removeErr = readAndValidateResponse(ds.client, removeSeq, "unable to remove unverified breakpoint"); removeErr != nil {
+			log.Printf("breakpoint: failed to remove unverified breakpoint at %s:%d: %v", params.File, params.Line.Int(), removeErr)
+		}
 		return nil, nil, fmt.Errorf("breakpoint not verified: %s", bp.Message)
 	}
 	return &mcp.CallToolResult{
