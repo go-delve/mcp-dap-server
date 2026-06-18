@@ -231,7 +231,8 @@ func (g *gdbBackend) LaunchArgs(mode, programPath string, stopOnEntry bool, prog
 	return args, nil
 }
 
-// CoreRequestType returns "attach" because GDB handles core dumps via the attach request.
+// CoreRequestType returns "attach" because GDB native DAP handles core dumps
+// via the attach request with a "coreFile" argument.
 func (g *gdbBackend) CoreRequestType() string {
 	return "attach"
 }

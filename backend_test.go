@@ -169,6 +169,9 @@ func TestGDBBackendTransportMode(t *testing.T) {
 
 func TestGDBBackendCoreArgs(t *testing.T) {
 	backend := &gdbBackend{gdbPath: "gdb"}
+	if backend.CoreRequestType() != "attach" {
+		t.Errorf("expected CoreRequestType 'attach', got: %s", backend.CoreRequestType())
+	}
 	args, err := backend.CoreArgs("/path/to/program", "/path/to/core")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
