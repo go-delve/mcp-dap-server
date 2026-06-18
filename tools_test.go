@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"io"
 	"net/http"
@@ -17,6 +18,46 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
+
+var dapLogDir string
+
+func TestMain(m *testing.M) {
+	flag.StringVar(&dapLogDir, "dap-log", "", "directory for DAP protocol and tool logs (enables verbose DAP logging)")
+	flag.Parse()
+	if dapLogDir != "" {
+		if err := os.MkdirAll(dapLogDir, 0o755); err != nil {
+			fmt.Fprintf(os.Stderr, "failed to create dap-log dir: %v\n", err)
+			os.Exit(1)
+		}
+	}
+	os.Exit(m.Run())
+}
+
+func dapLogArgs(t *testing.T) map[string]any {
+	if dapLogDir == "" {
+		return nil
+	}
+	name := strings.ReplaceAll(t.Name(), "/", "_")
+	return map[string]any{
+		"protocolLog": filepath.Join(dapLogDir, name+".protocol.log"),
+		"toolLog":     filepath.Join(dapLogDir, name+".tool.log"),
+	}
+}
+
+func dumpDAPLogs(t *testing.T) {
+	if dapLogDir == "" {
+		return
+	}
+	name := strings.ReplaceAll(t.Name(), "/", "_")
+	for _, suffix := range []string{".protocol.log", ".tool.log"} {
+		path := filepath.Join(dapLogDir, name+suffix)
+		data, err := os.ReadFile(path)
+		if err != nil || len(data) == 0 {
+			continue
+		}
+		t.Logf("\n=== %s ===\n%s", filepath.Base(path), string(data))
+	}
+}
 
 // testSetup holds the common test infrastructure
 type testSetup struct {
@@ -128,6 +169,9 @@ func (ts *testSetup) startDebugSession(t *testing.T, port string, binaryPath str
 	}
 	if len(programArgs) > 0 {
 		args["args"] = programArgs
+	}
+	for k, v := range dapLogArgs(t) {
+		args[k] = v
 	}
 
 	result, err := ts.session.CallTool(ts.ctx, &mcp.CallToolParams{
