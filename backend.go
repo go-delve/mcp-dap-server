@@ -165,6 +165,8 @@ func (g *gdbBackend) Spawn(port string, stderrWriter io.Writer) (*exec.Cmd, stri
 		gdbPath = "gdb"
 	}
 	args := []string{"-i", "dap"}
+	// Disable terminal styling — ANSI escapes have no place in DAP JSON responses.
+	args = append([]string{"-iex", "set style enabled off"}, args...)
 	if g.toolLogPath != "" {
 		args = append([]string{"-iex", "set debug dap-log-file " + g.toolLogPath}, args...)
 	}

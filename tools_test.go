@@ -1459,6 +1459,26 @@ func TestClearBreakpoints(t *testing.T) {
 	}
 	t.Logf("Cleared all breakpoints: %s", text)
 
+	// Clear a specific line that has no breakpoint — should report not found
+	text, isErr = ts.callTool(t, "clear-breakpoints", map[string]any{"file": f, "line": 999})
+	if isErr {
+		t.Fatalf("clear-breakpoints for nonexistent line returned error: %s", text)
+	}
+	if !strings.Contains(text, "No breakpoint at") {
+		t.Errorf("expected 'No breakpoint at' message, got: %s", text)
+	}
+	t.Logf("Clear nonexistent line breakpoint: %s", text)
+
+	// Clear a function breakpoint that doesn't exist
+	text, isErr = ts.callTool(t, "clear-breakpoints", map[string]any{"function": "nonexistent.Func"})
+	if isErr {
+		t.Fatalf("clear-breakpoints for nonexistent function returned error: %s", text)
+	}
+	if !strings.Contains(text, "No function breakpoint") {
+		t.Errorf("expected 'No function breakpoint' message, got: %s", text)
+	}
+	t.Logf("Clear nonexistent function breakpoint: %s", text)
+
 	// Error case: no file or all specified — tool returns (nil, error)
 	// The MCP go-sdk wraps this as an isError result or a transport error
 	result, err := ts.session.CallTool(ts.ctx, &mcp.CallToolParams{
@@ -1471,6 +1491,55 @@ func TestClearBreakpoints(t *testing.T) {
 		t.Logf("Got expected tool error result")
 	} else {
 		t.Error("Expected error when neither file nor all specified")
+	}
+
+	ts.stopDebugger(t)
+}
+
+func TestInfoBreakpoints(t *testing.T) {
+	ts := setupMCPServerAndClient(t)
+	defer ts.cleanup()
+
+	binaryPath, cleanupBinary := compileTestProgram(t, ts.cwd, "step")
+	defer cleanupBinary()
+
+	ts.startDebugSession(t, "0", binaryPath, nil)
+
+	f := filepath.Join(ts.cwd, "testdata", "go", "step", "main.go")
+
+	// No breakpoints yet
+	text, isErr := ts.callTool(t, "info", map[string]any{"type": "breakpoints"})
+	if isErr {
+		t.Fatalf("info breakpoints returned error: %s", text)
+	}
+	if !strings.Contains(text, "(none)") {
+		t.Errorf("expected '(none)' when no breakpoints set, got: %s", text)
+	}
+
+	// Set a line breakpoint and a function breakpoint
+	ts.callTool(t, "breakpoint", map[string]any{"file": f, "line": 7})
+	ts.callTool(t, "breakpoint", map[string]any{"function": "main.main"})
+
+	text, isErr = ts.callTool(t, "info", map[string]any{"type": "breakpoints"})
+	if isErr {
+		t.Fatalf("info breakpoints returned error: %s", text)
+	}
+	if !strings.Contains(text, ":7") {
+		t.Errorf("expected line 7 breakpoint in listing, got: %s", text)
+	}
+	if !strings.Contains(text, "function main.main") {
+		t.Errorf("expected function breakpoint in listing, got: %s", text)
+	}
+	t.Logf("info breakpoints:\n%s", text)
+
+	// Clear all and verify empty again
+	ts.callTool(t, "clear-breakpoints", map[string]any{"all": true})
+	text, isErr = ts.callTool(t, "info", map[string]any{"type": "breakpoints"})
+	if isErr {
+		t.Fatalf("info breakpoints returned error after clear: %s", text)
+	}
+	if !strings.Contains(text, "(none)") {
+		t.Errorf("expected '(none)' after clearing, got: %s", text)
 	}
 
 	ts.stopDebugger(t)
@@ -2096,4 +2165,112 @@ func TestErrorBeforeDebuggerStarted(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestFormatTermination(t *testing.T) {
+	code0 := 0
+	code1 := 1
+
+	tests := []struct {
+		name     string
+		exitCode *int
+		output   string
+		want     string
+	}{
+		{"no exit code, no output", nil, "", "Program terminated."},
+		{"exit code 0, no output", &code0, "", "Program exited with code 0."},
+		{"exit code 1, no output", &code1, "", "Program exited with code 1."},
+		{"exit code 0 with output", &code0, "hello, world\n", "Program exited with code 0.\nOutput:\nhello, world"},
+		{"no exit code with output", nil, "some output\n", "Program terminated.\nOutput:\nsome output"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := formatTermination(tt.exitCode, tt.output)
+			if got != tt.want {
+				t.Errorf("formatTermination() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestTerminationMessage(t *testing.T) {
+	ts := setupMCPServerAndClient(t)
+	defer ts.cleanup()
+
+	binaryPath, cleanupBinary := compileTestProgram(t, ts.cwd, "helloworld")
+	defer cleanupBinary()
+
+	f := filepath.Join(ts.cwd, "testdata", "go", "helloworld", "main.go")
+	ts.startDebugSession(t, "0", binaryPath, []map[string]any{
+		{"file": f, "line": 7},
+	})
+
+	// Continue past the breakpoint to let the program run to completion.
+	// Delve sends TerminatedEvent immediately on exit — the exit code
+	// surfaces later as an OutputEvent{category:"console"} during
+	// disconnect, not as a structured ExitedEvent. Program stdout is
+	// not piped through OutputEvent by default (GDB does both).
+	// Just verify the message is well-formed (not empty/crash).
+	text, isErr := ts.callTool(t, "continue", map[string]any{})
+	if isErr {
+		t.Fatalf("continue returned error: %s", text)
+	}
+	if !strings.Contains(text, "terminated") && !strings.Contains(text, "exited") {
+		t.Errorf("expected termination/exited message, got: %s", text)
+	}
+	t.Logf("termination result: %s", text)
+
+	ts.stopDebugger(t)
+}
+
+func TestStopOnEntry(t *testing.T) {
+	ts := setupMCPServerAndClient(t)
+	defer ts.cleanup()
+
+	binaryPath, cleanupBinary := compileTestProgram(t, ts.cwd, "helloworld")
+	defer cleanupBinary()
+
+	// Start with no breakpoints — forces stopOnEntry.
+	// Should return a stop summary or fallback message, not a generic
+	// "debug session started" string.
+	result, err := ts.session.CallTool(ts.ctx, &mcp.CallToolParams{
+		Name: "debug",
+		Arguments: map[string]any{
+			"mode": "binary",
+			"path": binaryPath,
+			"port": "0",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Failed to start debug session: %v", err)
+	}
+	var text string
+	if len(result.Content) > 0 {
+		if tc, ok := result.Content[0].(*mcp.TextContent); ok {
+			text = tc.Text
+		}
+	}
+	t.Logf("stopOnEntry result: %s", text)
+
+	// Should mention "entry" or "Stopped" — not the old generic message
+	if strings.Contains(text, "Use 'breakpoint' to set breakpoints") {
+		t.Errorf("got old generic message; expected stop summary or entry message")
+	}
+
+	// After stopOnEntry, set a breakpoint, continue, and verify evaluate works
+	f := filepath.Join(ts.cwd, "testdata", "go", "helloworld", "main.go")
+	ts.setBreakpointAndContinue(t, f, 7)
+
+	evalText, isError := ts.callTool(t, "evaluate", map[string]any{
+		"expression": "1+1",
+	})
+	if isError {
+		t.Fatalf("evaluate returned error: %s", evalText)
+	}
+	if !strings.Contains(evalText, "2") {
+		t.Errorf("expected evaluate result to contain '2', got: %s", evalText)
+	}
+	t.Logf("evaluate result: %s", evalText)
+
+	ts.stopDebugger(t)
 }

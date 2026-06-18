@@ -48,22 +48,26 @@ func (ds *debuggerSession) defaultThreadID() int {
 // and sends the full list to the DAP server. Caller must hold ds.mu.
 // Returns (seq, alreadyExists, error). When alreadyExists is true, no DAP
 // request was sent and seq is 0.
-func (ds *debuggerSession) addFunctionBreakpoint(name string) (int, bool, error) {
+func (ds *debuggerSession) addFunctionBreakpoint(name string) (int, error) {
 	if slices.Contains(ds.functionBreakpoints, name) {
-		return 0, true, nil
+		return 0, nil
 	}
 	ds.functionBreakpoints = append(ds.functionBreakpoints, name)
 	seq, err := ds.client.SetFunctionBreakpointsRequest(ds.functionBreakpoints)
 	if err != nil {
 		ds.functionBreakpoints = ds.functionBreakpoints[:len(ds.functionBreakpoints)-1]
-		return 0, false, err
+		return 0, err
 	}
-	return seq, false, nil
+	return seq, nil
 }
 
 // removeFunctionBreakpoint removes a function breakpoint by name
 // and sends the updated list to the DAP server. Caller must hold ds.mu.
+// Returns seq==0 when no breakpoint was found (no DAP request sent).
 func (ds *debuggerSession) removeFunctionBreakpoint(name string) (int, error) {
+	if !slices.Contains(ds.functionBreakpoints, name) {
+		return 0, nil
+	}
 	ds.functionBreakpoints = slices.DeleteFunc(ds.functionBreakpoints, func(fn string) bool {
 		return fn == name
 	})
@@ -79,40 +83,40 @@ func (ds *debuggerSession) clearFunctionBreakpoints() (int, error) {
 
 // addLineBreakpoint adds a line breakpoint for the given file and sends the
 // full list for that file to the DAP server. Caller must hold ds.mu.
-// Returns (seq, alreadyExists, error). When alreadyExists is true, no DAP
-// request was sent and seq is 0.
-func (ds *debuggerSession) addLineBreakpoint(file string, line int) (int, bool, error) {
+// Returns seq==0 when the breakpoint already exists (no DAP request sent).
+func (ds *debuggerSession) addLineBreakpoint(file string, line int) (int, error) {
 	if ds.lineBreakpoints == nil {
 		ds.lineBreakpoints = make(map[string][]int)
 	}
 	lines := ds.lineBreakpoints[file]
 	if slices.Contains(lines, line) {
-		return 0, true, nil
+		return 0, nil
 	}
 	lines = append(lines, line)
 	ds.lineBreakpoints[file] = lines
 	seq, err := ds.client.SetBreakpointsRequest(file, ds.lineBreakpoints[file])
 	if err != nil {
-		// Roll back: remove the line we just appended
 		ds.lineBreakpoints[file] = ds.lineBreakpoints[file][:len(ds.lineBreakpoints[file])-1]
 		if len(ds.lineBreakpoints[file]) == 0 {
 			delete(ds.lineBreakpoints, file)
 		}
-		return 0, false, err
+		return 0, err
 	}
-	return seq, false, nil
+	return seq, nil
 }
 
 // removeLineBreakpoint removes a line breakpoint for the given file and sends
 // the updated list to the DAP server. Caller must hold ds.mu.
+// Returns seq==0 when no breakpoint was found (no DAP request sent).
 func (ds *debuggerSession) removeLineBreakpoint(file string, line int) (int, error) {
-	if ds.lineBreakpoints != nil {
-		ds.lineBreakpoints[file] = slices.DeleteFunc(ds.lineBreakpoints[file], func(l int) bool {
-			return l == line
-		})
-		if len(ds.lineBreakpoints[file]) == 0 {
-			delete(ds.lineBreakpoints, file)
-		}
+	if ds.lineBreakpoints == nil || !slices.Contains(ds.lineBreakpoints[file], line) {
+		return 0, nil
+	}
+	ds.lineBreakpoints[file] = slices.DeleteFunc(ds.lineBreakpoints[file], func(l int) bool {
+		return l == line
+	})
+	if len(ds.lineBreakpoints[file]) == 0 {
+		delete(ds.lineBreakpoints, file)
 	}
 	return ds.client.SetBreakpointsRequest(file, ds.lineBreakpoints[file])
 }
@@ -259,6 +263,7 @@ For GDB commands (e.g. print/x), use context 'repl': {"expression": "print/x var
 
 	// Info tool with dynamic description based on adapter capabilities
 	infoTypes := "'threads' (list all threads with IDs, default)"
+	infoTypes += ", 'breakpoints' (active breakpoints)"
 	if ds.capabilities.SupportsLoadedSourcesRequest {
 		infoTypes += ", 'sources' (loaded source file paths)"
 	}
@@ -317,45 +322,45 @@ type BreakpointSpec struct {
 
 // DebugParams defines the parameters for starting a complete debug session.
 type DebugParams struct {
-	Mode         string           `json:"mode" mcp:"'source' (compile & debug), 'binary' (debug executable), 'core' (debug core dump), or 'attach' (connect to process)"`
-	Path         string           `json:"path,omitempty" mcp:"program path (required for source/binary modes; optional for core mode with GDB, which can auto-detect it)"`
-	Args         []string         `json:"args,omitempty" mcp:"command line arguments for the program"`
-	CoreFilePath string           `json:"coreFilePath,omitempty" mcp:"path to core dump file (required for core mode)"`
-	ProcessID    int              `json:"processId,omitempty" mcp:"process ID (required for attach mode)"`
-	Breakpoints  []BreakpointSpec `json:"breakpoints,omitempty" mcp:"initial breakpoints"`
-	StopOnEntry  bool             `json:"stopOnEntry,omitempty" mcp:"stop at program entry instead of running to first breakpoint"`
-	Port         string           `json:"port,omitempty" mcp:"port for DAP server (default: auto-assigned)"`
-	Debugger     string           `json:"debugger,omitempty" mcp:"debugger to use: 'delve' (default) or 'gdb'"`
-	GDBPath      string           `json:"gdbPath,omitempty" mcp:"path to gdb binary (default: auto-detected from PATH). Requires GDB 14+."`
-	ProtocolLog  string           `json:"protocolLog,omitempty" mcp:"file path for protocol-level DAP message logging (what the MCP server sends/receives)"`
-	ToolLog      string           `json:"toolLog,omitempty" mcp:"file path for tool-level DAP logging (native debugger logging, GDB only)"`
-	FullContext  bool             `json:"fullContext,omitempty" mcp:"if true, return full context (stack trace and variables) when stopped at a breakpoint; if false (default), return a compact stop summary — leave false unless you need variables immediately"`
+	Mode         string           `json:"mode" jsonschema:"'source' (compile & debug), 'binary' (debug executable), 'core' (debug core dump), or 'attach' (connect to process)"`
+	Path         string           `json:"path,omitempty" jsonschema:"program path (required for source/binary modes; optional for core mode with GDB, which can auto-detect it)"`
+	Args         []string         `json:"args,omitempty" jsonschema:"command line arguments for the program"`
+	CoreFilePath string           `json:"coreFilePath,omitempty" jsonschema:"path to core dump file (required for core mode)"`
+	ProcessID    int              `json:"processId,omitempty" jsonschema:"process ID (required for attach mode)"`
+	Breakpoints  []BreakpointSpec `json:"breakpoints,omitempty" jsonschema:"initial breakpoints"`
+	StopOnEntry  bool             `json:"stopOnEntry,omitempty" jsonschema:"stop at program entry (main function) instead of running to first breakpoint"`
+	Port         string           `json:"port,omitempty" jsonschema:"port for DAP server (default: auto-assigned)"`
+	Debugger     string           `json:"debugger,omitempty" jsonschema:"debugger to use: 'delve' (default) or 'gdb'"`
+	GDBPath      string           `json:"gdbPath,omitempty" jsonschema:"path to gdb binary (default: auto-detected from PATH). Requires GDB 14+."`
+	ProtocolLog  string           `json:"protocolLog,omitempty" jsonschema:"file path for protocol-level DAP message logging (what the MCP server sends/receives)"`
+	ToolLog      string           `json:"toolLog,omitempty" jsonschema:"file path for tool-level DAP logging (native debugger logging, GDB only)"`
+	FullContext  bool             `json:"fullContext,omitempty" jsonschema:"if true, return full context (stack trace and variables) when stopped at a breakpoint; if false (default), return a compact stop summary — leave false unless you need variables immediately"`
 }
 
 // ContextParams defines the parameters for getting debugging context.
 type ContextParams struct {
-	ThreadID  FlexInt `json:"threadId,omitempty" mcp:"thread to inspect (default: current thread)"`
-	FrameID   FlexInt `json:"frameId,omitempty" mcp:"frame to focus on (default: top frame)"`
-	MaxFrames FlexInt `json:"maxFrames,omitempty" mcp:"maximum stack frames (default: 20)"`
+	ThreadID  FlexInt `json:"threadId,omitempty" jsonschema:"thread to inspect (default: current thread)"`
+	FrameID   FlexInt `json:"frameId,omitempty" jsonschema:"frame to focus on (default: top frame)"`
+	MaxFrames FlexInt `json:"maxFrames,omitempty" jsonschema:"maximum stack frames (default: 20)"`
 }
 
 // StepParams defines the parameters for stepping through code.
 type StepParams struct {
-	Mode        string  `json:"mode" mcp:"'over' (next line), 'in' (into function), 'out' (out of function)"`
-	ThreadID    FlexInt `json:"threadId,omitempty" mcp:"thread to step (default: current thread)"`
-	FullContext bool    `json:"fullContext,omitempty" mcp:"if true, return full context (stack trace and variables) when stopped; if false (default), return a compact stop summary — leave false unless you need variables immediately"`
+	Mode        string  `json:"mode" jsonschema:"'over' (next line), 'in' (into function), 'out' (out of function)"`
+	ThreadID    FlexInt `json:"threadId,omitempty" jsonschema:"thread to step (default: current thread)"`
+	FullContext bool    `json:"fullContext,omitempty" jsonschema:"if true, return full context (stack trace and variables) when stopped; if false (default), return a compact stop summary — leave false unless you need variables immediately"`
 }
 
 // InfoParams defines parameters for getting program metadata.
 type InfoParams struct {
-	Type string `json:"type,omitempty" mcp:"'threads' (list threads), 'sources' (loaded source files), 'modules' (loaded modules), or 'registers' (CPU register values at current frame, GDB only)"`
+	Type string `json:"type,omitempty" jsonschema:"'threads' (list threads), 'breakpoints' (active breakpoints), 'sources' (loaded source files), 'modules' (loaded modules), or 'registers' (CPU register values at current frame, GDB only)"`
 }
 
 // BreakpointToolParams defines parameters for setting a breakpoint.
 type BreakpointToolParams struct {
-	File     string  `json:"file,omitempty" mcp:"source file path (required if no function)"`
-	Line     FlexInt `json:"line,omitempty" mcp:"line number (required if file provided)"`
-	Function string  `json:"function,omitempty" mcp:"function name (alternative to file+line)"`
+	File     string  `json:"file,omitempty" jsonschema:"source file path (required if no function)"`
+	Line     FlexInt `json:"line,omitempty" jsonschema:"line number (required if file provided)"`
+	Function string  `json:"function,omitempty" jsonschema:"function name (alternative to file+line)"`
 }
 
 // readAndValidateResponse reads DAP messages until it receives the response
@@ -430,15 +435,15 @@ func readTypedResponse[T dap.ResponseMessage](client *DAPClient, requestSeq int)
 
 // ClearBreakpointsParams defines parameters for clearing breakpoints.
 type ClearBreakpointsParams struct {
-	File     string  `json:"file,omitempty" mcp:"clear all breakpoints in this file, or a specific line if 'line' is also provided"`
-	Line     FlexInt `json:"line,omitempty" mcp:"clear the breakpoint at this line (requires 'file')"`
-	Function string  `json:"function,omitempty" mcp:"clear a function breakpoint by name"`
-	All      bool    `json:"all,omitempty" mcp:"clear all breakpoints"`
+	File     string  `json:"file,omitempty" jsonschema:"clear all breakpoints in this file, or a specific line if 'line' is also provided"`
+	Line     FlexInt `json:"line,omitempty" jsonschema:"clear the breakpoint at this line (requires 'file')"`
+	Function string  `json:"function,omitempty" jsonschema:"clear a function breakpoint by name"`
+	All      bool    `json:"all,omitempty" jsonschema:"clear all breakpoints"`
 }
 
 // StopParams defines parameters for stopping the debug session.
 type StopParams struct {
-	Detach bool `json:"detach,omitempty" mcp:"if true, detach from the process without terminating it (leaves the debuggee running); default false terminates the debuggee"`
+	Detach bool `json:"detach,omitempty" jsonschema:"if true, detach from the process without terminating it (leaves the debuggee running); default false terminates the debuggee"`
 }
 
 // clearBreakpoints removes breakpoints.
@@ -472,6 +477,11 @@ func (ds *debuggerSession) clearBreakpoints(ctx context.Context, _ *mcp.CallTool
 		if err != nil {
 			return nil, nil, err
 		}
+		if seq == 0 {
+			return &mcp.CallToolResult{
+				Content: []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf("No function breakpoint set on: %s", params.Function)}},
+			}, nil, nil
+		}
 		if err := readAndValidateResponse(ds.client, seq, "unable to clear function breakpoint"); err != nil {
 			return nil, nil, err
 		}
@@ -485,6 +495,11 @@ func (ds *debuggerSession) clearBreakpoints(ctx context.Context, _ *mcp.CallTool
 			seq, err := ds.removeLineBreakpoint(params.File, params.Line.Int())
 			if err != nil {
 				return nil, nil, err
+			}
+			if seq == 0 {
+				return &mcp.CallToolResult{
+					Content: []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf("No breakpoint at %s:%d", params.File, params.Line.Int())}},
+				}, nil, nil
 			}
 			if err := readAndValidateResponse(ds.client, seq, "unable to clear breakpoint"); err != nil {
 				return nil, nil, err
@@ -510,9 +525,9 @@ func (ds *debuggerSession) clearBreakpoints(ctx context.Context, _ *mcp.CallTool
 
 // ContinueParams defines the parameters for continuing execution.
 type ContinueParams struct {
-	ThreadID    FlexInt         `json:"threadId,omitempty" mcp:"thread to continue (default: all threads)"`
-	To          *BreakpointSpec `json:"to,omitempty" mcp:"location to run to (sets temporary breakpoint)"`
-	FullContext bool            `json:"fullContext,omitempty" mcp:"if true, return full context (stack trace and variables) when stopped; if false (default), return a compact stop summary — leave false unless you need variables immediately"`
+	ThreadID    FlexInt         `json:"threadId,omitempty" jsonschema:"thread to continue (default: all threads)"`
+	To          *BreakpointSpec `json:"to,omitempty" jsonschema:"location to run to (sets temporary breakpoint)"`
+	FullContext bool            `json:"fullContext,omitempty" jsonschema:"if true, return full context (stack trace and variables) when stopped; if false (default), return a compact stop summary — leave false unless you need variables immediately"`
 }
 
 // continueExecution continues execution and returns full context when stopped.
@@ -527,14 +542,14 @@ func (ds *debuggerSession) continueExecution(ctx context.Context, _ *mcp.CallToo
 	var cleanupRunToCursor func() error
 	if params.To != nil {
 		to := params.To
-		var alreadyExists bool
+		var addSeq int
 		if to.Function != "" {
 			var err error
-			_, alreadyExists, err = ds.addFunctionBreakpoint(to.Function)
+			addSeq, err = ds.addFunctionBreakpoint(to.Function)
 			if err != nil {
 				return nil, nil, err
 			}
-			if !alreadyExists {
+			if addSeq > 0 {
 				cleanupRunToCursor = func() error {
 					seq, err := ds.removeFunctionBreakpoint(to.Function)
 					if err != nil {
@@ -545,11 +560,11 @@ func (ds *debuggerSession) continueExecution(ctx context.Context, _ *mcp.CallToo
 			}
 		} else if to.File != "" && to.Line > 0 {
 			var err error
-			_, alreadyExists, err = ds.addLineBreakpoint(to.File, to.Line)
+			addSeq, err = ds.addLineBreakpoint(to.File, to.Line)
 			if err != nil {
 				return nil, nil, err
 			}
-			if !alreadyExists {
+			if addSeq > 0 {
 				cleanupRunToCursor = func() error {
 					seq, err := ds.removeLineBreakpoint(to.File, to.Line)
 					if err != nil {
@@ -559,7 +574,7 @@ func (ds *debuggerSession) continueExecution(ctx context.Context, _ *mcp.CallToo
 				}
 			}
 		}
-		if !alreadyExists {
+		if addSeq > 0 {
 			if _, err := ds.client.ReadMessage(); err != nil {
 				return nil, nil, err
 			}
@@ -575,39 +590,8 @@ func (ds *debuggerSession) continueExecution(ctx context.Context, _ *mcp.CallToo
 		return nil, nil, err
 	}
 
-	var result *mcp.CallToolResult
-	var resultErr error
-	for {
-		msg, err := ds.client.ReadMessage()
-		if err != nil {
-			return nil, nil, err
-		}
-		switch resp := msg.(type) {
-		case dap.ResponseMessage:
-			r := resp.GetResponse()
-			if r.RequestSeq != continueSeq {
-				log.Printf("continueExecution: skipping out-of-order response (request_seq=%d, waiting for %d)", r.RequestSeq, continueSeq)
-				continue
-			}
-			if !r.Success {
-				return nil, nil, fmt.Errorf("continue failed: %s", r.Message)
-			}
-		case *dap.StoppedEvent:
-			ds.stoppedThreadID = resp.Body.ThreadId
-			result, resultErr = ds.getFullContext(resp.Body.ThreadId, 0, 20)
-			if resultErr == nil && !params.FullContext {
-				result = stopSummary(result, resp.Body.Reason)
-			}
-			goto done
-		case *dap.TerminatedEvent:
-			result = &mcp.CallToolResult{
-				Content: []mcp.Content{&mcp.TextContent{Text: "Program terminated"}},
-			}
-			goto done
-		}
-	}
+	result, resultErr := ds.waitForStopOrTermination(continueSeq, params.FullContext, "continue failed")
 
-done:
 	// Remove the temporary run-to-cursor breakpoint if one was added
 	if cleanupRunToCursor != nil {
 		if err := cleanupRunToCursor(); err != nil {
@@ -619,7 +603,7 @@ done:
 
 // PauseParams defines the parameters for pausing execution.
 type PauseParams struct {
-	ThreadID FlexInt `json:"threadId" mcp:"thread ID to pause"`
+	ThreadID FlexInt `json:"threadId" jsonschema:"thread ID to pause"`
 }
 
 // pauseExecution pauses execution of a thread.
@@ -644,9 +628,9 @@ func (ds *debuggerSession) pauseExecution(ctx context.Context, _ *mcp.CallToolRe
 
 // EvaluateParams defines the parameters for evaluating an expression.
 type EvaluateParams struct {
-	Expression string   `json:"expression" mcp:"expression to evaluate"`
-	FrameID    *FlexInt `json:"frameId,omitempty" mcp:"stack frame ID for evaluation context (default: current frame)"`
-	Context    string   `json:"context,omitempty" mcp:"context for evaluation: watch, repl, hover (default: watch)"`
+	Expression string   `json:"expression" jsonschema:"expression to evaluate"`
+	FrameID    *FlexInt `json:"frameId,omitempty" jsonschema:"stack frame ID for evaluation context (default: current frame)"`
+	Context    string   `json:"context,omitempty" jsonschema:"context for evaluation: watch, repl, hover (default: watch)"`
 }
 
 // evaluateExpression evaluates an expression in the context of a stack frame.
@@ -710,9 +694,9 @@ func (ds *debuggerSession) evaluateExpression(ctx context.Context, _ *mcp.CallTo
 
 // SetVariableParams defines the parameters for setting a variable.
 type SetVariableParams struct {
-	VariablesReference FlexInt `json:"variablesReference" mcp:"reference to the variable container"`
-	Name               string  `json:"name" mcp:"name of the variable to set"`
-	Value              string  `json:"value" mcp:"new value for the variable"`
+	VariablesReference FlexInt `json:"variablesReference" jsonschema:"reference to the variable container"`
+	Name               string  `json:"name" jsonschema:"name of the variable to set"`
+	Value              string  `json:"value" jsonschema:"new value for the variable"`
 }
 
 // setVariable sets the value of a variable in the debugged program.
@@ -736,7 +720,7 @@ func (ds *debuggerSession) setVariable(ctx context.Context, _ *mcp.CallToolReque
 
 // RestartParams defines the parameters for restarting the debugger.
 type RestartParams struct {
-	Args []string `json:"args,omitempty" mcp:"new command line arguments for the program upon restart, or empty to reuse previous arguments"`
+	Args []string `json:"args,omitempty" jsonschema:"new command line arguments for the program upon restart, or empty to reuse previous arguments"`
 }
 
 // restartDebugger restarts the debugging session.
@@ -785,6 +769,29 @@ func (ds *debuggerSession) info(ctx context.Context, _ *mcp.CallToolRequest, par
 	}
 
 	switch infoType {
+	case "breakpoints":
+		var bp strings.Builder
+		bp.WriteString("Breakpoints:\n")
+		hasBP := false
+		if len(ds.lineBreakpoints) > 0 {
+			for file, lines := range ds.lineBreakpoints {
+				for _, line := range lines {
+					fmt.Fprintf(&bp, "  %s:%d\n", file, line)
+					hasBP = true
+				}
+			}
+		}
+		for _, fn := range ds.functionBreakpoints {
+			fmt.Fprintf(&bp, "  function %s\n", fn)
+			hasBP = true
+		}
+		if !hasBP {
+			bp.WriteString("  (none)\n")
+		}
+		return &mcp.CallToolResult{
+			Content: []mcp.Content{&mcp.TextContent{Text: bp.String()}},
+		}, nil, nil
+
 	case "threads":
 		seq, err := ds.client.ThreadsRequest()
 		if err != nil {
@@ -886,15 +893,15 @@ func (ds *debuggerSession) info(ctx context.Context, _ *mcp.CallToolRequest, par
 		return nil, nil, fmt.Errorf("registers not available (adapter did not report a Registers scope)")
 
 	default:
-		return nil, nil, fmt.Errorf("invalid type: %s (must be 'threads', 'sources', 'modules', or 'registers')", infoType)
+		return nil, nil, fmt.Errorf("invalid type: %s (must be 'threads', 'breakpoints', 'sources', 'modules', or 'registers')", infoType)
 	}
 }
 
 // DisassembleParams defines the parameters for disassembling code.
 type DisassembleParams struct {
-	Address string  `json:"address" mcp:"memory address to disassemble (e.g. '0x00400780')"`
-	Offset  FlexInt `json:"offset,omitempty" mcp:"instruction offset from address (default: 0)"`
-	Count   FlexInt `json:"count,omitempty" mcp:"number of instructions to disassemble (default: 20)"`
+	Address string  `json:"address" jsonschema:"memory address to disassemble (e.g. '0x00400780')"`
+	Offset  FlexInt `json:"offset,omitempty" jsonschema:"instruction offset from address (default: 0)"`
+	Count   FlexInt `json:"count,omitempty" jsonschema:"number of instructions to disassemble (default: 20)"`
 }
 
 // disassembleCode disassembles code at a memory reference.
@@ -1203,21 +1210,21 @@ initialized:
 	// Set breakpoints
 	for _, bp := range params.Breakpoints {
 		if bp.Function != "" {
-			seq, alreadyExists, err := ds.addFunctionBreakpoint(bp.Function)
+			seq, err := ds.addFunctionBreakpoint(bp.Function)
 			if err != nil {
 				return nil, nil, err
 			}
-			if !alreadyExists {
+			if seq > 0 {
 				if err := readAndValidateResponse(ds.client, seq, "unable to set function breakpoint"); err != nil {
 					return nil, nil, err
 				}
 			}
 		} else if bp.File != "" && bp.Line > 0 {
-			seq, alreadyExists, err := ds.addLineBreakpoint(bp.File, bp.Line)
+			seq, err := ds.addLineBreakpoint(bp.File, bp.Line)
 			if err != nil {
 				return nil, nil, err
 			}
-			if !alreadyExists {
+			if seq > 0 {
 				if err := readAndValidateResponse(ds.client, seq, "unable to set breakpoint"); err != nil {
 					return nil, nil, err
 				}
@@ -1325,12 +1332,27 @@ initialized:
 		return stopSummary(result, "breakpoint"), nil, nil
 	}
 
-	// Return simple success message when stopped on entry.
-	// The StoppedEvent from the adapter (if any) will be consumed by the
-	// next readTypedResponse call, which skips EventMessages.
-	return &mcp.CallToolResult{
-		Content: []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf("Debug session started for %s. Use 'breakpoint' to set breakpoints and 'continue' to run.", params.Path)}},
-	}, nil, nil
+	// Stopped on entry, try to populate stoppedThreadID and lastFrameID
+	// so that evaluate, context, etc. work immediately.
+	//
+	// Delve does NOT send a StoppedEvent for stopOnEntry; GDB does but
+	// the response readers inside getFullContext will skip it as an event.
+	// In both cases the program is already stopped after configurationDone,
+	// so we call getFullContext directly.
+	//
+	// getFullContext may fail at the entry point (e.g. Delve before the Go
+	// runtime is initialized). In that case we fall back to a helpful message.
+	ds.stoppedThreadID = 1
+	result, err := ds.getFullContext(ds.stoppedThreadID, 0, 20)
+	if err != nil {
+		return &mcp.CallToolResult{
+			Content: []mcp.Content{&mcp.TextContent{Text: "Stopped at program entry. Set breakpoints and use 'continue' to reach your code."}},
+		}, nil, nil
+	}
+	if params.FullContext {
+		return result, nil, nil
+	}
+	return stopSummary(result, "entry"), nil, nil
 }
 
 // context returns the full debugging context at the current location.
@@ -1393,53 +1415,24 @@ func (ds *debuggerSession) step(ctx context.Context, _ *mcp.CallToolRequest, par
 	}
 
 	// Execute the appropriate step command
+	var requestSeq int
+	var err error
 	switch params.Mode {
 	case "over":
-		stepSeq, err := ds.client.NextRequest(threadID)
-		if err != nil {
-			return nil, nil, err
-		}
-		_ = stepSeq
+		requestSeq, err = ds.client.NextRequest(threadID)
 	case "in":
-		stepSeq, err := ds.client.StepInRequest(threadID)
-		if err != nil {
-			return nil, nil, err
-		}
-		_ = stepSeq
+		requestSeq, err = ds.client.StepInRequest(threadID)
 	case "out":
-		stepSeq, err := ds.client.StepOutRequest(threadID)
-		if err != nil {
-			return nil, nil, err
-		}
-		_ = stepSeq
+		requestSeq, err = ds.client.StepOutRequest(threadID)
 	default:
 		return nil, nil, fmt.Errorf("invalid step mode: %s (must be 'over', 'in', or 'out')", params.Mode)
 	}
-
-	// Wait for stopped or terminated event
-	for {
-		msg, err := ds.client.ReadMessage()
-		if err != nil {
-			return nil, nil, err
-		}
-		switch resp := msg.(type) {
-		case dap.ResponseMessage:
-			if !resp.GetResponse().Success {
-				return nil, nil, fmt.Errorf("step failed: %s", resp.GetResponse().Message)
-			}
-		case *dap.StoppedEvent:
-			ds.stoppedThreadID = resp.Body.ThreadId
-			result, err := ds.getFullContext(resp.Body.ThreadId, 0, 20)
-			if err != nil || params.FullContext {
-				return result, nil, err
-			}
-			return stopSummary(result, resp.Body.Reason), nil, nil
-		case *dap.TerminatedEvent:
-			return &mcp.CallToolResult{
-				Content: []mcp.Content{&mcp.TextContent{Text: "Program terminated"}},
-			}, nil, nil
-		}
+	if err != nil {
+		return nil, nil, err
 	}
+
+	result, err := ds.waitForStopOrTermination(requestSeq, params.FullContext, "step failed")
+	return result, nil, err
 }
 
 // getFullContext returns a complete context dump including location, stack trace, scopes, and variables.
@@ -1502,6 +1495,67 @@ func (ds *debuggerSession) getFullContext(threadID, frameID, maxFrames int) (*mc
 	return &mcp.CallToolResult{
 		Content: []mcp.Content{&mcp.TextContent{Text: result.String()}},
 	}, nil
+}
+
+// waitForStopOrTermination reads DAP messages until a StoppedEvent or
+// TerminatedEvent is received. It handles response matching (by requestSeq),
+// OutputEvent accumulation, and ExitedEvent capture along the way.
+func (ds *debuggerSession) waitForStopOrTermination(requestSeq int, fullContext bool, errPrefix string) (*mcp.CallToolResult, error) {
+	var exitCode *int
+	var output strings.Builder
+	const maxOutput = 4096
+	for {
+		msg, err := ds.client.ReadMessage()
+		if err != nil {
+			return nil, err
+		}
+		switch resp := msg.(type) {
+		case dap.ResponseMessage:
+			r := resp.GetResponse()
+			if r.RequestSeq != requestSeq {
+				log.Printf("%s: skipping out-of-order response (request_seq=%d, waiting for %d)", errPrefix, r.RequestSeq, requestSeq)
+				continue
+			}
+			if !r.Success {
+				return nil, fmt.Errorf("%s: %s", errPrefix, r.Message)
+			}
+		case *dap.StoppedEvent:
+			ds.stoppedThreadID = resp.Body.ThreadId
+			result, err := ds.getFullContext(resp.Body.ThreadId, 0, 20)
+			if err != nil || fullContext {
+				return result, err
+			}
+			return stopSummary(result, resp.Body.Reason), nil
+		case *dap.OutputEvent:
+			if output.Len() < maxOutput {
+				output.WriteString(resp.Body.Output)
+			}
+		case *dap.ExitedEvent:
+			code := resp.Body.ExitCode
+			exitCode = &code
+		case *dap.TerminatedEvent:
+			return &mcp.CallToolResult{
+				Content: []mcp.Content{&mcp.TextContent{Text: formatTermination(exitCode, output.String())}},
+			}, nil
+		}
+	}
+}
+
+// formatTermination builds a human-readable termination message from an
+// optional exit code and captured program output.
+func formatTermination(exitCode *int, output string) string {
+	var msg strings.Builder
+	if exitCode != nil {
+		fmt.Fprintf(&msg, "Program exited with code %d.", *exitCode)
+	} else {
+		msg.WriteString("Program terminated.")
+	}
+	output = strings.TrimRight(output, "\n")
+	if output != "" {
+		msg.WriteString("\nOutput:\n")
+		msg.WriteString(output)
+	}
+	return msg.String()
 }
 
 // stopSummary extracts a compact stop message from a full context result,
@@ -1587,11 +1641,11 @@ func (ds *debuggerSession) breakpoint(ctx context.Context, _ *mcp.CallToolReques
 	}
 
 	if params.Function != "" {
-		seq, alreadyExists, err := ds.addFunctionBreakpoint(params.Function)
+		seq, err := ds.addFunctionBreakpoint(params.Function)
 		if err != nil {
 			return nil, nil, err
 		}
-		if alreadyExists {
+		if seq == 0 {
 			return &mcp.CallToolResult{
 				Content: []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf("Breakpoint already set on function: %s", params.Function)}},
 			}, nil, nil
@@ -1610,7 +1664,7 @@ func (ds *debuggerSession) breakpoint(ctx context.Context, _ *mcp.CallToolReques
 			if bp.Reason == "pending" {
 				// Pending breakpoints may be verified later (e.g. when a shared library loads).
 				// Keep them in the tracked list.
-				msg := fmt.Sprintf("Breakpoint set on function %s (pending — will resolve when the source is loaded)", params.Function)
+				msg := fmt.Sprintf("Breakpoint set on function %s (pending — may resolve when additional source is loaded)", params.Function)
 				if bp.Message != "" {
 					msg = fmt.Sprintf("Breakpoint set on function %s (pending: %s)", params.Function, bp.Message)
 				}
@@ -1644,11 +1698,11 @@ func (ds *debuggerSession) breakpoint(ctx context.Context, _ *mcp.CallToolReques
 		return nil, nil, fmt.Errorf("either function or file+line is required")
 	}
 
-	bpSeq, alreadyExists, err := ds.addLineBreakpoint(params.File, params.Line.Int())
+	bpSeq, err := ds.addLineBreakpoint(params.File, params.Line.Int())
 	if err != nil {
 		return nil, nil, err
 	}
-	if alreadyExists {
+	if bpSeq == 0 {
 		return &mcp.CallToolResult{
 			Content: []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf("Breakpoint already set at %s:%d", params.File, params.Line.Int())}},
 		}, nil, nil
@@ -1668,7 +1722,7 @@ func (ds *debuggerSession) breakpoint(ctx context.Context, _ *mcp.CallToolReques
 		if bp.Reason == "pending" {
 			// Pending breakpoints may be verified later (e.g. when a shared library loads).
 			// Keep them in the tracked list.
-			msg := fmt.Sprintf("Breakpoint set at %s:%d (pending — will resolve when the source is loaded)", params.File, params.Line.Int())
+			msg := fmt.Sprintf("Breakpoint set at %s:%d (pending — may resolve when additional source is loaded)", params.File, params.Line.Int())
 			if bp.Message != "" {
 				msg = fmt.Sprintf("Breakpoint set at %s:%d (pending: %s)", params.File, params.Line.Int(), bp.Message)
 			}
