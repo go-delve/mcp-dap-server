@@ -1070,8 +1070,9 @@ func (ds *debuggerSession) debug(ctx context.Context, _ *mcp.CallToolRequest, pa
 		log.Printf("warning: tool-level logging is not supported for Delve; Delve DAP logs go to the server log")
 	}
 
-	// Note: GDB can auto-detect the executable from the core file,
-	// so params.Path is optional for GDB core mode.
+	if mode == "core" && params.Path == "" && debugger != "gdb" {
+		return nil, nil, fmt.Errorf("path is required for core mode with %s (only GDB can auto-detect the executable from a core file)", debugger)
+	}
 
 	// Spawn DAP server via backend
 	cmd, listenAddr, err := ds.backend.Spawn(port, ds.logWriter)
@@ -1123,7 +1124,7 @@ func (ds *debuggerSession) debug(ctx context.Context, _ *mcp.CallToolRequest, pa
 
 	// Launch or attach using backend-specific args
 	stopOnEntry := params.StopOnEntry || len(params.Breakpoints) == 0
-	var launchSeq int
+	launchSeq := -1
 	switch mode {
 	case "source", "binary":
 		launchArgs, err := ds.backend.LaunchArgs(mode, params.Path, stopOnEntry, params.Args)
@@ -1266,6 +1267,7 @@ initialized:
 				if r.RequestSeq == launchSeq && !r.Success {
 					return nil, nil, fmt.Errorf("unable to start debug session: %s", r.Message)
 				}
+				// Successful deferred response; keep waiting for StoppedEvent
 			case dap.EventMessage:
 				continue
 			}
@@ -1309,6 +1311,7 @@ initialized:
 				if r.RequestSeq == launchSeq && !r.Success {
 					return nil, nil, fmt.Errorf("unable to start debug session: %s", r.Message)
 				}
+				// Successful deferred response; keep waiting for StoppedEvent
 			}
 		}
 	stopped:

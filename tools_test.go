@@ -283,6 +283,13 @@ func requireGDBDeps(t *testing.T) {
 	}
 }
 
+func skipIfGDBLacksCoreFileSupport(t *testing.T, errorMsg string) {
+	t.Helper()
+	if strings.Contains(errorMsg, "attach requires either") {
+		t.Skipf("GDB does not support DAP core file loading (requires GDB 18+): %s", errorMsg)
+	}
+}
+
 // compileTestCProgram compiles a C test program with debug symbols and returns the binary path.
 func compileTestCProgram(t *testing.T, cwd, name string) (binaryPath string, cleanup func()) {
 	t.Helper()
@@ -1181,11 +1188,7 @@ func TestGDBCoreDump(t *testing.T) {
 				errorMsg = tc.Text
 			}
 		}
-		// GDB added DAP core file support after 17.2 (via attach + coreFile).
-		// Older versions reject the attach with this specific error.
-		if strings.Contains(errorMsg, "attach requires either") {
-			t.Skipf("GDB does not support DAP core file loading (requires GDB 18+): %s", errorMsg)
-		}
+		skipIfGDBLacksCoreFileSupport(t, errorMsg)
 		t.Fatalf("GDB core debug session returned error: %s", errorMsg)
 	}
 
@@ -1240,9 +1243,7 @@ func TestGDBCoreDumpWithoutPath(t *testing.T) {
 				errorMsg = tc.Text
 			}
 		}
-		if strings.Contains(errorMsg, "attach requires either") {
-			t.Skipf("GDB does not support DAP core file loading (requires GDB 18+): %s", errorMsg)
-		}
+		skipIfGDBLacksCoreFileSupport(t, errorMsg)
 		t.Fatalf("GDB core debug session without path returned error: %s", errorMsg)
 	}
 
@@ -1251,6 +1252,9 @@ func TestGDBCoreDumpWithoutPath(t *testing.T) {
 
 	if !strings.Contains(contextStr, "crash") {
 		t.Errorf("Expected stack trace to contain 'crash', got:\n%s", contextStr)
+	}
+	if !strings.Contains(contextStr, "main") {
+		t.Errorf("Expected stack trace to contain 'main', got:\n%s", contextStr)
 	}
 
 	ts.stopDebugger(t)
