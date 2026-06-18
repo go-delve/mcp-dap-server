@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"io"
 	"net/http"
@@ -17,6 +18,46 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
+
+var dapLogDir string
+
+func TestMain(m *testing.M) {
+	flag.StringVar(&dapLogDir, "dap-log", "", "directory for DAP protocol and tool logs (enables verbose DAP logging)")
+	flag.Parse()
+	if dapLogDir != "" {
+		if err := os.MkdirAll(dapLogDir, 0o755); err != nil {
+			fmt.Fprintf(os.Stderr, "failed to create dap-log dir: %v\n", err)
+			os.Exit(1)
+		}
+	}
+	os.Exit(m.Run())
+}
+
+func dapLogArgs(t *testing.T) map[string]any {
+	if dapLogDir == "" {
+		return nil
+	}
+	name := strings.ReplaceAll(t.Name(), "/", "_")
+	return map[string]any{
+		"protocolLog": filepath.Join(dapLogDir, name+".protocol.log"),
+		"toolLog":     filepath.Join(dapLogDir, name+".tool.log"),
+	}
+}
+
+func dumpDAPLogs(t *testing.T) {
+	if dapLogDir == "" {
+		return
+	}
+	name := strings.ReplaceAll(t.Name(), "/", "_")
+	for _, suffix := range []string{".protocol.log", ".tool.log"} {
+		path := filepath.Join(dapLogDir, name+suffix)
+		data, err := os.ReadFile(path)
+		if err != nil || len(data) == 0 {
+			continue
+		}
+		t.Logf("\n=== %s ===\n%s", filepath.Base(path), string(data))
+	}
+}
 
 // testSetup holds the common test infrastructure
 type testSetup struct {
@@ -129,6 +170,9 @@ func (ts *testSetup) startDebugSession(t *testing.T, port string, binaryPath str
 	if len(programArgs) > 0 {
 		args["args"] = programArgs
 	}
+	for k, v := range dapLogArgs(t) {
+		args[k] = v
+	}
 
 	result, err := ts.session.CallTool(ts.ctx, &mcp.CallToolParams{
 		Name:      "debug",
@@ -236,6 +280,13 @@ func requireGDBDeps(t *testing.T) {
 	t.Helper()
 	if _, err := exec.LookPath("gdb"); err != nil {
 		t.Skip("gdb not found in PATH")
+	}
+}
+
+func skipIfGDBLacksCoreFileSupport(t *testing.T, errorMsg string) {
+	t.Helper()
+	if strings.Contains(errorMsg, "attach requires either") {
+		t.Skipf("GDB does not support DAP core file loading (requires GDB 18+): %s", errorMsg)
 	}
 }
 
@@ -1105,14 +1156,27 @@ func TestGDBCoreDump(t *testing.T) {
 	corePath := generateCoreDump(t, binaryPath)
 	defer os.Remove(corePath)
 
+	// Remove execute permission so GDB cannot re-run the binary.
+	// Core dump analysis only needs to read the binary for symbols;
+	// if GDB tries to execute it instead, the session will fail.
+	if err := os.Chmod(binaryPath, 0o444); err != nil {
+		t.Fatalf("Failed to chmod binary: %v", err)
+	}
+
+	debugArgs := map[string]any{
+		"debugger":     "gdb",
+		"mode":         "core",
+		"path":         binaryPath,
+		"coreFilePath": corePath,
+	}
+	for k, v := range dapLogArgs(t) {
+		debugArgs[k] = v
+	}
+	defer dumpDAPLogs(t)
+
 	result, err := ts.session.CallTool(ts.ctx, &mcp.CallToolParams{
-		Name: "debug",
-		Arguments: map[string]any{
-			"debugger":     "gdb",
-			"mode":         "core",
-			"path":         binaryPath,
-			"coreFilePath": corePath,
-		},
+		Name:      "debug",
+		Arguments: debugArgs,
 	})
 	if err != nil {
 		t.Fatalf("Failed to start GDB core debug session: %v", err)
@@ -1124,6 +1188,7 @@ func TestGDBCoreDump(t *testing.T) {
 				errorMsg = tc.Text
 			}
 		}
+		skipIfGDBLacksCoreFileSupport(t, errorMsg)
 		t.Fatalf("GDB core debug session returned error: %s", errorMsg)
 	}
 
@@ -1140,9 +1205,8 @@ func TestGDBCoreDump(t *testing.T) {
 	ts.stopDebugger(t)
 }
 
-// Start a 'core' session for GDB passing a core file but no
-// executable.  GDB should be able to figure out the executable
-// from the core file.
+// GDB can auto-detect the executable from the core file,
+// so the program path should be optional.
 func TestGDBCoreDumpWithoutPath(t *testing.T) {
 	requireGDBDeps(t)
 
@@ -1155,14 +1219,19 @@ func TestGDBCoreDumpWithoutPath(t *testing.T) {
 	corePath := generateCoreDump(t, binaryPath)
 	defer os.Remove(corePath)
 
-	// Do not pass "path" — GDB should auto-detect the executable from the core file.
+	debugArgs := map[string]any{
+		"debugger":     "gdb",
+		"mode":         "core",
+		"coreFilePath": corePath,
+	}
+	for k, v := range dapLogArgs(t) {
+		debugArgs[k] = v
+	}
+	defer dumpDAPLogs(t)
+
 	result, err := ts.session.CallTool(ts.ctx, &mcp.CallToolParams{
-		Name: "debug",
-		Arguments: map[string]any{
-			"debugger":     "gdb",
-			"mode":         "core",
-			"coreFilePath": corePath,
-		},
+		Name:      "debug",
+		Arguments: debugArgs,
 	})
 	if err != nil {
 		t.Fatalf("Failed to start GDB core debug session without path: %v", err)
@@ -1174,6 +1243,7 @@ func TestGDBCoreDumpWithoutPath(t *testing.T) {
 				errorMsg = tc.Text
 			}
 		}
+		skipIfGDBLacksCoreFileSupport(t, errorMsg)
 		t.Fatalf("GDB core debug session without path returned error: %s", errorMsg)
 	}
 

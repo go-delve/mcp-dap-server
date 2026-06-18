@@ -1124,6 +1124,7 @@ func (ds *debuggerSession) debug(ctx context.Context, _ *mcp.CallToolRequest, pa
 
 	// Launch or attach using backend-specific args
 	stopOnEntry := params.StopOnEntry || len(params.Breakpoints) == 0
+	launchSeq := -1
 	switch mode {
 	case "source", "binary":
 		launchArgs, err := ds.backend.LaunchArgs(mode, params.Path, stopOnEntry, params.Args)
@@ -1131,6 +1132,7 @@ func (ds *debuggerSession) debug(ctx context.Context, _ *mcp.CallToolRequest, pa
 			return nil, nil, err
 		}
 		req := ds.client.newRequest("launch")
+		launchSeq = req.Seq
 		request := &dap.LaunchRequest{Request: *req}
 		request.Arguments = toRawMessage(launchArgs)
 		if err := ds.client.send(request); err != nil {
@@ -1145,9 +1147,11 @@ func (ds *debuggerSession) debug(ctx context.Context, _ *mcp.CallToolRequest, pa
 		var request dap.Message
 		if ds.backend.CoreRequestType() == "attach" {
 			req := ds.client.newRequest("attach")
+			launchSeq = req.Seq
 			request = &dap.AttachRequest{Request: *req, Arguments: rawArgs}
 		} else if ds.backend.CoreRequestType() == "launch" {
 			req := ds.client.newRequest("launch")
+			launchSeq = req.Seq
 			request = &dap.LaunchRequest{Request: *req, Arguments: rawArgs}
 		} else {
 			return nil, nil, fmt.Errorf("unsupported core request type: %s", ds.backend.CoreRequestType())
@@ -1161,6 +1165,7 @@ func (ds *debuggerSession) debug(ctx context.Context, _ *mcp.CallToolRequest, pa
 			return nil, nil, err
 		}
 		req := ds.client.newRequest("attach")
+		launchSeq = req.Seq
 		request := &dap.AttachRequest{Request: *req}
 		request.Arguments = toRawMessage(attachArgs)
 		if err := ds.client.send(request); err != nil {
@@ -1171,13 +1176,13 @@ func (ds *debuggerSession) debug(ctx context.Context, _ *mcp.CallToolRequest, pa
 	//
 	// Delve: launch response arrives immediately, then initialized event.
 	//
-	// GDB native DAP: may send an "initialized" event before or after the
-	// launch response.
+	// GDB native DAP: sends initialized event first, then DEFERS the
+	// launch/attach response until after configurationDone is processed.
 	//
-	// We unify both by reading messages until we see the initialized event.
+	// We read messages until we see the initialized event.
 	// The launch response may arrive before or after — if it arrives here,
-	// we consume it. If it arrives later, it will be automatically skipped
-	// as an out-of-order response by subsequent seq-based readers.
+	// we consume it and check for errors. If it arrives later (GDB's deferred
+	// pattern), it will be checked in subsequent message-reading loops.
 	for {
 		msg, err := ds.client.ReadMessage()
 		if err != nil {
@@ -1188,7 +1193,6 @@ func (ds *debuggerSession) debug(ctx context.Context, _ *mcp.CallToolRequest, pa
 			if !resp.GetResponse().Success {
 				return nil, nil, fmt.Errorf("unable to start debug session: %s", resp.GetResponse().Message)
 			}
-			// Launch response consumed; continue reading for initialized event
 		case *dap.InitializedEvent:
 			_ = resp
 			goto initialized
@@ -1230,16 +1234,17 @@ initialized:
 		return nil, nil, err
 	}
 
-	// If the launch response was deferred (arrived after the initialized event),
-	// it will be automatically consumed and skipped as an out-of-order response by
-	// subsequent readAndValidateResponse/readTypedResponse calls, which match
-	// by request_seq.
-
 	// Register session-specific tools based on capabilities
 	ds.registerSessionTools()
 
 	// For core dump mode, the program is already stopped at the crash point.
 	// Wait for the StoppedEvent from the adapter before returning context.
+	//
+	// GDB native DAP defers the launch/attach response until after
+	// configurationDone is processed. If the attach fails (e.g. unsupported
+	// coreFile parameter), the error response arrives here. We must check
+	// ResponseMessages to avoid hanging forever waiting for a StoppedEvent
+	// that will never come.
 	if mode == "core" {
 		for {
 			msg, err := ds.client.ReadMessage()
@@ -1257,6 +1262,12 @@ initialized:
 					return result, nil, err
 				}
 				return stopSummary(result, ev.Body.Reason), nil, nil
+			case dap.ResponseMessage:
+				r := ev.GetResponse()
+				if r.RequestSeq == launchSeq && !r.Success {
+					return nil, nil, fmt.Errorf("unable to start debug session: %s", r.Message)
+				}
+				// Successful deferred response; keep waiting for StoppedEvent
 			case dap.EventMessage:
 				continue
 			}
@@ -1295,6 +1306,12 @@ initialized:
 				goto stopped
 			case *dap.TerminatedEvent:
 				goto stopped
+			case dap.ResponseMessage:
+				r := ev.GetResponse()
+				if r.RequestSeq == launchSeq && !r.Success {
+					return nil, nil, fmt.Errorf("unable to start debug session: %s", r.Message)
+				}
+				// Successful deferred response; keep waiting for StoppedEvent
 			}
 		}
 	stopped:
