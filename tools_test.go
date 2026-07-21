@@ -1882,6 +1882,74 @@ func TestRunToCursorCleansUpBreakpoint(t *testing.T) {
 	ts.stopDebugger(t)
 }
 
+// TestContinueWithEmptyTo verifies that passing an empty but non-null "to" object
+// (e.g. {"to": {"file": "", "function": "", "line": 0}}) behaves like a plain
+// continue rather than hanging. Some LLM tool-calling implementations populate
+// optional object parameters with default zero values instead of omitting them.
+func TestContinueWithEmptyTo(t *testing.T) {
+	ts := setupMCPServerAndClient(t)
+	defer ts.cleanup()
+
+	binaryPath, cleanupBinary := compileTestProgram(t, ts.cwd, "helloworld")
+	defer cleanupBinary()
+
+	f := filepath.Join(ts.cwd, "testdata", "go", "helloworld", "main.go")
+	ts.startDebugSession(t, "0", binaryPath, []map[string]any{
+		{"file": f, "line": 7},
+	})
+
+	// Stopped at the breakpoint. Now continue with an empty "to" object —
+	// this simulates what GPT-5.6 Sol and other models send.
+	text, isErr := ts.callTool(t, "continue", map[string]any{
+		"to": map[string]any{"file": "", "function": "", "line": 0},
+	})
+	if isErr {
+		t.Fatalf("continue with empty 'to' returned error: %s", text)
+	}
+	// The program should run to completion (no more breakpoints).
+	if !strings.Contains(text, "terminated") && !strings.Contains(text, "exited") {
+		t.Errorf("Expected program to terminate with empty 'to', got: %s", text)
+	}
+	t.Logf("Continue with empty to result: %s", text)
+
+	ts.stopDebugger(t)
+}
+
+// TestContinueWithPartialTo verifies that a "to" with partial data (e.g. file
+// set but no line) returns an error rather than silently misbehaving.
+func TestContinueWithPartialTo(t *testing.T) {
+	ts := setupMCPServerAndClient(t)
+	defer ts.cleanup()
+
+	binaryPath, cleanupBinary := compileTestProgram(t, ts.cwd, "helloworld")
+	defer cleanupBinary()
+
+	f := filepath.Join(ts.cwd, "testdata", "go", "helloworld", "main.go")
+	ts.startDebugSession(t, "0", binaryPath, []map[string]any{
+		{"file": f, "line": 7},
+	})
+
+	// file set but line is 0 — incomplete spec that should be rejected
+	text, isErr := ts.callTool(t, "continue", map[string]any{
+		"to": map[string]any{"file": f, "line": 0},
+	})
+	if !isErr {
+		t.Fatalf("Expected error for partial 'to' (file without line), got: %s", text)
+	}
+	t.Logf("Partial to error (expected): %s", text)
+
+	// line set but no file and no function — also invalid
+	text, isErr = ts.callTool(t, "continue", map[string]any{
+		"to": map[string]any{"line": 5},
+	})
+	if !isErr {
+		t.Fatalf("Expected error for partial 'to' (line without file), got: %s", text)
+	}
+	t.Logf("Partial to error (expected): %s", text)
+
+	ts.stopDebugger(t)
+}
+
 func TestInfo(t *testing.T) {
 	ts := setupMCPServerAndClient(t)
 	defer ts.cleanup()
