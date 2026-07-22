@@ -1335,13 +1335,48 @@ initialized:
 	// Stopped on entry, try to populate stoppedThreadID and lastFrameID
 	// so that evaluate, context, etc. work immediately.
 	//
-	// Delve does NOT send a StoppedEvent for stopOnEntry; GDB does but
-	// the response readers inside getFullContext will skip it as an event.
-	// In both cases the program is already stopped after configurationDone,
-	// so we call getFullContext directly.
+	// Delve does NOT send a StoppedEvent for stopOnEntry — the program is
+	// already stopped after configurationDone, so we call getFullContext
+	// directly.
 	//
-	// getFullContext may fail at the entry point (e.g. Delve before the Go
-	// runtime is initialized). In that case we fall back to a helpful message.
+	// GDB DOES send a StoppedEvent asynchronously after configurationDone,
+	// once the inferior actually reaches the entry point. Calling
+	// getFullContext before that event races: stackTrace returns empty
+	// frames and scopes returns "notStopped", and the late StoppedEvent
+	// can be skipped/lost by subsequent response readers. Wait for it.
+	if _, isGDB := ds.backend.(*gdbBackend); isGDB {
+		for {
+			msg, err := ds.client.ReadMessage()
+			if err != nil {
+				return nil, nil, err
+			}
+			switch ev := msg.(type) {
+			case *dap.StoppedEvent:
+				ds.stoppedThreadID = ev.Body.ThreadId
+				if ds.stoppedThreadID == 0 {
+					ds.stoppedThreadID = 1
+				}
+				result, err := ds.getFullContext(ds.stoppedThreadID, 0, 20)
+				if err != nil || params.FullContext {
+					return result, nil, err
+				}
+				return stopSummary(result, ev.Body.Reason), nil, nil
+			case *dap.TerminatedEvent:
+				return &mcp.CallToolResult{
+					Content: []mcp.Content{&mcp.TextContent{Text: "Program terminated."}},
+				}, nil, nil
+			case dap.ResponseMessage:
+				r := ev.GetResponse()
+				if r.RequestSeq == launchSeq && !r.Success {
+					return nil, nil, fmt.Errorf("unable to start debug session: %s", r.Message)
+				}
+				// Successful deferred launch response; keep waiting for StoppedEvent
+			}
+		}
+	}
+
+	// Delve path: getFullContext may fail at the entry point (e.g. before the
+	// Go runtime is initialized). Fall back to a helpful message in that case.
 	ds.stoppedThreadID = 1
 	result, err := ds.getFullContext(ds.stoppedThreadID, 0, 20)
 	if err != nil {
