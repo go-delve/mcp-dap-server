@@ -1253,32 +1253,8 @@ initialized:
 	// ResponseMessages to avoid hanging forever waiting for a StoppedEvent
 	// that will never come.
 	if mode == "core" {
-		for {
-			msg, err := ds.client.ReadMessage()
-			if err != nil {
-				return nil, nil, err
-			}
-			switch ev := msg.(type) {
-			case *dap.StoppedEvent:
-				ds.stoppedThreadID = ev.Body.ThreadId
-				if ds.stoppedThreadID == 0 {
-					ds.stoppedThreadID = 1
-				}
-				result, err := ds.getFullContext(ds.stoppedThreadID, 0, 20)
-				if err != nil || params.FullContext {
-					return result, nil, err
-				}
-				return stopSummary(result, ev.Body.Reason), nil, nil
-			case dap.ResponseMessage:
-				r := ev.GetResponse()
-				if r.RequestSeq == launchSeq && !r.Success {
-					return nil, nil, fmt.Errorf("unable to start debug session: %s", r.Message)
-				}
-				// Successful deferred response; keep waiting for StoppedEvent
-			case dap.EventMessage:
-				continue
-			}
-		}
+		result, err := ds.waitForStopOrTermination(launchSeq, params.FullContext, "unable to start debug session")
+		return result, nil, err
 	}
 
 	// If we have breakpoints and not explicitly stopping on entry, wait for the
@@ -1345,34 +1321,8 @@ initialized:
 	// frames and scopes returns "notStopped", and the late StoppedEvent
 	// can be skipped/lost by subsequent response readers. Wait for it.
 	if _, isGDB := ds.backend.(*gdbBackend); isGDB {
-		for {
-			msg, err := ds.client.ReadMessage()
-			if err != nil {
-				return nil, nil, err
-			}
-			switch ev := msg.(type) {
-			case *dap.StoppedEvent:
-				ds.stoppedThreadID = ev.Body.ThreadId
-				if ds.stoppedThreadID == 0 {
-					ds.stoppedThreadID = 1
-				}
-				result, err := ds.getFullContext(ds.stoppedThreadID, 0, 20)
-				if err != nil || params.FullContext {
-					return result, nil, err
-				}
-				return stopSummary(result, ev.Body.Reason), nil, nil
-			case *dap.TerminatedEvent:
-				return &mcp.CallToolResult{
-					Content: []mcp.Content{&mcp.TextContent{Text: "Program terminated."}},
-				}, nil, nil
-			case dap.ResponseMessage:
-				r := ev.GetResponse()
-				if r.RequestSeq == launchSeq && !r.Success {
-					return nil, nil, fmt.Errorf("unable to start debug session: %s", r.Message)
-				}
-				// Successful deferred launch response; keep waiting for StoppedEvent
-			}
-		}
+		result, err := ds.waitForStopOrTermination(launchSeq, params.FullContext, "unable to start debug session")
+		return result, nil, err
 	}
 
 	// Delve path: getFullContext may fail at the entry point (e.g. before the
