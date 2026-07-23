@@ -947,6 +947,72 @@ func TestGDBBasic(t *testing.T) {
 	ts.stopDebugger(t)
 }
 
+// TestGDBStopOnEntry verifies that with GDB, stopOnEntry waits for the
+// asynchronous StoppedEvent before calling getFullContext. Without that wait,
+// getFullContext races ahead of the inferior and returns empty stacks /
+// "notStopped" scopes; continue then runs past breakpoints to exit.
+func TestGDBStopOnEntry(t *testing.T) {
+	requireGDBDeps(t)
+
+	ts := setupMCPServerAndClient(t)
+	defer ts.cleanup()
+
+	binaryPath, cleanupBinary := compileTestCProgram(t, ts.cwd, "helloworld")
+	defer cleanupBinary()
+
+	f := filepath.Join(ts.cwd, "testdata", "c", "helloworld", "main.c")
+
+	result, err := ts.session.CallTool(ts.ctx, &mcp.CallToolParams{
+		Name: "debug",
+		Arguments: map[string]any{
+			"debugger":    "gdb",
+			"mode":        "binary",
+			"path":        binaryPath,
+			"stopOnEntry": true,
+			"breakpoints": []map[string]any{
+				{"file": f, "line": 11},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Failed to start GDB stopOnEntry session: %v", err)
+	}
+	if result.IsError {
+		errorMsg := ""
+		if len(result.Content) > 0 {
+			if tc, ok := result.Content[0].(*mcp.TextContent); ok {
+				errorMsg = tc.Text
+			}
+		}
+		t.Fatalf("GDB stopOnEntry session returned error: %s", errorMsg)
+	}
+
+	contextStr := ts.getContextContent(t)
+	t.Logf("GDB stopOnEntry context:\n%s", contextStr)
+	if !strings.Contains(contextStr, "main") {
+		t.Fatalf("Expected context to contain 'main' after stopOnEntry, got: %s", contextStr)
+	}
+	if strings.Contains(contextStr, "unable to retrieve scopes") {
+		t.Fatalf("context reported scopes failure after stopOnEntry: %s", contextStr)
+	}
+
+	// Continue should hit the breakpoint at line 11, not run to termination.
+	text, isErr := ts.callTool(t, "continue", map[string]any{})
+	if isErr {
+		t.Fatalf("continue returned error: %s", text)
+	}
+	t.Logf("continue after stopOnEntry: %s", text)
+	if strings.Contains(text, "exited") || strings.Contains(text, "terminated") {
+		t.Fatalf("expected continue to hit breakpoint, program terminated: %s", text)
+	}
+	contextStr = ts.getContextContent(t)
+	if !strings.Contains(contextStr, "main.c:11") && !strings.Contains(contextStr, ":11") {
+		t.Errorf("Expected to be stopped at line 11 after continue, got: %s", contextStr)
+	}
+
+	ts.stopDebugger(t)
+}
+
 func TestGDBStep(t *testing.T) {
 	requireGDBDeps(t)
 
