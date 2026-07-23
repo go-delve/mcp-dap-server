@@ -538,10 +538,23 @@ func (ds *debuggerSession) continueExecution(ctx context.Context, _ *mcp.CallToo
 		return nil, nil, fmt.Errorf("debugger not started")
 	}
 
-	// If "to" is specified, set a temporary breakpoint
+	// If "to" is specified, set a temporary breakpoint.
+	// Normalize fully-empty "to" to nil. Some LLM tool-calling implementations
+	// send {"to": {"file": "", "function": "", "line": 0}} instead of omitting
+	// the field. Older code treated any non-nil "to" as run-to-cursor and then
+	// ReadMessage()'d for a breakpoint response that was never requested,
+	// hanging forever while holding ds.mu (blocking stop and all other tools).
+	if params.To != nil && params.To.File == "" && params.To.Function == "" && params.To.Line <= 0 {
+		params.To = nil
+	}
 	var cleanupRunToCursor func() error
 	if params.To != nil {
 		to := params.To
+		// Reject incomplete specs (e.g. file without line) rather than silently
+		// falling through to a plain continue.
+		if to.Function == "" && (to.File == "" || to.Line <= 0) {
+			return nil, nil, fmt.Errorf("run-to-cursor requires 'function' or 'file' with 'line'")
+		}
 		var addSeq int
 		if to.Function != "" {
 			var err error
