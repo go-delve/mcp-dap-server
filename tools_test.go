@@ -875,6 +875,12 @@ func TestToolListChangesWithCapabilities(t *testing.T) {
 	if !toolNames["evaluate"] {
 		t.Error("Expected 'evaluate' tool during active session")
 	}
+	if !toolNames["set-variable"] {
+		t.Error("Expected capability-gated 'set-variable' tool during active session")
+	}
+	if !toolNames["disassemble"] {
+		t.Error("Expected capability-gated 'disassemble' tool during active session")
+	}
 
 	// Stop debug session
 	ts.stopDebugger(t)
@@ -890,14 +896,50 @@ func TestToolListChangesWithCapabilities(t *testing.T) {
 		toolNames[tool.Name] = true
 	}
 
-	if !toolNames["debug"] {
-		t.Error("Expected 'debug' tool after session stop")
+	if len(toolNames) != 1 || !toolNames["debug"] {
+		t.Errorf("Expected only 'debug' after session stop, got %v", toolNames)
 	}
-	if toolNames["stop"] {
-		t.Error("Did not expect 'stop' tool after session stop")
+}
+
+func TestDelveRejectsNonGoBinaryWithDebuggerGuidance(t *testing.T) {
+	ts := setupMCPServerAndClient(t)
+	defer ts.cleanup()
+
+	binaryPath, cleanupBinary := compileTestCProgram(t, ts.cwd, "helloworld")
+	defer cleanupBinary()
+
+	result, err := ts.session.CallTool(ts.ctx, &mcp.CallToolParams{
+		Name: "debug",
+		Arguments: map[string]any{
+			"mode": "binary",
+			"path": binaryPath,
+		},
+	})
+	if err != nil {
+		t.Fatalf("debug call failed: %v", err)
 	}
-	if toolNames["breakpoint"] {
-		t.Error("Did not expect 'breakpoint' tool after session stop")
+	if !result.IsError {
+		t.Fatalf("Expected Delve to reject a non-Go binary, got: %v", result)
+	}
+
+	var errorText strings.Builder
+	for _, content := range result.Content {
+		if text, ok := content.(*mcp.TextContent); ok {
+			errorText.WriteString(text.Text)
+		}
+	}
+	for _, want := range []string{"Delve backend only supports Go programs", `debugger: "gdb"`} {
+		if !strings.Contains(errorText.String(), want) {
+			t.Errorf("Expected error to contain %q, got: %s", want, errorText.String())
+		}
+	}
+
+	toolList, err := ts.session.ListTools(ts.ctx, &mcp.ListToolsParams{})
+	if err != nil {
+		t.Fatalf("Failed to list tools after rejected debug call: %v", err)
+	}
+	if len(toolList.Tools) != 1 || toolList.Tools[0].Name != "debug" {
+		t.Errorf("Expected only 'debug' after rejected debug call, got: %v", toolList.Tools)
 	}
 }
 
@@ -1204,6 +1246,56 @@ func TestGDBEvaluateWatchContext(t *testing.T) {
 			}
 			t.Logf("evaluate %q = %s", tc.expression, text)
 		})
+	}
+
+	ts.stopDebugger(t)
+}
+
+func TestGDBContextSelectsRequestedFrame(t *testing.T) {
+	requireGDBDeps(t)
+
+	ts := setupMCPServerAndClient(t)
+	defer ts.cleanup()
+
+	binaryPath, cleanupBinary := compileTestCProgram(t, ts.cwd, "frames")
+	defer cleanupBinary()
+
+	sourcePath := filepath.Join(ts.cwd, "testdata", "c", "frames", "main.c")
+	text, isError := ts.callTool(t, "debug", map[string]any{
+		"debugger": "gdb",
+		"mode":     "binary",
+		"path":     binaryPath,
+		"breakpoints": []map[string]any{
+			{"file": sourcePath, "line": 14},
+		},
+	})
+	if isError {
+		t.Fatalf("Failed to start GDB session: %s", text)
+	}
+
+	contextText, isError := ts.callTool(t, "context", map[string]any{"frameId": 2})
+	if isError {
+		t.Fatalf("context for frame 2 returned an error: %s", contextText)
+	}
+	if !strings.Contains(contextText, "File: "+sourcePath+":12") {
+		t.Errorf("Expected current location for frame 2, got:\n%s", contextText)
+	}
+	for _, want := range []string{
+		"local (struct point) =",
+		"local.x (int) = 12",
+		"local.y (int) = 18",
+	} {
+		if !strings.Contains(contextText, want) {
+			t.Errorf("Expected frame 2 context to contain %q, got:\n%s", want, contextText)
+		}
+	}
+
+	evalText, isError := ts.callTool(t, "evaluate", map[string]any{"expression": "local.x"})
+	if isError {
+		t.Fatalf("evaluate in selected frame returned an error: %s", evalText)
+	}
+	if !strings.Contains(evalText, "12") {
+		t.Errorf("Expected evaluation in frame 2 to return 12, got: %s", evalText)
 	}
 
 	ts.stopDebugger(t)

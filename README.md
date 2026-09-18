@@ -45,6 +45,23 @@ cd mcp-dap-server
 go build -o bin/mcp-dap-server
 ```
 
+### Run tests on area51
+
+GDB cannot launch native ARM64 macOS processes, so run the GDB integration
+tests on Linux. The `test-area51` target syncs the current working tree to
+`area51`, installs Delve from its existing `Code/delve` checkout, and runs the
+complete race-enabled test suite:
+
+```bash
+make test-area51
+```
+
+Override the remote host or checkout directories when needed:
+
+```bash
+make test-area51 REMOTE_HOST=linux-host REMOTE_PROJECT_DIR=src/mcp-dap-server REMOTE_DELVE_DIR=src/delve
+```
+
 ## Usage
 
 ### Connecting via MCP
