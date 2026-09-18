@@ -203,27 +203,6 @@ func (ds *debuggerSession) sessionToolNames() []string {
 	return tools
 }
 
-// allSessionToolNames returns every tool that registerSessionTools can add,
-// regardless of the current adapter capabilities. Cleanup must not depend on
-// capabilities because session state may already have been reset or partially
-// initialized when tools are withdrawn.
-func allSessionToolNames() []string {
-	return []string{
-		"stop",
-		"breakpoint",
-		"clear-breakpoints",
-		"continue",
-		"step",
-		"pause",
-		"context",
-		"evaluate",
-		"info",
-		"restart",
-		"set-variable",
-		"disassemble",
-	}
-}
-
 // registerSessionTools removes the debug tool and registers all session-specific tools.
 func (ds *debuggerSession) registerSessionTools() {
 	// Remove debug tool
@@ -327,7 +306,7 @@ The 'address' is a hex memory address (e.g. from instructionPointerReference in 
 
 // unregisterSessionTools removes all session tools and re-registers debug.
 func (ds *debuggerSession) unregisterSessionTools() {
-	ds.server.RemoveTools(allSessionToolNames()...)
+	ds.server.RemoveTools(ds.sessionToolNames()...)
 
 	mcp.AddTool(ds.server, &mcp.Tool{
 		Name:        "debug",
@@ -1033,6 +1012,9 @@ func (ds *debuggerSession) cleanup() {
 		ds.cmd = nil
 	}
 
+	// sessionToolNames uses capabilities to identify the optional tools that
+	// were registered for this adapter, so unregister before clearing them.
+	ds.unregisterSessionTools()
 	ds.launchMode = ""
 	ds.programPath = ""
 	ds.programArgs = nil
@@ -1042,7 +1024,6 @@ func (ds *debuggerSession) cleanup() {
 	ds.lastFrameID = -1
 	ds.functionBreakpoints = nil
 	ds.lineBreakpoints = nil
-	ds.unregisterSessionTools()
 }
 
 // debug starts a complete debugging session.
