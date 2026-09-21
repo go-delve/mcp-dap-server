@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bufio"
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -16,6 +18,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/go-dap"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
@@ -523,6 +526,72 @@ func TestRestart(t *testing.T) {
 
 	// Stop debugger
 	ts.stopDebugger(t)
+}
+
+func TestRestartUsesSavedLaunchArguments(t *testing.T) {
+	serverReader, clientWriter := io.Pipe()
+	clientReader, serverWriter := io.Pipe()
+	client := newDAPClientFromRWC(&readWriteCloser{
+		Reader:      clientReader,
+		WriteCloser: clientWriter,
+	})
+	defer client.Close()
+
+	ds := &debuggerSession{
+		client:      client,
+		backend:     &delveBackend{},
+		launchMode:  "binary",
+		programPath: "/tmp/program",
+	}
+	requestArgs := make(chan map[string]any, 1)
+	serverErr := make(chan error, 1)
+	go func() {
+		msg, err := dap.ReadProtocolMessage(bufio.NewReader(serverReader))
+		if err != nil {
+			serverErr <- err
+			return
+		}
+		req, ok := msg.(*dap.RestartRequest)
+		if !ok {
+			serverErr <- fmt.Errorf("expected RestartRequest, got %T", msg)
+			return
+		}
+		var args map[string]any
+		if err := json.Unmarshal(req.Arguments, &args); err != nil {
+			serverErr <- err
+			return
+		}
+		requestArgs <- args
+		serverErr <- dap.WriteProtocolMessage(serverWriter, &dap.RestartResponse{
+			Response: dap.Response{
+				ProtocolMessage: dap.ProtocolMessage{Seq: 1, Type: "response"},
+				RequestSeq:      req.Seq,
+				Command:         "restart",
+				Success:         true,
+			},
+		})
+	}()
+
+	if _, _, err := ds.restartDebugger(context.Background(), nil, RestartParams{Args: []string{"new-arg"}}); err != nil {
+		t.Fatalf("restartDebugger returned error: %v", err)
+	}
+	if err := <-serverErr; err != nil {
+		t.Fatalf("DAP server returned error: %v", err)
+	}
+	args := <-requestArgs
+	restartArgs, ok := args["arguments"].(map[string]any)
+	if !ok {
+		t.Fatalf("restart request arguments = %T (%v), want object", args["arguments"], args["arguments"])
+	}
+	if got := restartArgs["program"]; got != "/tmp/program" {
+		t.Errorf("restart program = %v, want saved program path", got)
+	}
+	if got := restartArgs["mode"]; got != "exec" {
+		t.Errorf("restart mode = %v, want exec", got)
+	}
+	if got := restartArgs["rebuild"]; got != false {
+		t.Errorf("restart rebuild = %v, want false", got)
+	}
 }
 
 func TestContext(t *testing.T) {
@@ -2154,6 +2223,9 @@ func TestInfo(t *testing.T) {
 	text, isErr = ts.callTool(t, "info", map[string]any{})
 	if isErr {
 		t.Fatalf("info default returned error: %s", text)
+	}
+	if !strings.Contains(text, "Thread") {
+		t.Errorf("Expected default info to list threads, got: %s", text)
 	}
 	t.Logf("Info default: %s", text)
 
