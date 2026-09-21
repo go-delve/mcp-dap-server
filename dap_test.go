@@ -4,7 +4,10 @@ import (
 	"bufio"
 	"bytes"
 	"io"
+	"net"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/go-dap"
 )
@@ -71,5 +74,29 @@ func TestNewDAPClientFromRWC(t *testing.T) {
 	_, err = clientWriter.Write(buf.Bytes())
 	if err == nil {
 		t.Error("expected error writing to closed connection")
+	}
+}
+
+func TestReadMessageTimeoutClosesConnection(t *testing.T) {
+	clientConn, serverConn := net.Pipe()
+	defer serverConn.Close()
+
+	client := newDAPClientFromRWC(clientConn)
+	client.readTimeout = 20 * time.Millisecond
+
+	start := time.Now()
+	_, err := client.ReadMessage()
+	if err == nil {
+		t.Fatal("expected a timeout error")
+	}
+	if !strings.Contains(err.Error(), "timed out") || !strings.Contains(err.Error(), "connection closed") {
+		t.Fatalf("unexpected timeout error: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("ReadMessage took %s, want bounded timeout", elapsed)
+	}
+
+	if _, err := serverConn.Write([]byte("late response")); err == nil {
+		t.Error("expected client connection to be closed after timeout")
 	}
 }

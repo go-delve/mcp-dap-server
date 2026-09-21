@@ -281,6 +281,25 @@ func requireGDBDeps(t *testing.T) {
 	if _, err := exec.LookPath("gdb"); err != nil {
 		t.Skip("gdb not found in PATH")
 	}
+	// Homebrew's current GDB package can inspect Mach-O binaries on Apple
+	// Silicon but cannot launch a native ARM64 inferior. Without this probe,
+	// every GDB integration test waits for a DAP stopped event that will never
+	// arrive. Keep GDB backend unit tests runnable on this host while skipping
+	// only the impossible integration coverage.
+	if runtime.GOOS == "darwin" && runtime.GOARCH == "arm64" {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		output, err := exec.CommandContext(ctx, "gdb", "-q", "-batch", "-ex", "start", "/usr/bin/true").CombinedOutput()
+		if strings.Contains(string(output), "Don't know how to run") {
+			t.Skip("installed GDB cannot launch native ARM64 macOS inferiors")
+		}
+		if ctx.Err() != nil {
+			t.Skip("GDB runnability probe timed out")
+		}
+		if err != nil {
+			t.Logf("GDB runnability probe exited with %v: %s", err, output)
+		}
+	}
 }
 
 func skipIfGDBLacksCoreFileSupport(t *testing.T, errorMsg string) {

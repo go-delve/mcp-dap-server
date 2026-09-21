@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"sync"
+	"time"
 
 	"github.com/google/go-dap"
 )
@@ -14,6 +16,19 @@ import (
 type readWriteCloser struct {
 	io.Reader
 	io.WriteCloser
+}
+
+// Close closes both sides when the reader is also closable. This matters for
+// stdio adapters: closing only stdin does not unblock a goroutine reading their
+// stdout after a read timeout.
+func (r *readWriteCloser) Close() error {
+	writeErr := r.WriteCloser.Close()
+	if reader, ok := r.Reader.(io.Closer); ok {
+		if readErr := reader.Close(); writeErr == nil {
+			return readErr
+		}
+	}
+	return writeErr
 }
 
 // DAPClient is a synchronous Debug Adapter Protocol client.
@@ -25,9 +40,15 @@ type DAPClient struct {
 	rwc       io.ReadWriteCloser
 	reader    *bufio.Reader
 	logWriter io.Writer
+	closeOnce sync.Once
+	// readTimeout bounds every adapter read. A timed-out read closes the
+	// single-reader transport so later requests cannot consume a stale reply.
+	readTimeout time.Duration
 	// seq tracks the sequence number for each request sent to the server.
 	seq int
 }
+
+const defaultDAPReadTimeout = 30 * time.Second
 
 // newDAPClient creates a new Client over a TCP connection.
 // Call Close to close the connection.
@@ -43,15 +64,18 @@ func newDAPClient(addr string) (*DAPClient, error) {
 // Call Close to close the underlying transport.
 func newDAPClientFromRWC(rwc io.ReadWriteCloser) *DAPClient {
 	return &DAPClient{
-		rwc:    rwc,
-		reader: bufio.NewReader(rwc),
-		seq:    1, // match VS Code numbering
+		rwc:         rwc,
+		reader:      bufio.NewReader(rwc),
+		readTimeout: defaultDAPReadTimeout,
+		seq:         1, // match VS Code numbering
 	}
 }
 
 // Close closes the client connection.
 func (c *DAPClient) Close() {
-	c.rwc.Close()
+	c.closeOnce.Do(func() {
+		_ = c.rwc.Close()
+	})
 }
 
 // SetProtocolLogger sets a writer for logging all DAP messages sent and received.
@@ -97,16 +121,39 @@ func (c *DAPClient) InitializeRequest(adapterID string) (dap.Capabilities, error
 }
 
 func (c *DAPClient) ReadMessage() (dap.Message, error) {
-	msg, err := dap.ReadProtocolMessage(c.reader)
-	if err != nil {
-		return nil, err
+	type readResult struct {
+		msg dap.Message
+		err error
+	}
+	result := make(chan readResult, 1)
+	go func() {
+		msg, err := dap.ReadProtocolMessage(c.reader)
+		result <- readResult{msg: msg, err: err}
+	}()
+
+	var read readResult
+	if c.readTimeout <= 0 {
+		read = <-result
+	} else {
+		select {
+		case read = <-result:
+		case <-time.After(c.readTimeout):
+			// There is only one reader for a DAP connection. Leaving a blocked
+			// reader alive would make a later request race for its response, so
+			// a timeout deliberately poisons this session's connection.
+			c.Close()
+			return nil, fmt.Errorf("DAP adapter timed out after %s while waiting for a message; connection closed", c.readTimeout)
+		}
+	}
+	if read.err != nil {
+		return nil, read.err
 	}
 	if c.logWriter != nil {
-		if data, merr := json.Marshal(msg); merr == nil {
+		if data, merr := json.Marshal(read.msg); merr == nil {
 			fmt.Fprintf(c.logWriter, "RECV: <<<%s>>>\n", data)
 		}
 	}
-	return msg, nil
+	return read.msg, nil
 }
 
 // LaunchRequest sends a 'launch' request with the specified args.

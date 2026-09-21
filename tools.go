@@ -316,9 +316,9 @@ func (ds *debuggerSession) unregisterSessionTools() {
 
 // BreakpointSpec specifies a breakpoint location.
 type BreakpointSpec struct {
-	File     string `json:"file,omitempty"`
-	Line     int    `json:"line,omitempty"`
-	Function string `json:"function,omitempty"`
+	File     string  `json:"file,omitempty"`
+	Line     FlexInt `json:"line,omitempty"`
+	Function string  `json:"function,omitempty"`
 }
 
 // DebugParams defines the parameters for starting a complete debug session.
@@ -574,13 +574,13 @@ func (ds *debuggerSession) continueExecution(ctx context.Context, _ *mcp.CallToo
 			}
 		} else if to.File != "" && to.Line > 0 {
 			var err error
-			addSeq, err = ds.addLineBreakpoint(to.File, to.Line)
+			addSeq, err = ds.addLineBreakpoint(to.File, to.Line.Int())
 			if err != nil {
 				return nil, nil, err
 			}
 			if addSeq > 0 {
 				cleanupRunToCursor = func() error {
-					seq, err := ds.removeLineBreakpoint(to.File, to.Line)
+					seq, err := ds.removeLineBreakpoint(to.File, to.Line.Int())
 					if err != nil {
 						return err
 					}
@@ -589,7 +589,7 @@ func (ds *debuggerSession) continueExecution(ctx context.Context, _ *mcp.CallToo
 			}
 		}
 		if addSeq > 0 {
-			if _, err := ds.client.ReadMessage(); err != nil {
+			if err := readAndValidateResponse(ds.client, addSeq, "unable to set run-to-cursor breakpoint"); err != nil {
 				return nil, nil, err
 			}
 		}
@@ -627,7 +627,11 @@ func (ds *debuggerSession) pauseExecution(ctx context.Context, _ *mcp.CallToolRe
 	if ds.client == nil {
 		return nil, nil, fmt.Errorf("debugger not started")
 	}
-	seq, err := ds.client.PauseRequest(params.ThreadID.Int())
+	threadID := params.ThreadID.Int()
+	if threadID == 0 {
+		threadID = ds.defaultThreadID()
+	}
+	seq, err := ds.client.PauseRequest(threadID)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -744,15 +748,19 @@ func (ds *debuggerSession) restartDebugger(ctx context.Context, _ *mcp.CallToolR
 	if ds.client == nil {
 		return nil, nil, fmt.Errorf("debugger not started")
 	}
-	seq, err := ds.client.RestartRequest(map[string]any{
-		"arguments": map[string]any{
-			"request":     "launch",
-			"mode":        "exec",
-			"stopOnEntry": false,
-			"args":        params.Args,
-			"rebuild":     false,
-		},
-	})
+	if ds.launchMode != "source" && ds.launchMode != "binary" {
+		return nil, nil, fmt.Errorf("restart is only supported for source or binary launch sessions")
+	}
+	restartArgs, err := ds.backend.LaunchArgs(ds.launchMode, ds.programPath, false, params.Args)
+	if err != nil {
+		return nil, nil, fmt.Errorf("unable to build restart arguments: %w", err)
+	}
+	// Delve accepts this optional flag, while other adapters ignore unknown
+	// launch arguments. It preserves the prior no-rebuild restart behavior.
+	if ds.backend.AdapterID() == "go" {
+		restartArgs["rebuild"] = false
+	}
+	seq, err := ds.client.RestartRequest(map[string]any{"arguments": restartArgs})
 	if err != nil {
 		return nil, nil, err
 	}
@@ -775,11 +783,7 @@ func (ds *debuggerSession) info(ctx context.Context, _ *mcp.CallToolRequest, par
 
 	infoType := params.Type
 	if infoType == "" {
-		if ds.capabilities.SupportsLoadedSourcesRequest {
-			infoType = "sources"
-		} else {
-			infoType = "threads"
-		}
+		infoType = "threads"
 	}
 
 	switch infoType {
@@ -1222,8 +1226,9 @@ func (ds *debuggerSession) debug(ctx context.Context, _ *mcp.CallToolRequest, pa
 		}
 		switch resp := msg.(type) {
 		case dap.ResponseMessage:
-			if !resp.GetResponse().Success {
-				return nil, nil, fmt.Errorf("unable to start debug session: %s", resp.GetResponse().Message)
+			response := resp.GetResponse()
+			if response.RequestSeq == launchSeq && !response.Success {
+				return nil, nil, fmt.Errorf("unable to start debug session: %s", response.Message)
 			}
 		case *dap.InitializedEvent:
 			_ = resp
@@ -1244,8 +1249,8 @@ initialized:
 					return nil, nil, err
 				}
 			}
-		} else if bp.File != "" && bp.Line > 0 {
-			seq, err := ds.addLineBreakpoint(bp.File, bp.Line)
+		} else if bp.File != "" && bp.Line.Int() > 0 {
+			seq, err := ds.addLineBreakpoint(bp.File, bp.Line.Int())
 			if err != nil {
 				return nil, nil, err
 			}
