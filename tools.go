@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -663,6 +664,16 @@ func (ds *debuggerSession) evaluateExpression(ctx context.Context, _ *mcp.CallTo
 	if evalContext == "" {
 		evalContext = "watch"
 	}
+	if evalContext == "repl" {
+		if frameID, ok := replFrameSelection(params.Expression); ok {
+			return &mcp.CallToolResult{
+				Content: []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf(
+					"GDB's DAP REPL does not persist `frame %d` selection. Use context with frameId: %d, then evaluate expressions in the default watch context.",
+					frameID, frameID,
+				)}},
+			}, nil, nil
+		}
+	}
 
 	var frameID int
 	if params.FrameID != nil {
@@ -691,6 +702,20 @@ func (ds *debuggerSession) evaluateExpression(ctx context.Context, _ *mcp.CallTo
 			if resp.Body.Type != "" {
 				result = fmt.Sprintf("%s (type: %s)", resp.Body.Result, resp.Body.Type)
 			}
+			if resp.Body.VariablesReference > 0 {
+				var expanded strings.Builder
+				expanded.WriteString(result)
+				if !strings.HasSuffix(result, "\n") {
+					expanded.WriteString("\n")
+				}
+				ds.writeVariable(&expanded, dap.Variable{
+					Name:               params.Expression,
+					Value:              resp.Body.Result,
+					Type:               resp.Body.Type,
+					VariablesReference: resp.Body.VariablesReference,
+				}, "  ", params.Expression, 2)
+				result = expanded.String()
+			}
 			return &mcp.CallToolResult{
 				Content: []mcp.Content{&mcp.TextContent{Text: result}},
 			}, nil, nil
@@ -708,6 +733,22 @@ func (ds *debuggerSession) evaluateExpression(ctx context.Context, _ *mcp.CallTo
 			continue
 		}
 	}
+}
+
+// replFrameSelection recognizes GDB's "frame N" command. GDB native DAP
+// accepts it in a REPL evaluate request but does not retain the selection for
+// later requests, so returning an explicit instruction is less misleading than
+// forwarding a command that appears to succeed but has no useful effect.
+func replFrameSelection(expression string) (int, bool) {
+	fields := strings.Fields(expression)
+	if len(fields) != 2 || fields[0] != "frame" {
+		return 0, false
+	}
+	frameID, err := strconv.Atoi(fields[1])
+	if err != nil || frameID < 0 {
+		return 0, false
+	}
+	return frameID, true
 }
 
 // SetVariableParams defines the parameters for setting a variable.

@@ -594,6 +594,27 @@ func TestRestartUsesSavedLaunchArguments(t *testing.T) {
 	}
 }
 
+func TestReplFrameSelection(t *testing.T) {
+	tests := []struct {
+		expression string
+		wantFrame  int
+		wantOK     bool
+	}{
+		{expression: "frame 2", wantFrame: 2, wantOK: true},
+		{expression: " frame 0 ", wantFrame: 0, wantOK: true},
+		{expression: "frame -1"},
+		{expression: "f 2"},
+		{expression: "info locals"},
+	}
+	for _, test := range tests {
+		gotFrame, gotOK := replFrameSelection(test.expression)
+		if gotFrame != test.wantFrame || gotOK != test.wantOK {
+			t.Errorf("replFrameSelection(%q) = (%d, %t), want (%d, %t)",
+				test.expression, gotFrame, gotOK, test.wantFrame, test.wantOK)
+		}
+	}
+}
+
 func TestContext(t *testing.T) {
 	// Setup test infrastructure
 	ts := setupMCPServerAndClient(t)
@@ -1384,6 +1405,14 @@ func TestGDBContextSelectsRequestedFrame(t *testing.T) {
 	}
 	if !strings.Contains(evalText, "12") {
 		t.Errorf("Expected evaluation in frame 2 to return 12, got: %s", evalText)
+	}
+
+	structText, isError := ts.callTool(t, "evaluate", map[string]any{"expression": "*p"})
+	if isError {
+		t.Fatalf("structured evaluation returned an error: %s", structText)
+	}
+	if !strings.Contains(structText, "*p.x (int) = 10") {
+		t.Errorf("Expected structured evaluation to expand *p members, got: %s", structText)
 	}
 
 	ts.stopDebugger(t)
