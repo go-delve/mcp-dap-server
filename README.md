@@ -51,6 +51,19 @@ go build -o bin/mcp-dap-server
 
 The server uses stdio transport, allowing AI agents to spawn it on-demand. Configure your MCP client with the path to the binary.
 
+> [!IMPORTANT]
+> A debugger can launch programs, attach to processes, evaluate target code,
+> inspect secrets, and alter or terminate a debuggee. Run this server only for a
+> trusted, single-user MCP client under a least-privileged OS account. The stdio
+> server has no HTTP listener or multi-tenant authorization layer. Delve's
+> internal DAP socket is always bound to loopback.
+
+Persistent server logging is disabled by default. Set `MCP_DAP_LOG=1` to create
+a unique private log in the OS temporary directory. It is capped at 8 MiB and
+retained until manually deleted. Explicit protocol and GDB tool logs reject
+existing files; treat them as sensitive. GDB tool logs are written directly by
+GDB and are not size-capped.
+
 ### Example MCP Client Configuration
 
 This configuration works with [Gemini CLI](https://developers.google.com/gemini-code-assist/docs/use-agentic-chat-pair-programmer#configure-mcp-servers) and similar MCP clients:
@@ -92,7 +105,8 @@ Start a debugging session. Supports four modes:
 - `processId` (number): Process ID (required for attach mode)
 - `breakpoints` (array): Breakpoints to set before running (file:line or function name)
 - `stopOnEntry` (boolean): Stop at program entry point
-- `port` (number): DAP server port
+- `port` (number): optional numeric Delve port (`0` chooses an ephemeral
+  loopback port; external bind addresses are not accepted)
 
 Returns full context (location, stack trace, variables) when stopped.
 
