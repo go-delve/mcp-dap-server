@@ -23,8 +23,92 @@ jobs:
       - name: Install Delve
         run: go install github.com/go-delve/delve/cmd/dlv@latest
 
+      - name: Verify Delve installation
+        run: dlv version
+
       - name: Build
         run: go build -v ./...
 
-      - name: Test
-        run: go test -v ./...
+      - name: Test with race detector and coverage
+        run: go test -race -count=1 -coverprofile=coverage.out -v ./...
+
+      - name: Report coverage
+        run: go tool cover -func=coverage.out
+
+  delve-integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: '1.26'
+
+      - name: Install Delve
+        run: go install github.com/go-delve/delve/cmd/dlv@latest
+
+      - name: Verify Delve installation
+        run: dlv version
+
+      - name: Run required Delve DAP scenarios
+        run: >-
+          go test -count=1 -v
+          -run '^Test(Basic|Restart|RestartUsesSavedLaunchArguments|ReplFrameSelection|Context|Variables|Step|ToolListChangesWithCapabilities|ClearBreakpoints|InfoBreakpoints|LineBreakpointTracking|ClearSpecificLineBreakpoint|MultipleFilesLineBreakpoints|ClearAllBreakpointsAcrossFiles|DuplicateLineBreakpoint|RunToCursorCleansUpBreakpoint|ContinueWithEmptyTo|ContinueWithPartialTo|Info|Disassemble|SetVariable|Pause|StepIn|StepOut|TerminationMessage|StopOnEntry)$'
+          .
+
+      - name: Mutation-test Delve scenarios
+        env:
+          GOAUDIT_TIMEOUT: 120s
+        run: >-
+          go run scripts/mutation-audit.go
+          -helper scripts/goaudit-ci.sh
+          -output "${RUNNER_TEMP}/delve-mutation"
+          -run '^Test(Basic|Restart|RestartUsesSavedLaunchArguments|ReplFrameSelection|Context|Variables|Step|ToolListChangesWithCapabilities|ClearBreakpoints|InfoBreakpoints|LineBreakpointTracking|ClearSpecificLineBreakpoint|MultipleFilesLineBreakpoints|ClearAllBreakpointsAcrossFiles|DuplicateLineBreakpoint|RunToCursorCleansUpBreakpoint|ContinueWithEmptyTo|ContinueWithPartialTo|Info|Disassemble|SetVariable|Pause|StepIn|StepOut|TerminationMessage|StopOnEntry)$'
+          -max 5
+
+      - name: Upload Delve mutation report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: delve-mutation-report
+          path: ${{ runner.temp }}/delve-mutation
+
+  gdb-integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: '1.26'
+
+      - name: Install GDB and C compiler
+        run: sudo apt-get update && sudo apt-get install -y gdb gcc
+
+      - name: Run required GDB DAP scenarios
+        env:
+          MCP_DAP_REQUIRE_GDB: '1'
+        run: >-
+          go test -count=1 -v
+          -run '^TestGDB(Basic|StopOnEntry|Step|Evaluate|EvaluateWatchContext|ContextSelectsRequestedFrame|FullFlow)$'
+          .
+
+      - name: Mutation-test GDB scenarios
+        env:
+          MCP_DAP_REQUIRE_GDB: '1'
+          GOAUDIT_TIMEOUT: 120s
+        run: >-
+          go run scripts/mutation-audit.go
+          -helper scripts/goaudit-ci.sh
+          -output "${RUNNER_TEMP}/gdb-mutation"
+          -run '^TestGDB(Basic|StopOnEntry|Step|Evaluate|EvaluateWatchContext|ContextSelectsRequestedFrame|FullFlow)$'
+          -max 5
+
+      - name: Upload GDB mutation report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gdb-mutation-report
+          path: ${{ runner.temp }}/gdb-mutation
