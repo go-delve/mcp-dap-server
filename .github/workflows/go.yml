@@ -5,7 +5,7 @@ name: Go
 
 on:
   push:
-    branches: ['master', 'stack/**']
+    branches: ['master']
   pull_request:
     branches: ['master', 'stack/**']
 
