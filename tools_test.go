@@ -268,6 +268,25 @@ func (ts *testSetup) getContextContent(t *testing.T) string {
 func (ts *testSetup) stopDebugger(t *testing.T) {
 	t.Helper()
 
+	toolList, err := ts.session.ListTools(ts.ctx, &mcp.ListToolsParams{})
+	if err != nil {
+		t.Fatalf("Failed to list tools before stopping debugger: %v", err)
+	}
+	stopAvailable := false
+	for _, tool := range toolList.Tools {
+		if tool.Name == "stop" {
+			stopAvailable = true
+			break
+		}
+	}
+	if !stopAvailable {
+		// Natural program termination now performs the same cleanup as stop.
+		if len(toolList.Tools) != 1 || toolList.Tools[0].Name != "debug" {
+			t.Fatalf("Stop tool unavailable but session was not cleaned up: %v", toolList.Tools)
+		}
+		return
+	}
+
 	stopResult, err := ts.session.CallTool(ts.ctx, &mcp.CallToolParams{
 		Name:      "stop",
 		Arguments: map[string]any{},
@@ -1375,7 +1394,7 @@ func TestGDBContextSelectsRequestedFrame(t *testing.T) {
 		"mode":     "binary",
 		"path":     binaryPath,
 		"breakpoints": []map[string]any{
-			{"file": sourcePath, "line": 14},
+			{"file": sourcePath, "line": 30},
 		},
 	})
 	if isError {
@@ -1386,13 +1405,15 @@ func TestGDBContextSelectsRequestedFrame(t *testing.T) {
 	if isError {
 		t.Fatalf("context for frame 2 returned an error: %s", contextText)
 	}
-	if !strings.Contains(contextText, "File: "+sourcePath+":12") {
+	if !strings.Contains(contextText, "File: "+sourcePath+":28") {
 		t.Errorf("Expected current location for frame 2, got:\n%s", contextText)
 	}
 	for _, want := range []string{
 		"local (struct point) =",
 		"local.x (int) = 12",
 		"local.y (int) = 18",
+		"nested.in.fid.code (int) = 7",
+		"nested.in.fid.stamp (long) = 99",
 	} {
 		if !strings.Contains(contextText, want) {
 			t.Errorf("Expected frame 2 context to contain %q, got:\n%s", want, contextText)
@@ -2566,7 +2587,13 @@ func TestTerminationMessage(t *testing.T) {
 	}
 	t.Logf("termination result: %s", text)
 
-	ts.stopDebugger(t)
+	toolList, err := ts.session.ListTools(ts.ctx, &mcp.ListToolsParams{})
+	if err != nil {
+		t.Fatalf("Failed to list tools after termination: %v", err)
+	}
+	if len(toolList.Tools) != 1 || toolList.Tools[0].Name != "debug" {
+		t.Errorf("Expected only 'debug' after program termination, got %v", toolList.Tools)
+	}
 }
 
 func TestStopOnEntry(t *testing.T) {
