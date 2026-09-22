@@ -1276,21 +1276,23 @@ func (ds *debuggerSession) debug(ctx context.Context, _ *mcp.CallToolRequest, pa
 	ds.programArgs = params.Args
 	ds.coreFilePath = params.CoreFilePath
 
-	// Launch or attach using backend-specific args
+	// Build the backend-specific launch/attach request. Request sequence numbers
+	// are assigned only when the request is sent so wire order remains monotonic
+	// for adapters that launch after configuration.
 	stopOnEntry := params.StopOnEntry || len(params.Breakpoints) == 0
 	launchSeq := -1
+	var sendLaunch func() (int, error)
 	switch mode {
 	case "source", "binary":
 		launchArgs, err := ds.backend.LaunchArgs(mode, params.Path, stopOnEntry, params.Args)
 		if err != nil {
 			return nil, nil, err
 		}
-		req := ds.client.newRequest("launch")
-		launchSeq = req.Seq
-		request := &dap.LaunchRequest{Request: *req}
-		request.Arguments = toRawMessage(launchArgs)
-		if err := ds.client.send(request); err != nil {
-			return nil, nil, err
+		sendLaunch = func() (int, error) {
+			req := ds.client.newRequest("launch")
+			request := &dap.LaunchRequest{Request: *req}
+			request.Arguments = toRawMessage(launchArgs)
+			return req.Seq, ds.client.send(request)
 		}
 	case "core":
 		coreArgs, err := ds.backend.CoreArgs(params.Path, params.CoreFilePath)
@@ -1298,45 +1300,47 @@ func (ds *debuggerSession) debug(ctx context.Context, _ *mcp.CallToolRequest, pa
 			return nil, nil, err
 		}
 		rawArgs := toRawMessage(coreArgs)
-		var request dap.Message
-		if ds.backend.CoreRequestType() == "attach" {
-			req := ds.client.newRequest("attach")
-			launchSeq = req.Seq
-			request = &dap.AttachRequest{Request: *req, Arguments: rawArgs}
-		} else if ds.backend.CoreRequestType() == "launch" {
-			req := ds.client.newRequest("launch")
-			launchSeq = req.Seq
-			request = &dap.LaunchRequest{Request: *req, Arguments: rawArgs}
-		} else {
+		requestType := ds.backend.CoreRequestType()
+		if requestType != "attach" && requestType != "launch" {
 			return nil, nil, fmt.Errorf("unsupported core request type: %s", ds.backend.CoreRequestType())
 		}
-		if err := ds.client.send(request); err != nil {
-			return nil, nil, err
+		sendLaunch = func() (int, error) {
+			req := ds.client.newRequest(requestType)
+			if requestType == "attach" {
+				return req.Seq, ds.client.send(&dap.AttachRequest{Request: *req, Arguments: rawArgs})
+			}
+			return req.Seq, ds.client.send(&dap.LaunchRequest{Request: *req, Arguments: rawArgs})
 		}
 	case "attach":
 		attachArgs, err := ds.backend.AttachArgs(params.ProcessID)
 		if err != nil {
 			return nil, nil, err
 		}
-		req := ds.client.newRequest("attach")
-		launchSeq = req.Seq
-		request := &dap.AttachRequest{Request: *req}
-		request.Arguments = toRawMessage(attachArgs)
-		if err := ds.client.send(request); err != nil {
+		sendLaunch = func() (int, error) {
+			req := ds.client.newRequest("attach")
+			request := &dap.AttachRequest{Request: *req}
+			request.Arguments = toRawMessage(attachArgs)
+			return req.Seq, ds.client.send(request)
+		}
+	}
+	launchAfterConfiguration := ds.backend.LaunchAfterConfiguration()
+	if !launchAfterConfiguration {
+		launchSeq, err = sendLaunch()
+		if err != nil {
 			return nil, nil, err
 		}
 	}
-	// After sending the launch/attach request, we must handle two DAP patterns:
+
+	// Handle both adapter startup patterns:
 	//
-	// Delve: launch response arrives immediately, then initialized event.
+	// Delve emits initialized after launch/attach.
 	//
-	// GDB native DAP: sends initialized event first, then DEFERS the
-	// launch/attach response until after configurationDone is processed.
+	// Modern GDB emits initialized after initialize and requires breakpoint
+	// configuration plus configurationDone before launch/attach.
 	//
-	// We read messages until we see the initialized event.
-	// The launch response may arrive before or after — if it arrives here,
-	// we consume it and check for errors. If it arrives later (GDB's deferred
-	// pattern), it will be checked in subsequent message-reading loops.
+	// For launch-first adapters, the response may arrive before initialized and
+	// is retained here. For configuration-first adapters there is no launch
+	// request to match yet.
 	launchResponseSeen := false
 	for {
 		msg, err := ds.client.waitMessageContext(ctx, func(msg dap.Message) bool {
@@ -1344,7 +1348,7 @@ func (ds *debuggerSession) debug(ctx context.Context, _ *mcp.CallToolRequest, pa
 				return true
 			}
 			response, ok := msg.(dap.ResponseMessage)
-			return ok && response.GetResponse().RequestSeq == launchSeq
+			return launchSeq >= 0 && ok && response.GetResponse().RequestSeq == launchSeq
 		})
 		if err != nil {
 			return nil, nil, err
@@ -1385,6 +1389,12 @@ initialized:
 			return nil, nil, err
 		}
 		if err := readAndValidateResponse(ctx, ds.client, configSeq, "unable to complete configuration"); err != nil {
+			return nil, nil, err
+		}
+	}
+	if launchAfterConfiguration {
+		launchSeq, err = sendLaunch()
+		if err != nil {
 			return nil, nil, err
 		}
 	}

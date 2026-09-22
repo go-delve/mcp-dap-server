@@ -25,6 +25,9 @@ type DebuggerBackend interface {
 	TransportMode() string
 	// StdioPipes returns the adapter pipes for stdio transports.
 	StdioPipes() (stdout io.ReadCloser, stdin io.WriteCloser)
+	// LaunchAfterConfiguration reports whether the adapter requires breakpoint
+	// configuration and configurationDone before launch/attach.
+	LaunchAfterConfiguration() bool
 
 	// AdapterID returns the DAP adapter identifier for InitializeRequest.
 	AdapterID() string
@@ -127,6 +130,10 @@ func (b *delveBackend) TransportMode() string {
 
 func (b *delveBackend) StdioPipes() (io.ReadCloser, io.WriteCloser) {
 	return nil, nil
+}
+
+func (b *delveBackend) LaunchAfterConfiguration() bool {
+	return false
 }
 
 // AdapterID returns "go" for the Delve debug adapter.
@@ -253,6 +260,10 @@ func (g *gdbBackend) AdapterID() string {
 // These are used to create a DAPClient over the stdio transport.
 func (g *gdbBackend) StdioPipes() (stdout io.ReadCloser, stdin io.WriteCloser) {
 	return g.stdout, g.stdin
+}
+
+func (g *gdbBackend) LaunchAfterConfiguration() bool {
+	return true
 }
 
 // LaunchArgs builds the GDB native DAP argument map for a DAP LaunchRequest.

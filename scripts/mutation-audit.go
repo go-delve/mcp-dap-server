@@ -110,7 +110,7 @@ func main() {
 	// Isolation must be explicitly selected by the caller (usually copy mode).
 	a.require("CHECK_ISOLATION: OK", nil, "check-isolation")
 	a.require("PREFLIGHT: OK", nil, "preflight")
-	a.require("RESULT: PASS", nil, "run", ".", ".*")
+	a.require("RESULT: PASS", nil, "run", ".", a.run)
 	list := a.require("LIST: OK", nil, "tests", ".")
 	var tests []string
 	selected, err := regexp.Compile(a.run)
