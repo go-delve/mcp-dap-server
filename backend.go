@@ -4,9 +4,11 @@ import (
 	"bufio"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"os/exec"
 	"strings"
+	"time"
 )
 
 // DebuggerBackend abstracts the debugger-specific logic for spawning a DAP
@@ -21,6 +23,8 @@ type DebuggerBackend interface {
 
 	// TransportMode returns "tcp" or "stdio" indicating how to connect.
 	TransportMode() string
+	// StdioPipes returns the adapter pipes for stdio transports.
+	StdioPipes() (stdout io.ReadCloser, stdin io.WriteCloser)
 
 	// AdapterID returns the DAP adapter identifier for InitializeRequest.
 	AdapterID() string
@@ -47,7 +51,17 @@ type delveBackend struct{}
 // The port should be in ":PORT" format (e.g. ":0" for auto-assign).
 // It waits for the server to report its listen address on stdout.
 func (b *delveBackend) Spawn(port string, stderrWriter io.Writer) (*exec.Cmd, string, error) {
-	cmd := exec.Command("dlv", "dap", "--listen", port, "--log", "--log-output", "dap")
+	listen, err := delveListenAddress(port)
+	if err != nil {
+		return nil, "", err
+	}
+	cmd := exec.Command("dlv", "dap", "--listen", listen)
+	return startDelve(cmd, stderrWriter, 10*time.Second)
+}
+
+// startDelve bounds startup and continues draining stdout after the announcement.
+// The caller owns Wait after success; on failure this function reaps the child.
+func startDelve(cmd *exec.Cmd, stderrWriter io.Writer, timeout time.Duration) (*exec.Cmd, string, error) {
 	// Send adapter stderr to the provided writer, never to os.Stderr.
 	// With MCP stdio transport, os.Stderr is a pipe that can fill and block.
 	cmd.Stderr = stderrWriter
@@ -59,37 +73,60 @@ func (b *delveBackend) Spawn(port string, stderrWriter io.Writer) (*exec.Cmd, st
 		return nil, "", err
 	}
 
-	// Wait for server to start and parse actual listen address
-	r := bufio.NewReader(stdout)
-	var listenAddr string
-	for {
-		s, err := r.ReadString('\n')
-		if err != nil {
-			cmd.Process.Kill()
-			cmd.Wait()
-			return nil, "", err
-		}
-		if strings.HasPrefix(s, "DAP server listening at") {
-			// Parse address from "DAP server listening at: 127.0.0.1:PORT"
-			parts := strings.SplitN(s, ": ", 2)
-			if len(parts) == 2 {
-				listenAddr = strings.TrimSpace(parts[1])
+	type result struct {
+		address string
+		err     error
+	}
+	ready := make(chan result, 1)
+	go func() {
+		scanner := bufio.NewScanner(stdout) // bounds pre-announcement line size
+		for scanner.Scan() {
+			if address, ok := strings.CutPrefix(scanner.Text(), "DAP server listening at: "); ok {
+				host, port, err := net.SplitHostPort(address)
+				ip := net.ParseIP(host)
+				if err != nil || ip == nil || !ip.IsLoopback() {
+					ready <- result{err: fmt.Errorf("invalid Delve listen address")}
+					return
+				}
+				if _, err := delveListenAddress(port); err != nil || port == "0" {
+					ready <- result{err: fmt.Errorf("invalid Delve listen port")}
+					return
+				}
+				ready <- result{address: address}
+				_, _ = io.Copy(io.Discard, stdout)
+				return
 			}
-			break
 		}
+		err := scanner.Err()
+		if err == nil {
+			err = io.ErrUnexpectedEOF
+		}
+		ready <- result{err: err}
+	}()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case r := <-ready:
+		if r.err == nil {
+			return cmd, r.address, nil
+		}
+		err = r.err
+	case <-timer.C:
+		err = fmt.Errorf("Delve startup timed out after %s", timeout)
 	}
-	if listenAddr == "" {
-		cmd.Process.Kill()
-		cmd.Wait()
-		return nil, "", fmt.Errorf("failed to parse DAP server listen address")
-	}
-
-	return cmd, listenAddr, nil
+	_ = cmd.Process.Kill()
+	_ = stdout.Close()
+	_ = cmd.Wait()
+	return nil, "", err
 }
 
 // TransportMode returns "tcp" because Delve communicates over a TCP socket.
 func (b *delveBackend) TransportMode() string {
 	return "tcp"
+}
+
+func (b *delveBackend) StdioPipes() (io.ReadCloser, io.WriteCloser) {
+	return nil, nil
 }
 
 // AdapterID returns "go" for the Delve debug adapter.
@@ -164,10 +201,15 @@ func (g *gdbBackend) Spawn(port string, stderrWriter io.Writer) (*exec.Cmd, stri
 	if gdbPath == "" {
 		gdbPath = "gdb"
 	}
-	args := []string{"-i", "dap"}
+	// Ignore user/project init files and target-supplied auto-load scripts.
+	// Explicit debugger commands remain available; this is not a sandbox.
+	args := []string{"-nx", "-iex", "set auto-load off", "-i", "dap"}
 	// Disable terminal styling — ANSI escapes have no place in DAP JSON responses.
 	args = append([]string{"-iex", "set style enabled off"}, args...)
 	if g.toolLogPath != "" {
+		if err := prepareGDBLog(g.toolLogPath); err != nil {
+			return nil, "", fmt.Errorf("unsafe GDB log path: %w", err)
+		}
 		args = append([]string{"-iex", "set debug dap-log-file " + g.toolLogPath}, args...)
 	}
 	cmd := exec.Command(gdbPath, args...)
@@ -179,6 +221,7 @@ func (g *gdbBackend) Spawn(port string, stderrWriter io.Writer) (*exec.Cmd, stri
 	}
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
+		_ = stdin.Close()
 		return nil, "", fmt.Errorf("failed to create stdout pipe: %w", err)
 	}
 
@@ -186,6 +229,8 @@ func (g *gdbBackend) Spawn(port string, stderrWriter io.Writer) (*exec.Cmd, stri
 	g.stdout = stdout
 
 	if err := cmd.Start(); err != nil {
+		_ = stdin.Close()
+		_ = stdout.Close()
 		return nil, "", fmt.Errorf("failed to start gdb: %w (is GDB 14+ installed?)", err)
 	}
 

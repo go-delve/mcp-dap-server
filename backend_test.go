@@ -146,6 +146,14 @@ func TestGDBBackendLaunchArgs(t *testing.T) {
 	if _, ok := args["miDebuggerPath"]; ok {
 		t.Error("unexpected miDebuggerPath key (cpptools artifact)")
 	}
+
+	withoutArgs, err := backend.LaunchArgs("binary", "/path/to/prog", false, nil)
+	if err != nil {
+		t.Fatalf("LaunchArgs without program args: %v", err)
+	}
+	if _, ok := withoutArgs["args"]; ok {
+		t.Errorf("empty program args should be omitted, got: %#v", withoutArgs["args"])
+	}
 }
 
 func TestGDBBackendSourceModeError(t *testing.T) {
