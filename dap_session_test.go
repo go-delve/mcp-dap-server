@@ -334,8 +334,9 @@ func TestCancellationRequestAndLateResponseAreDrained(t *testing.T) {
 }
 
 type fakeStdioBackend struct {
-	stdout io.ReadCloser
-	stdin  io.WriteCloser
+	stdout      io.ReadCloser
+	stdin       io.WriteCloser
+	launchAfter bool
 }
 
 func (b *fakeStdioBackend) Spawn(string, io.Writer) (*exec.Cmd, string, error) {
@@ -345,7 +346,8 @@ func (b *fakeStdioBackend) TransportMode() string { return "stdio" }
 func (b *fakeStdioBackend) StdioPipes() (io.ReadCloser, io.WriteCloser) {
 	return b.stdout, b.stdin
 }
-func (b *fakeStdioBackend) AdapterID() string { return "fake" }
+func (b *fakeStdioBackend) LaunchAfterConfiguration() bool { return b.launchAfter }
+func (b *fakeStdioBackend) AdapterID() string              { return "fake" }
 func (b *fakeStdioBackend) LaunchArgs(string, string, bool, []string) (map[string]any, error) {
 	return map[string]any{}, nil
 }
@@ -371,5 +373,107 @@ func TestDebugStartupEOFRollsBackSession(t *testing.T) {
 	}
 	if ds.client != nil || ds.controlClient != nil || ds.protocolLogFile != nil {
 		t.Fatalf("startup rollback left resources: client=%v control=%v log=%v", ds.client, ds.controlClient, ds.protocolLogFile)
+	}
+}
+
+func TestDebugSupportsConfigurationBeforeLaunch(t *testing.T) {
+	clientConn, adapterConn := net.Pipe()
+	backend := &fakeStdioBackend{stdout: clientConn, stdin: clientConn, launchAfter: true}
+	server := mcp.NewServer(&mcp.Implementation{Name: "test", Version: "test"}, nil)
+	ds := &debuggerSession{server: server, backendOverride: backend, lastFrameID: -1}
+	defer ds.cleanup()
+
+	adapterDone := make(chan error, 1)
+	go func() {
+		reader := bufio.NewReader(adapterConn)
+		read := func(command string) (dap.RequestMessage, error) {
+			message, err := dap.ReadProtocolMessage(reader)
+			if err != nil {
+				return nil, err
+			}
+			request, ok := message.(dap.RequestMessage)
+			if !ok {
+				return nil, fmt.Errorf("got %T, want %q request", message, command)
+			}
+			if request.GetRequest().Command != command {
+				return nil, fmt.Errorf("got command %q, want %q", request.GetRequest().Command, command)
+			}
+			return request, nil
+		}
+		initialize, err := read("initialize")
+		if err != nil {
+			adapterDone <- err
+			return
+		}
+		if err := dap.WriteProtocolMessage(adapterConn, &dap.InitializeResponse{
+			Response: dap.Response{
+				ProtocolMessage: protocolMessage(1, "response"), RequestSeq: initialize.GetRequest().Seq,
+				Success: true, Command: "initialize",
+			},
+			Body: dap.Capabilities{SupportsConfigurationDoneRequest: true},
+		}); err != nil {
+			adapterDone <- err
+			return
+		}
+		if err := dap.WriteProtocolMessage(adapterConn, &dap.InitializedEvent{
+			Event: dap.Event{ProtocolMessage: protocolMessage(2, "event"), Event: "initialized"},
+		}); err != nil {
+			adapterDone <- err
+			return
+		}
+		config, err := read("configurationDone")
+		if err != nil {
+			adapterDone <- err
+			return
+		}
+		if err := dap.WriteProtocolMessage(adapterConn, &dap.ConfigurationDoneResponse{Response: dap.Response{
+			ProtocolMessage: protocolMessage(3, "response"), RequestSeq: config.GetRequest().Seq,
+			Success: true, Command: "configurationDone",
+		}}); err != nil {
+			adapterDone <- err
+			return
+		}
+		launch, err := read("launch")
+		if err != nil {
+			adapterDone <- err
+			return
+		}
+		if err := dap.WriteProtocolMessage(adapterConn, &dap.LaunchResponse{Response: dap.Response{
+			ProtocolMessage: protocolMessage(4, "response"), RequestSeq: launch.GetRequest().Seq,
+			Success: true, Command: "launch",
+		}}); err != nil {
+			adapterDone <- err
+			return
+		}
+		if err := dap.WriteProtocolMessage(adapterConn, &dap.StoppedEvent{
+			Event: dap.Event{ProtocolMessage: protocolMessage(5, "event"), Event: "stopped"},
+			Body:  dap.StoppedEventBody{Reason: "entry", ThreadId: 1},
+		}); err != nil {
+			adapterDone <- err
+			return
+		}
+		stack, err := read("stackTrace")
+		if err != nil {
+			adapterDone <- err
+			return
+		}
+		adapterDone <- dap.WriteProtocolMessage(adapterConn, &dap.StackTraceResponse{
+			Response: dap.Response{
+				ProtocolMessage: protocolMessage(6, "response"), RequestSeq: stack.GetRequest().Seq,
+				Success: true, Command: "stackTrace",
+			},
+			Body: dap.StackTraceResponseBody{StackFrames: []dap.StackFrame{{Id: 0, Name: "main", Line: 1}}},
+		})
+	}()
+
+	result, _, err := ds.debug(context.Background(), nil, DebugParams{Mode: "source", Path: "/workspace"})
+	if err != nil {
+		t.Fatalf("configuration-before-launch startup failed: %v", err)
+	}
+	if !strings.Contains(textContent(result), "Function: main") {
+		t.Fatalf("startup result = %q", textContent(result))
+	}
+	if err := <-adapterDone; err != nil {
+		t.Fatal(err)
 	}
 }
