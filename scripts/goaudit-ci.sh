@@ -25,7 +25,8 @@ tests)
 run)
 	pkg=${1:-.}
 	re=${2:-.*}
-	log="$state/run-$(printf '%s' "$re" | tr -c 'A-Za-z0-9._-' '_').log"
+	key=$(printf '%s' "$re" | cksum | awk '{print $1}')
+	log="$state/run-$key.log"
 	set +e
 	(cd "$pkg" && go test -vet=off -count=1 -v -timeout="$timeout" -run "$re" .) >"$log" 2>&1
 	code=$?
@@ -52,7 +53,8 @@ run)
 cover)
 	pkg=${1:-.}
 	re=${2:-.*}
-	profile="$state/cover-$(printf '%s' "$re" | tr -c 'A-Za-z0-9._-' '_').out"
+	key=$(printf '%s' "$re" | cksum | awk '{print $1}')
+	profile="$state/cover-$key.out"
 	(cd "$pkg" && go test -vet=off -count=1 -timeout="$timeout" -run "$re" -coverprofile="$profile" .)
 	awk '
 		NR == 1 { next }
