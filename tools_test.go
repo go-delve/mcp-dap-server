@@ -7,12 +7,15 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -28,8 +31,12 @@ func TestMain(m *testing.M) {
 	flag.StringVar(&dapLogDir, "dap-log", "", "directory for DAP protocol and tool logs (enables verbose DAP logging)")
 	flag.Parse()
 	if dapLogDir != "" {
-		if err := os.MkdirAll(dapLogDir, 0o755); err != nil {
+		if err := os.MkdirAll(dapLogDir, 0o700); err != nil {
 			fmt.Fprintf(os.Stderr, "failed to create dap-log dir: %v\n", err)
+			os.Exit(1)
+		}
+		if err := os.Chmod(dapLogDir, 0o700); err != nil {
+			fmt.Fprintf(os.Stderr, "failed to make dap-log dir private: %v\n", err)
 			os.Exit(1)
 		}
 	}
@@ -78,10 +85,7 @@ func compileTestProgram(t *testing.T, cwd, name string) (binaryPath string, clea
 	t.Helper()
 
 	programPath := filepath.Join(cwd, "testdata", "go", name)
-	binaryPath = filepath.Join(programPath, "debugprog")
-
-	// Remove old binary if exists
-	os.Remove(binaryPath)
+	binaryPath = filepath.Join(t.TempDir(), "debugprog")
 
 	// Compile with debugging flags
 	cmd := exec.Command("go", "build", "-gcflags=all=-N -l", "-o", binaryPath, ".")
@@ -91,9 +95,7 @@ func compileTestProgram(t *testing.T, cwd, name string) (binaryPath string, clea
 		t.Fatalf("Failed to compile program: %v\nOutput: %s", err, output)
 	}
 
-	cleanup = func() {
-		os.Remove(binaryPath)
-	}
+	cleanup = func() {}
 
 	return binaryPath, cleanup
 }
@@ -115,6 +117,7 @@ func setupMCPServerAndClient(t *testing.T) *testSetup {
 	}
 	server := mcp.NewServer(&implementation, nil)
 	registerTools(server, io.Discard)
+	registerPrompts(server)
 
 	// Create httptest server
 	getServer := func(request *http.Request) *mcp.Server {
@@ -173,9 +176,7 @@ func (ts *testSetup) startDebugSession(t *testing.T, port string, binaryPath str
 	if len(programArgs) > 0 {
 		args["args"] = programArgs
 	}
-	for k, v := range dapLogArgs(t) {
-		args[k] = v
-	}
+	maps.Copy(args, dapLogArgs(t))
 
 	result, err := ts.session.CallTool(ts.ctx, &mcp.CallToolParams{
 		Name:      "debug",
@@ -301,6 +302,9 @@ func (ts *testSetup) stopDebugger(t *testing.T) {
 func requireGDBDeps(t *testing.T) {
 	t.Helper()
 	if _, err := exec.LookPath("gdb"); err != nil {
+		if os.Getenv("MCP_DAP_REQUIRE_GDB") == "1" {
+			t.Fatal("gdb is required by this test environment but was not found")
+		}
 		t.Skip("gdb not found in PATH")
 	}
 	// Homebrew's current GDB package can inspect Mach-O binaries on Apple
@@ -313,9 +317,15 @@ func requireGDBDeps(t *testing.T) {
 		defer cancel()
 		output, err := exec.CommandContext(ctx, "gdb", "-q", "-batch", "-ex", "start", "/usr/bin/true").CombinedOutput()
 		if strings.Contains(string(output), "Don't know how to run") {
+			if os.Getenv("MCP_DAP_REQUIRE_GDB") == "1" {
+				t.Fatal("installed GDB cannot launch native ARM64 macOS inferiors")
+			}
 			t.Skip("installed GDB cannot launch native ARM64 macOS inferiors")
 		}
 		if ctx.Err() != nil {
+			if os.Getenv("MCP_DAP_REQUIRE_GDB") == "1" {
+				t.Fatal("GDB runnability probe timed out")
+			}
 			t.Skip("GDB runnability probe timed out")
 		}
 		if err != nil {
@@ -327,6 +337,9 @@ func requireGDBDeps(t *testing.T) {
 func skipIfGDBLacksCoreFileSupport(t *testing.T, errorMsg string) {
 	t.Helper()
 	if strings.Contains(errorMsg, "attach requires either") {
+		if os.Getenv("MCP_DAP_REQUIRE_GDB_CORE") == "1" {
+			t.Fatalf("GDB core DAP support required: %s", errorMsg)
+		}
 		t.Skipf("GDB does not support DAP core file loading (requires GDB 18+): %s", errorMsg)
 	}
 }
@@ -340,9 +353,7 @@ func compileTestCProgram(t *testing.T, cwd, name string) (binaryPath string, cle
 	}
 
 	programDir := filepath.Join(cwd, "testdata", "c", name)
-	binaryPath = filepath.Join(programDir, "debugprog")
-
-	os.Remove(binaryPath)
+	binaryPath = filepath.Join(t.TempDir(), "debugprog")
 
 	cmd := exec.Command("gcc", "-g", "-O0", "-o", binaryPath, "main.c")
 	cmd.Dir = programDir
@@ -351,10 +362,7 @@ func compileTestCProgram(t *testing.T, cwd, name string) (binaryPath string, cle
 		t.Fatalf("Failed to compile C program: %v\nOutput: %s", err, output)
 	}
 
-	cleanup = func() {
-		os.Remove(binaryPath)
-		os.RemoveAll(binaryPath + ".dSYM")
-	}
+	cleanup = func() {}
 
 	return binaryPath, cleanup
 }
@@ -1465,9 +1473,7 @@ func TestGDBCoreDump(t *testing.T) {
 		"path":         binaryPath,
 		"coreFilePath": corePath,
 	}
-	for k, v := range dapLogArgs(t) {
-		debugArgs[k] = v
-	}
+	maps.Copy(debugArgs, dapLogArgs(t))
 	defer dumpDAPLogs(t)
 
 	result, err := ts.session.CallTool(ts.ctx, &mcp.CallToolParams{
@@ -1520,9 +1526,7 @@ func TestGDBCoreDumpWithoutPath(t *testing.T) {
 		"mode":         "core",
 		"coreFilePath": corePath,
 	}
-	for k, v := range dapLogArgs(t) {
-		debugArgs[k] = v
-	}
+	maps.Copy(debugArgs, dapLogArgs(t))
 	defer dumpDAPLogs(t)
 
 	result, err := ts.session.CallTool(ts.ctx, &mcp.CallToolParams{
@@ -1813,8 +1817,12 @@ func TestInfoBreakpoints(t *testing.T) {
 	}
 
 	// Set a line breakpoint and a function breakpoint
-	ts.callTool(t, "breakpoint", map[string]any{"file": f, "line": 7})
-	ts.callTool(t, "breakpoint", map[string]any{"function": "main.main"})
+	if text, isErr = ts.callTool(t, "breakpoint", map[string]any{"file": f, "line": 7}); isErr {
+		t.Fatalf("set line breakpoint: %s", text)
+	}
+	if text, isErr = ts.callTool(t, "breakpoint", map[string]any{"function": "main.main"}); isErr {
+		t.Fatalf("set function breakpoint: %s", text)
+	}
 
 	text, isErr = ts.callTool(t, "info", map[string]any{"type": "breakpoints"})
 	if isErr {
@@ -1829,7 +1837,9 @@ func TestInfoBreakpoints(t *testing.T) {
 	t.Logf("info breakpoints:\n%s", text)
 
 	// Clear all and verify empty again
-	ts.callTool(t, "clear-breakpoints", map[string]any{"all": true})
+	if text, isErr = ts.callTool(t, "clear-breakpoints", map[string]any{"all": true}); isErr {
+		t.Fatalf("clear all breakpoints: %s", text)
+	}
 	text, isErr = ts.callTool(t, "info", map[string]any{"type": "breakpoints"})
 	if isErr {
 		t.Fatalf("info breakpoints returned error after clear: %s", text)
@@ -1884,7 +1894,7 @@ func TestLineBreakpointTracking(t *testing.T) {
 	// Verify we stopped at line 7
 	contextStr := ts.getContextContent(t)
 	if !strings.Contains(contextStr, "main.go:7") {
-		t.Logf("Expected to be stopped at line 7, got: %s", contextStr)
+		t.Fatalf("Expected to be stopped at line 7, got: %s", contextStr)
 	}
 
 	// Continue to second breakpoint
@@ -1897,7 +1907,7 @@ func TestLineBreakpointTracking(t *testing.T) {
 	// Verify we stopped at line 13
 	contextStr = ts.getContextContent(t)
 	if !strings.Contains(contextStr, "main.go:13") {
-		t.Logf("Expected to be stopped at line 13, got: %s", contextStr)
+		t.Fatalf("Expected to be stopped at line 13, got: %s", contextStr)
 	}
 
 	ts.stopDebugger(t)
@@ -1949,7 +1959,7 @@ func TestClearSpecificLineBreakpoint(t *testing.T) {
 	// Verify we stopped at line 13
 	contextStr := ts.getContextContent(t)
 	if !strings.Contains(contextStr, "main.go:13") {
-		t.Logf("Context after continue (expected line 13): %s", contextStr)
+		t.Fatalf("Context after continue (expected line 13): %s", contextStr)
 	}
 
 	ts.stopDebugger(t)
@@ -1982,6 +1992,14 @@ func TestMultipleFilesLineBreakpoints(t *testing.T) {
 	}
 	t.Logf("Set second breakpoint in file 1: %s", text)
 
+	text, isErr = ts.callTool(t, "info", map[string]any{"type": "breakpoints"})
+	if isErr {
+		t.Fatalf("list breakpoints before clear: %s", text)
+	}
+	if !strings.Contains(text, ":7") || !strings.Contains(text, ":13") {
+		t.Fatalf("both requested breakpoints must be tracked before clear:\n%s", text)
+	}
+
 	// Clear breakpoints in first file only
 	text, isErr = ts.callTool(t, "clear-breakpoints", map[string]any{"file": f1})
 	if isErr {
@@ -1999,7 +2017,7 @@ func TestMultipleFilesLineBreakpoints(t *testing.T) {
 	}
 	// Program should run to completion
 	if !strings.Contains(text, "terminated") && !strings.Contains(text, "exited") {
-		t.Logf("Continue result (expected termination): %s", text)
+		t.Fatalf("Continue result (expected termination): %s", text)
 	}
 
 	ts.stopDebugger(t)
@@ -2055,7 +2073,7 @@ func TestClearAllBreakpointsAcrossFiles(t *testing.T) {
 	}
 	// Program should run to completion
 	if !strings.Contains(text, "terminated") && !strings.Contains(text, "exited") {
-		t.Logf("Continue result (expected termination): %s", text)
+		t.Fatalf("Continue result (expected termination): %s", text)
 	}
 
 	ts.stopDebugger(t)
@@ -2098,7 +2116,7 @@ func TestDuplicateLineBreakpoint(t *testing.T) {
 	// Verify we stopped
 	contextStr := ts.getContextContent(t)
 	if !strings.Contains(contextStr, "main.go:7") {
-		t.Logf("Context after first stop (expected line 7): %s", contextStr)
+		t.Fatalf("Context after first stop (expected line 7): %s", contextStr)
 	}
 
 	// Continue again - should not hit another breakpoint at same location
@@ -2313,7 +2331,9 @@ func TestDisassemble(t *testing.T) {
 		t.Fatalf("Failed to set breakpoint on main.main: %s", text)
 	}
 
-	ts.callTool(t, "continue", map[string]any{})
+	if text, isErr = ts.callTool(t, "continue", map[string]any{}); isErr {
+		t.Fatalf("continue to main.main: %s", text)
+	}
 
 	contextStr := ts.getContextContent(t)
 	var addr string
@@ -2327,7 +2347,7 @@ func TestDisassemble(t *testing.T) {
 		}
 	}
 	if addr == "" {
-		t.Skip("Could not determine instruction address for disassemble test")
+		t.Fatalf("context omitted instruction address required by disassemble:\n%s", contextStr)
 	}
 	t.Logf("Using instruction pointer address for main.main: %s", addr)
 
@@ -2366,10 +2386,16 @@ func TestSetVariable(t *testing.T) {
 		t.Fatalf("Expected x to be 10, got context:\n%s", contextStr)
 	}
 
-	// Delve uses variablesReference = 1001 for the Locals scope in frame 1000
-	// Set x to 99
+	match := regexp.MustCompile(`### Locals \(variablesReference: ([0-9]+)\)`).FindStringSubmatch(contextStr)
+	if len(match) != 2 {
+		t.Fatalf("context did not expose the Locals variablesReference:\n%s", contextStr)
+	}
+	variablesReference, err := strconv.Atoi(match[1])
+	if err != nil {
+		t.Fatalf("invalid Locals variablesReference %q: %v", match[1], err)
+	}
 	text, isErr := ts.callTool(t, "set-variable", map[string]any{
-		"variablesReference": 1001,
+		"variablesReference": variablesReference,
 		"name":               "x",
 		"value":              "99",
 	})
@@ -2410,10 +2436,9 @@ func TestPause(t *testing.T) {
 	f := filepath.Join(ts.cwd, "testdata", "go", "helloworld", "main.go")
 	ts.setBreakpointAndContinue(t, f, 7)
 
-	// Call pause while already stopped — exercises the pause code path.
-	// Full concurrent pause (continue + pause) requires concurrent DAP reads
-	// which is not supported by the current single-reader architecture.
-	text, isErr := ts.callTool(t, "pause", map[string]any{"threadId": 1})
+	// Omit threadId to verify the current stopped thread/default is selected.
+	// The fake-adapter test separately exercises pause during a pending continue.
+	text, isErr := ts.callTool(t, "pause", map[string]any{})
 	if isErr {
 		t.Fatalf("pause returned error: %s", text)
 	}
@@ -2441,7 +2466,6 @@ func TestStepIn(t *testing.T) {
 	// Step in — should step into fmt.Sprintf; fullContext needed to check function name
 	text, isErr := ts.callTool(t, "step", map[string]any{
 		"mode":        "in",
-		"threadId":    1,
 		"fullContext": true,
 	})
 	if isErr {
@@ -2472,8 +2496,7 @@ func TestStepOut(t *testing.T) {
 
 	// Step in
 	_, isErr := ts.callTool(t, "step", map[string]any{
-		"mode":     "in",
-		"threadId": 1,
+		"mode": "in",
 	})
 	if isErr {
 		t.Fatal("step in failed")
@@ -2481,8 +2504,7 @@ func TestStepOut(t *testing.T) {
 
 	// Step out — should return to main.main
 	text, isErr := ts.callTool(t, "step", map[string]any{
-		"mode":     "out",
-		"threadId": 1,
+		"mode": "out",
 	})
 	if isErr {
 		t.Fatalf("step out returned error: %s", text)

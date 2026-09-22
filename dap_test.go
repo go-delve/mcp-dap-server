@@ -5,9 +5,7 @@ import (
 	"bytes"
 	"io"
 	"net"
-	"strings"
 	"testing"
-	"time"
 
 	"github.com/google/go-dap"
 )
@@ -77,26 +75,62 @@ func TestNewDAPClientFromRWC(t *testing.T) {
 	}
 }
 
-func TestReadMessageTimeoutClosesConnection(t *testing.T) {
+func TestDAPClientPreservesOutOfOrderMessages(t *testing.T) {
 	clientConn, serverConn := net.Pipe()
 	defer serverConn.Close()
 
 	client := newDAPClientFromRWC(clientConn)
-	client.readTimeout = 20 * time.Millisecond
+	defer client.Close()
+	handled := make(chan dap.EventMessage, 1)
+	client.SetEventHandler(func(event dap.EventMessage) {
+		handled <- event
+	})
 
-	start := time.Now()
-	_, err := client.ReadMessage()
-	if err == nil {
-		t.Fatal("expected a timeout error")
-	}
-	if !strings.Contains(err.Error(), "timed out") || !strings.Contains(err.Error(), "connection closed") {
-		t.Fatalf("unexpected timeout error: %v", err)
-	}
-	if elapsed := time.Since(start); elapsed > time.Second {
-		t.Fatalf("ReadMessage took %s, want bounded timeout", elapsed)
-	}
+	go func() {
+		_ = dap.WriteProtocolMessage(serverConn, &dap.ContinueResponse{
+			Response: dap.Response{
+				ProtocolMessage: dap.ProtocolMessage{Seq: 3, Type: "response"},
+				RequestSeq:      2,
+				Success:         true,
+				Command:         "continue",
+			},
+		})
+		_ = dap.WriteProtocolMessage(serverConn, &dap.StoppedEvent{
+			Event: dap.Event{ProtocolMessage: dap.ProtocolMessage{Seq: 4, Type: "event"}, Event: "stopped"},
+			Body:  dap.StoppedEventBody{Reason: "breakpoint", ThreadId: 1},
+		})
+		_ = dap.WriteProtocolMessage(serverConn, &dap.PauseResponse{
+			Response: dap.Response{
+				ProtocolMessage: dap.ProtocolMessage{Seq: 5, Type: "response"},
+				RequestSeq:      1,
+				Success:         true,
+				Command:         "pause",
+			},
+		})
+	}()
 
-	if _, err := serverConn.Write([]byte("late response")); err == nil {
-		t.Error("expected client connection to be closed after timeout")
+	first, err := client.waitResponse(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.(dap.ResponseMessage).GetResponse().RequestSeq != 1 {
+		t.Fatalf("waitResponse(1) got %#v", first)
+	}
+	event, err := client.waitEvent()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := event.(*dap.StoppedEvent); !ok {
+		t.Fatalf("waitEvent got %T", event)
+	}
+	if _, ok := (<-handled).(*dap.StoppedEvent); !ok {
+		t.Fatal("central event handler did not receive stopped event")
+	}
+	second, err := client.waitResponse(2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.(dap.ResponseMessage).GetResponse().RequestSeq != 2 {
+		t.Fatalf("waitResponse(2) got %#v", second)
 	}
 }

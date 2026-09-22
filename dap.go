@@ -2,12 +2,12 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net"
 	"sync"
-	"time"
 
 	"github.com/google/go-dap"
 )
@@ -31,24 +31,25 @@ func (r *readWriteCloser) Close() error {
 	return writeErr
 }
 
-// DAPClient is a synchronous Debug Adapter Protocol client.
-// It manages a connection to a DAP server and provides methods for
-// sending each DAP request type. Each request method returns the
-// sequence number of the sent request, which callers use to match
-// the corresponding response via request_seq.
+// DAPClient has one transport reader and a durable, ordered inbox. Waiters
+// remove only messages they consume, so a response or event that arrives early
+// remains available to the operation responsible for it.
 type DAPClient struct {
 	rwc       io.ReadWriteCloser
 	reader    *bufio.Reader
 	logWriter io.Writer
 	closeOnce sync.Once
-	// readTimeout bounds every adapter read. A timed-out read closes the
-	// single-reader transport so later requests cannot consume a stale reply.
-	readTimeout time.Duration
-	// seq tracks the sequence number for each request sent to the server.
-	seq int
+	sendMu    sync.Mutex
+	handlerMu sync.RWMutex
+	onEvent   func(dap.EventMessage)
+	inboxMu   sync.Mutex
+	inbox     []dap.Message
+	readErr   error
+	notify    chan struct{}
+	seq       int
 }
 
-const defaultDAPReadTimeout = 30 * time.Second
+const maxDAPInboxMessages = 4096
 
 // newDAPClient creates a new Client over a TCP connection.
 // Call Close to close the connection.
@@ -63,12 +64,14 @@ func newDAPClient(addr string) (*DAPClient, error) {
 // newDAPClientFromRWC creates a new Client with the given ReadWriteCloser.
 // Call Close to close the underlying transport.
 func newDAPClientFromRWC(rwc io.ReadWriteCloser) *DAPClient {
-	return &DAPClient{
-		rwc:         rwc,
-		reader:      bufio.NewReader(rwc),
-		readTimeout: defaultDAPReadTimeout,
-		seq:         1, // match VS Code numbering
+	c := &DAPClient{
+		rwc:    rwc,
+		reader: bufio.NewReader(rwc),
+		notify: make(chan struct{}),
+		seq:    1, // match VS Code numbering
 	}
+	go c.readLoop()
+	return c
 }
 
 // Close closes the client connection.
@@ -80,11 +83,23 @@ func (c *DAPClient) Close() {
 
 // SetProtocolLogger sets a writer for logging all DAP messages sent and received.
 func (c *DAPClient) SetProtocolLogger(w io.Writer) {
+	c.sendMu.Lock()
+	defer c.sendMu.Unlock()
 	c.logWriter = w
+}
+
+func (c *DAPClient) SetEventHandler(handler func(dap.EventMessage)) {
+	c.handlerMu.Lock()
+	defer c.handlerMu.Unlock()
+	c.onEvent = handler
 }
 
 // InitializeRequest sends an 'initialize' request and returns the server's capabilities.
 func (c *DAPClient) InitializeRequest(adapterID string) (dap.Capabilities, error) {
+	return c.InitializeRequestContext(context.Background(), adapterID)
+}
+
+func (c *DAPClient) InitializeRequestContext(ctx context.Context, adapterID string) (dap.Capabilities, error) {
 	req := c.newRequest("initialize")
 	request := &dap.InitializeRequest{Request: *req}
 	request.Arguments = dap.InitializeRequestArguments{
@@ -93,67 +108,144 @@ func (c *DAPClient) InitializeRequest(adapterID string) (dap.Capabilities, error
 		LinesStartAt1:                true,
 		ColumnsStartAt1:              true,
 		SupportsVariableType:         true,
-		SupportsVariablePaging:       true,
+		SupportsVariablePaging:       false,
 		SupportsRunInTerminalRequest: false,
 		Locale:                       "en-us",
 	}
 	if err := c.send(request); err != nil {
 		return dap.Capabilities{}, err
 	}
+	msg, err := c.waitResponseContext(ctx, req.Seq)
+	if err != nil {
+		return dap.Capabilities{}, err
+	}
+	resp, ok := msg.(*dap.InitializeResponse)
+	if !ok {
+		return dap.Capabilities{}, fmt.Errorf("expected InitializeResponse, got %T", msg)
+	}
+	if !resp.Success {
+		return dap.Capabilities{}, fmt.Errorf("initialize failed: %s", resp.Message)
+	}
+	return resp.Body, nil
+}
+
+func (c *DAPClient) readLoop() {
 	for {
-		msg, err := c.ReadMessage()
-		if err != nil {
-			return dap.Capabilities{}, err
-		}
-		switch resp := msg.(type) {
-		case *dap.InitializeResponse:
-			if !resp.Success {
-				return dap.Capabilities{}, fmt.Errorf("initialize failed: %s", resp.Message)
+		msg, err := dap.ReadProtocolMessage(c.reader)
+		if err == nil {
+			c.sendMu.Lock()
+			if c.logWriter != nil {
+				if data, merr := json.Marshal(msg); merr == nil {
+					fmt.Fprintf(c.logWriter, "RECV: <<<%s>>>\n", data)
+				}
 			}
-			return resp.Body, nil
-		case dap.EventMessage:
-			// Skip events (e.g. OutputEvent) during initialization and keep reading
-			continue
-		default:
-			return dap.Capabilities{}, fmt.Errorf("expected InitializeResponse, got %T", msg)
+			c.sendMu.Unlock()
+			if event, ok := msg.(dap.EventMessage); ok {
+				c.handlerMu.RLock()
+				handler := c.onEvent
+				c.handlerMu.RUnlock()
+				if handler != nil {
+					handler(event)
+				}
+			}
+		}
+		c.inboxMu.Lock()
+		if err != nil {
+			c.readErr = err
+		} else if len(c.inbox) >= maxDAPInboxMessages {
+			c.readErr = fmt.Errorf("DAP adapter exceeded the %d-message inbox limit", maxDAPInboxMessages)
+		} else {
+			c.inbox = append(c.inbox, msg)
+		}
+		close(c.notify)
+		c.notify = make(chan struct{})
+		c.inboxMu.Unlock()
+		if err != nil {
+			return
+		}
+		c.inboxMu.Lock()
+		overflow := c.readErr != nil
+		c.inboxMu.Unlock()
+		if overflow {
+			c.Close()
+			return
 		}
 	}
 }
 
-func (c *DAPClient) ReadMessage() (dap.Message, error) {
-	type readResult struct {
-		msg dap.Message
-		err error
-	}
-	result := make(chan readResult, 1)
-	go func() {
-		msg, err := dap.ReadProtocolMessage(c.reader)
-		result <- readResult{msg: msg, err: err}
-	}()
+// waitMessage removes the first queued message accepted by match. Unmatched
+// messages remain ordered in the inbox for another waiter.
+func (c *DAPClient) waitMessage(match func(dap.Message) bool) (dap.Message, error) {
+	return c.waitMessageContext(context.Background(), match)
+}
 
-	var read readResult
-	if c.readTimeout <= 0 {
-		read = <-result
-	} else {
+func (c *DAPClient) takeMessage(match func(dap.Message) bool) (dap.Message, bool) {
+	c.inboxMu.Lock()
+	defer c.inboxMu.Unlock()
+	for i, msg := range c.inbox {
+		if match(msg) {
+			c.inbox = append(c.inbox[:i], c.inbox[i+1:]...)
+			return msg, true
+		}
+	}
+	return nil, false
+}
+
+func (c *DAPClient) waitMessageContext(ctx context.Context, match func(dap.Message) bool) (dap.Message, error) {
+	for {
+		c.inboxMu.Lock()
+		for i, msg := range c.inbox {
+			if match(msg) {
+				c.inbox = append(c.inbox[:i], c.inbox[i+1:]...)
+				c.inboxMu.Unlock()
+				return msg, nil
+			}
+		}
+		if c.readErr != nil {
+			err := c.readErr
+			c.inboxMu.Unlock()
+			return nil, err
+		}
+		notify := c.notify
+		c.inboxMu.Unlock()
 		select {
-		case read = <-result:
-		case <-time.After(c.readTimeout):
-			// There is only one reader for a DAP connection. Leaving a blocked
-			// reader alive would make a later request race for its response, so
-			// a timeout deliberately poisons this session's connection.
-			c.Close()
-			return nil, fmt.Errorf("DAP adapter timed out after %s while waiting for a message; connection closed", c.readTimeout)
+		case <-notify:
+		case <-ctx.Done():
+			return nil, ctx.Err()
 		}
 	}
-	if read.err != nil {
-		return nil, read.err
-	}
-	if c.logWriter != nil {
-		if data, merr := json.Marshal(read.msg); merr == nil {
-			fmt.Fprintf(c.logWriter, "RECV: <<<%s>>>\n", data)
-		}
-	}
-	return read.msg, nil
+}
+
+func (c *DAPClient) waitResponse(requestSeq int) (dap.Message, error) {
+	return c.waitMessage(func(msg dap.Message) bool {
+		resp, ok := msg.(dap.ResponseMessage)
+		return ok && resp.GetResponse().RequestSeq == requestSeq
+	})
+}
+
+func (c *DAPClient) waitResponseContext(ctx context.Context, requestSeq int) (dap.Message, error) {
+	return c.waitMessageContext(ctx, func(msg dap.Message) bool {
+		resp, ok := msg.(dap.ResponseMessage)
+		return ok && resp.GetResponse().RequestSeq == requestSeq
+	})
+}
+
+func (c *DAPClient) waitEvent() (dap.Message, error) {
+	return c.waitMessage(func(msg dap.Message) bool {
+		_, ok := msg.(dap.EventMessage)
+		return ok
+	})
+}
+
+func (c *DAPClient) waitEventContext(ctx context.Context) (dap.Message, error) {
+	return c.waitMessageContext(ctx, func(msg dap.Message) bool {
+		_, ok := msg.(dap.EventMessage)
+		return ok
+	})
+}
+
+func (c *DAPClient) ReadMessage() (dap.Message, error) {
+	return c.waitMessage(func(dap.Message) bool { return true })
 }
 
 // LaunchRequest sends a 'launch' request with the specified args.
@@ -190,6 +282,8 @@ func (c *DAPClient) CoreRequest(program, coreFilePath string) (int, error) {
 // auto-incremented sequence number. The caller can read the assigned
 // sequence number from the returned request's Seq field.
 func (c *DAPClient) newRequest(command string) *dap.Request {
+	c.sendMu.Lock()
+	defer c.sendMu.Unlock()
 	request := &dap.Request{}
 	request.Type = "request"
 	request.Command = command
@@ -199,6 +293,8 @@ func (c *DAPClient) newRequest(command string) *dap.Request {
 }
 
 func (c *DAPClient) send(request dap.Message) error {
+	c.sendMu.Lock()
+	defer c.sendMu.Unlock()
 	if c.logWriter != nil {
 		if data, err := json.Marshal(request); err == nil {
 			fmt.Fprintf(c.logWriter, "SENT: <<<%s>>>\n", data)
@@ -286,6 +382,16 @@ func (c *DAPClient) PauseRequest(threadID int) (int, error) {
 	req := c.newRequest("pause")
 	request := &dap.PauseRequest{Request: *req}
 	request.Arguments.ThreadId = threadID
+	return req.Seq, c.send(request)
+}
+
+// CancelRequest asks an adapter to cancel an in-progress request.
+func (c *DAPClient) CancelRequest(requestID int) (int, error) {
+	req := c.newRequest("cancel")
+	request := &dap.CancelRequest{
+		Request:   *req,
+		Arguments: &dap.CancelArguments{RequestId: requestID},
+	}
 	return req.Seq, c.send(request)
 }
 
