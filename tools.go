@@ -713,7 +713,7 @@ func (ds *debuggerSession) evaluateExpression(ctx context.Context, _ *mcp.CallTo
 					Value:              resp.Body.Result,
 					Type:               resp.Body.Type,
 					VariablesReference: resp.Body.VariablesReference,
-				}, "  ", params.Expression, 2)
+				}, "  ", params.Expression, maxVariableExpansionDepth)
 				result = expanded.String()
 			}
 			return &mcp.CallToolResult{
@@ -1605,9 +1605,14 @@ func (ds *debuggerSession) waitForStopOrTermination(requestSeq int, fullContext 
 			code := resp.Body.ExitCode
 			exitCode = &code
 		case *dap.TerminatedEvent:
-			return &mcp.CallToolResult{
+			result := &mcp.CallToolResult{
 				Content: []mcp.Content{&mcp.TextContent{Text: formatTermination(exitCode, output.String())}},
-			}, nil
+			}
+			// A terminated debuggee cannot service any more session tools. Tear
+			// down the adapter and restore the debug tool just as an explicit
+			// stop does, rather than leaving a stale session behind.
+			ds.cleanup()
+			return result, nil
 		}
 	}
 }
@@ -1694,10 +1699,15 @@ func (ds *debuggerSession) writeScopesAndVariables(result *strings.Builder, fram
 			continue
 		}
 		for _, v := range varResp.Body.Variables {
-			ds.writeVariable(result, v, "  ", v.Name, 2)
+			ds.writeVariable(result, v, "  ", v.Name, maxVariableExpansionDepth)
 		}
 	}
 }
+
+// maxVariableExpansionDepth bounds the number of child-reference traversals
+// from a top-level variable. Twenty levels accommodate deeply nested debugger
+// data structures while still guaranteeing termination for recursive pointers.
+const maxVariableExpansionDepth = 20
 
 // writeVariable writes a variable and up to maxDepth levels of children.
 // GDB represents aggregate values (such as structs) with an empty Value and
