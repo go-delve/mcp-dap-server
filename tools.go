@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/google/go-dap"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -20,11 +21,19 @@ import (
 
 type debuggerSession struct {
 	mu                  sync.Mutex // serializes DAP requests to prevent concurrent read races
+	controlMu           sync.RWMutex
+	controlClient       *DAPClient // permits pause/stop to interrupt a blocking execution wait
+	eventMu             sync.Mutex
+	eventBreakpoints    map[int]dap.Breakpoint
+	eventThreads        map[int]bool
+	progress            map[string]dap.ProgressStartEventBody
+	invalidated         bool
 	cmd                 *exec.Cmd
 	client              *DAPClient
 	server              *mcp.Server      // MCP server for dynamic tool registration
 	logWriter           io.Writer        // writer for adapter stderr (log file or io.Discard)
 	backend             DebuggerBackend  // debugger-specific backend (delve, gdb, etc.)
+	backendOverride     DebuggerBackend  // deterministic adapter used by protocol tests
 	capabilities        dap.Capabilities // capabilities reported by DAP server
 	launchMode          string           // "source", "binary", "core", or "attach"
 	programPath         string           // path to program being debugged
@@ -37,6 +46,54 @@ type debuggerSession struct {
 	lineBreakpoints     map[string][]int // tracked line breakpoints per file (DAP replaces all on each setBreakpoints call)
 }
 
+func (ds *debuggerSession) handleDAPEvent(event dap.EventMessage) {
+	ds.eventMu.Lock()
+	defer ds.eventMu.Unlock()
+	switch event := event.(type) {
+	case *dap.BreakpointEvent:
+		if ds.eventBreakpoints == nil {
+			ds.eventBreakpoints = make(map[int]dap.Breakpoint)
+		}
+		if event.Body.Reason == "removed" {
+			delete(ds.eventBreakpoints, event.Body.Breakpoint.Id)
+		} else {
+			ds.eventBreakpoints[event.Body.Breakpoint.Id] = event.Body.Breakpoint
+		}
+	case *dap.ThreadEvent:
+		if ds.eventThreads == nil {
+			ds.eventThreads = make(map[int]bool)
+		}
+		if event.Body.Reason == "exited" {
+			delete(ds.eventThreads, event.Body.ThreadId)
+		} else {
+			ds.eventThreads[event.Body.ThreadId] = true
+		}
+	case *dap.InvalidatedEvent:
+		ds.invalidated = true
+	case *dap.ProgressStartEvent:
+		if ds.progress == nil {
+			ds.progress = make(map[string]dap.ProgressStartEventBody)
+		}
+		ds.progress[event.Body.ProgressId] = event.Body
+	case *dap.ProgressUpdateEvent:
+		if started, ok := ds.progress[event.Body.ProgressId]; ok {
+			started.Message = event.Body.Message
+			started.Percentage = event.Body.Percentage
+			ds.progress[event.Body.ProgressId] = started
+		}
+	case *dap.ProgressEndEvent:
+		delete(ds.progress, event.Body.ProgressId)
+	}
+}
+
+func (ds *debuggerSession) consumeInvalidation() bool {
+	ds.eventMu.Lock()
+	defer ds.eventMu.Unlock()
+	invalidated := ds.invalidated
+	ds.invalidated = false
+	return invalidated
+}
+
 // defaultThreadID returns the thread ID to use when none is specified.
 // It returns the thread ID from the last StoppedEvent, or 1 as a fallback.
 func (ds *debuggerSession) defaultThreadID() int {
@@ -46,108 +103,103 @@ func (ds *debuggerSession) defaultThreadID() int {
 	return 1
 }
 
-// addFunctionBreakpoint appends a function breakpoint (if not already tracked)
-// and sends the full list to the DAP server. Caller must hold ds.mu.
-// Returns (seq, alreadyExists, error). When alreadyExists is true, no DAP
-// request was sent and seq is 0.
-func (ds *debuggerSession) addFunctionBreakpoint(name string) (int, error) {
-	if slices.Contains(ds.functionBreakpoints, name) {
-		return 0, nil
-	}
-	ds.functionBreakpoints = append(ds.functionBreakpoints, name)
-	seq, err := ds.client.SetFunctionBreakpointsRequest(ds.functionBreakpoints)
+// Breakpoint helpers commit local state only after the adapter acknowledges the
+// complete replacement list. Caller must hold ds.mu.
+func (ds *debuggerSession) setFunctionBreakpoints(ctx context.Context, candidate []string) (*dap.SetFunctionBreakpointsResponse, error) {
+	seq, err := ds.client.SetFunctionBreakpointsRequest(candidate)
 	if err != nil {
-		ds.functionBreakpoints = ds.functionBreakpoints[:len(ds.functionBreakpoints)-1]
-		return 0, err
+		return nil, err
 	}
-	return seq, nil
+	resp, err := readTypedResponse[*dap.SetFunctionBreakpointsResponse](ctx, ds.client, seq)
+	if err != nil {
+		return nil, err
+	}
+	ds.functionBreakpoints = slices.Clone(candidate)
+	return resp, nil
 }
 
-// removeFunctionBreakpoint removes a function breakpoint by name
-// and sends the updated list to the DAP server. Caller must hold ds.mu.
-// Returns seq==0 when no breakpoint was found (no DAP request sent).
-func (ds *debuggerSession) removeFunctionBreakpoint(name string) (int, error) {
-	if !slices.Contains(ds.functionBreakpoints, name) {
-		return 0, nil
+func (ds *debuggerSession) addFunctionBreakpoint(ctx context.Context, name string) (*dap.SetFunctionBreakpointsResponse, bool, error) {
+	if slices.Contains(ds.functionBreakpoints, name) {
+		return nil, true, nil
 	}
-	ds.functionBreakpoints = slices.DeleteFunc(ds.functionBreakpoints, func(fn string) bool {
+	candidate := append(slices.Clone(ds.functionBreakpoints), name)
+	resp, err := ds.setFunctionBreakpoints(ctx, candidate)
+	return resp, false, err
+}
+
+func (ds *debuggerSession) removeFunctionBreakpoint(ctx context.Context, name string) (bool, error) {
+	if !slices.Contains(ds.functionBreakpoints, name) {
+		return false, nil
+	}
+	candidate := slices.DeleteFunc(slices.Clone(ds.functionBreakpoints), func(fn string) bool {
 		return fn == name
 	})
-	return ds.client.SetFunctionBreakpointsRequest(ds.functionBreakpoints)
+	_, err := ds.setFunctionBreakpoints(ctx, candidate)
+	return err == nil, err
 }
 
-// clearFunctionBreakpoints removes all tracked function breakpoints
-// and sends an empty list to the DAP server. Caller must hold ds.mu.
-func (ds *debuggerSession) clearFunctionBreakpoints() (int, error) {
-	ds.functionBreakpoints = nil
-	return ds.client.SetFunctionBreakpointsRequest([]string{})
+func (ds *debuggerSession) clearFunctionBreakpoints(ctx context.Context) error {
+	_, err := ds.setFunctionBreakpoints(ctx, []string{})
+	return err
 }
 
-// addLineBreakpoint adds a line breakpoint for the given file and sends the
-// full list for that file to the DAP server. Caller must hold ds.mu.
-// Returns seq==0 when the breakpoint already exists (no DAP request sent).
-func (ds *debuggerSession) addLineBreakpoint(file string, line int) (int, error) {
+func (ds *debuggerSession) setLineBreakpoints(ctx context.Context, file string, candidate []int) (*dap.SetBreakpointsResponse, error) {
+	seq, err := ds.client.SetBreakpointsRequest(file, candidate)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := readTypedResponse[*dap.SetBreakpointsResponse](ctx, ds.client, seq)
+	if err != nil {
+		return nil, err
+	}
 	if ds.lineBreakpoints == nil {
 		ds.lineBreakpoints = make(map[string][]int)
 	}
+	if len(candidate) == 0 {
+		delete(ds.lineBreakpoints, file)
+	} else {
+		ds.lineBreakpoints[file] = slices.Clone(candidate)
+	}
+	return resp, nil
+}
+
+func (ds *debuggerSession) addLineBreakpoint(ctx context.Context, file string, line int) (*dap.SetBreakpointsResponse, bool, error) {
 	lines := ds.lineBreakpoints[file]
 	if slices.Contains(lines, line) {
-		return 0, nil
+		return nil, true, nil
 	}
-	lines = append(lines, line)
-	ds.lineBreakpoints[file] = lines
-	seq, err := ds.client.SetBreakpointsRequest(file, ds.lineBreakpoints[file])
-	if err != nil {
-		ds.lineBreakpoints[file] = ds.lineBreakpoints[file][:len(ds.lineBreakpoints[file])-1]
-		if len(ds.lineBreakpoints[file]) == 0 {
-			delete(ds.lineBreakpoints, file)
-		}
-		return 0, err
-	}
-	return seq, nil
+	candidate := append(slices.Clone(lines), line)
+	resp, err := ds.setLineBreakpoints(ctx, file, candidate)
+	return resp, false, err
 }
 
-// removeLineBreakpoint removes a line breakpoint for the given file and sends
-// the updated list to the DAP server. Caller must hold ds.mu.
-// Returns seq==0 when no breakpoint was found (no DAP request sent).
-func (ds *debuggerSession) removeLineBreakpoint(file string, line int) (int, error) {
+func (ds *debuggerSession) removeLineBreakpoint(ctx context.Context, file string, line int) (bool, error) {
 	if ds.lineBreakpoints == nil || !slices.Contains(ds.lineBreakpoints[file], line) {
-		return 0, nil
+		return false, nil
 	}
-	ds.lineBreakpoints[file] = slices.DeleteFunc(ds.lineBreakpoints[file], func(l int) bool {
+	candidate := slices.DeleteFunc(slices.Clone(ds.lineBreakpoints[file]), func(l int) bool {
 		return l == line
 	})
-	if len(ds.lineBreakpoints[file]) == 0 {
-		delete(ds.lineBreakpoints, file)
-	}
-	return ds.client.SetBreakpointsRequest(file, ds.lineBreakpoints[file])
+	_, err := ds.setLineBreakpoints(ctx, file, candidate)
+	return err == nil, err
 }
 
-// clearLineBreakpoints removes all tracked line breakpoints for a file and
-// sends an empty list to the DAP server. Caller must hold ds.mu.
-func (ds *debuggerSession) clearLineBreakpoints(file string) (int, error) {
-	if ds.lineBreakpoints != nil {
-		delete(ds.lineBreakpoints, file)
-	}
-	return ds.client.SetBreakpointsRequest(file, []int{})
+func (ds *debuggerSession) clearLineBreakpoints(ctx context.Context, file string) error {
+	_, err := ds.setLineBreakpoints(ctx, file, []int{})
+	return err
 }
 
 // clearAllLineBreakpoints removes all tracked line breakpoints across all files.
 // Caller must hold ds.mu.
-func (ds *debuggerSession) clearAllLineBreakpoints() error {
+func (ds *debuggerSession) clearAllLineBreakpoints(ctx context.Context) error {
 	if ds.lineBreakpoints == nil {
 		return nil
 	}
 	for file := range ds.lineBreakpoints {
-		seq, err := ds.client.SetBreakpointsRequest(file, []int{})
-		if err != nil {
-			return err
-		}
-		if err := readAndValidateResponse(ds.client, seq, "unable to clear breakpoints"); err != nil {
+		if err := ds.clearLineBreakpoints(ctx, file); err != nil {
 			return err
 		}
 	}
-	ds.lineBreakpoints = nil
 	return nil
 }
 
@@ -163,6 +215,16 @@ Choose the debugger based on the language of the program being debugged: use 'de
 
 By default, when stopped at a breakpoint returns a compact stop summary (location only). Set fullContext: true only if you need variables immediately — leave it false unless you plan to call 'context' right after anyway.`
 
+func debuggerToolAnnotations(readOnly, destructive, idempotent bool) *mcp.ToolAnnotations {
+	openWorld := true
+	return &mcp.ToolAnnotations{
+		ReadOnlyHint:    readOnly,
+		DestructiveHint: &destructive,
+		IdempotentHint:  idempotent,
+		OpenWorldHint:   &openWorld,
+	}
+}
+
 // registerTools registers the debugger tools with the MCP server.
 // logWriter is used to redirect adapter stderr output; pass io.Discard to suppress.
 func registerTools(server *mcp.Server, logWriter io.Writer) *debuggerSession {
@@ -171,6 +233,7 @@ func registerTools(server *mcp.Server, logWriter io.Writer) *debuggerSession {
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "debug",
 		Description: debugToolDescription,
+		Annotations: debuggerToolAnnotations(false, true, false),
 	}, ds.debug)
 
 	return ds
@@ -213,21 +276,25 @@ func (ds *debuggerSession) registerSessionTools() {
 	mcp.AddTool(ds.server, &mcp.Tool{
 		Name:        "stop",
 		Description: "End the debugging session. By default terminates the debuggee. Pass detach=true to detach without killing the process (leaves it running); detach requires adapter support.",
+		Annotations: debuggerToolAnnotations(false, true, true),
 	}, ds.stop)
 	mcp.AddTool(ds.server, &mcp.Tool{
-		Name: "breakpoint",
+		Name:        "breakpoint",
+		Annotations: debuggerToolAnnotations(false, false, true),
 		Description: `Set a breakpoint. Provide EITHER file+line OR function name (not both).
 
 Examples: {"file": "/path/to/main.go", "line": 42} or {"function": "main.processData"}`,
 	}, ds.breakpoint)
 	mcp.AddTool(ds.server, &mcp.Tool{
-		Name: "clear-breakpoints",
+		Name:        "clear-breakpoints",
+		Annotations: debuggerToolAnnotations(false, true, true),
 		Description: `Remove breakpoints. Provide 'file' to clear all breakpoints in a file, 'file'+'line' to clear a specific line breakpoint, 'function' to clear a function breakpoint, or 'all': true to clear all breakpoints.
 
 Examples: {"file": "/path/to/main.go"} or {"file": "/path/to/main.go", "line": 42} or {"function": "main.processData"} or {"all": true}`,
 	}, ds.clearBreakpoints)
 	mcp.AddTool(ds.server, &mcp.Tool{
-		Name: "continue",
+		Name:        "continue",
+		Annotations: debuggerToolAnnotations(false, true, false),
 		Description: `Continue program execution until the next breakpoint or termination.
 
 By default returns a compact stop summary (location only). Set fullContext: true only if you need variables immediately — it saves a separate 'context' call but returns much more data. Leave fullContext false (the default) unless you know you need variables right away.
@@ -235,7 +302,8 @@ By default returns a compact stop summary (location only). Set fullContext: true
 Optionally specify 'to' for run-to-cursor: {"to": {"file": "/path/main.go", "line": 50}} or {"to": {"function": "main.Run"}}`,
 	}, ds.continueExecution)
 	mcp.AddTool(ds.server, &mcp.Tool{
-		Name: "step",
+		Name:        "step",
+		Annotations: debuggerToolAnnotations(false, true, false),
 		Description: `Step through code one line at a time.
 
 By default returns a compact stop summary (location only). Set fullContext: true only if you need variables immediately — it saves a separate 'context' call but returns much more data. Leave fullContext false (the default) unless you know you need variables right away.
@@ -245,15 +313,18 @@ Modes: 'over' (execute current line, step over function calls), 'in' (step into 
 	mcp.AddTool(ds.server, &mcp.Tool{
 		Name:        "pause",
 		Description: "Pause a running program. Use 'context' afterwards to inspect the current state.",
+		Annotations: debuggerToolAnnotations(false, false, true),
 	}, ds.pauseExecution)
 	mcp.AddTool(ds.server, &mcp.Tool{
-		Name: "context",
+		Name:        "context",
+		Annotations: debuggerToolAnnotations(true, false, true),
 		Description: `Get full debugging context at the current stop location. Always returns ALL of the following — source location, full stack trace, and all variables with types and values. There are no flags to control what is included; everything is always returned.
 
 Call with {} (no arguments) to use the current thread and top frame. Only three optional parameters exist: threadId, frameId, maxFrames. Do NOT pass any other parameters. Use 'info' with type 'threads' to discover valid thread IDs.`,
 	}, ds.context)
 	mcp.AddTool(ds.server, &mcp.Tool{
-		Name: "evaluate",
+		Name:        "evaluate",
+		Annotations: debuggerToolAnnotations(false, true, false),
 		Description: `Evaluate an expression in the debugged program's context. Returns the result value and type. All parameters except 'expression' are optional.
 
 The default context is 'watch', which evaluates language expressions (C, C++, Go). Use valid language syntax, not debugger commands.
@@ -277,6 +348,7 @@ For GDB commands (e.g. print/x), use context 'repl': {"expression": "print/x var
 	mcp.AddTool(ds.server, &mcp.Tool{
 		Name:        "info",
 		Description: infoDesc,
+		Annotations: debuggerToolAnnotations(true, false, true),
 	}, ds.info)
 
 	// Capability-gated tools
@@ -284,11 +356,13 @@ For GDB commands (e.g. print/x), use context 'repl': {"expression": "print/x var
 		mcp.AddTool(ds.server, &mcp.Tool{
 			Name:        "restart",
 			Description: "Restart the debugging session from the beginning. Optionally provide new command line arguments via 'args', or omit to reuse the previous arguments.",
+			Annotations: debuggerToolAnnotations(false, true, false),
 		}, ds.restartDebugger)
 	}
 	if ds.capabilities.SupportsSetVariable {
 		mcp.AddTool(ds.server, &mcp.Tool{
-			Name: "set-variable",
+			Name:        "set-variable",
+			Annotations: debuggerToolAnnotations(false, true, false),
 			Description: `Modify a variable's value in the debugged program. Requires the variablesReference from a previous 'context' call's scope.
 
 Example: {"variablesReference": 1000, "name": "count", "value": "42"}`,
@@ -296,7 +370,8 @@ Example: {"variablesReference": 1000, "name": "count", "value": "42"}`,
 	}
 	if ds.capabilities.SupportsDisassembleRequest {
 		mcp.AddTool(ds.server, &mcp.Tool{
-			Name: "disassemble",
+			Name:        "disassemble",
+			Annotations: debuggerToolAnnotations(true, false, true),
 			Description: `Disassemble machine code at a memory address. Returns assembly instructions.
 
 Example: {"address": "0x00400780"} or {"address": "0x00400780", "count": 30}
@@ -312,6 +387,7 @@ func (ds *debuggerSession) unregisterSessionTools() {
 	mcp.AddTool(ds.server, &mcp.Tool{
 		Name:        "debug",
 		Description: debugToolDescription,
+		Annotations: debuggerToolAnnotations(false, true, false),
 	}, ds.debug)
 }
 
@@ -365,74 +441,39 @@ type BreakpointToolParams struct {
 	Function string  `json:"function,omitempty" jsonschema:"function name (alternative to file+line)"`
 }
 
-// readAndValidateResponse reads DAP messages until it receives the response
-// matching requestSeq. Out-of-order responses (different request_seq) and
-// events are skipped. Returns an error if the matched response indicates failure.
-func readAndValidateResponse(client *DAPClient, requestSeq int, errorPrefix string) error {
-	for {
-		msg, err := client.ReadMessage()
-		if err != nil {
-			return err
-		}
-		switch resp := msg.(type) {
-		case dap.ResponseMessage:
-			r := resp.GetResponse()
-			if r.RequestSeq != requestSeq {
-				log.Printf("readAndValidateResponse: skipping out-of-order response (request_seq=%d, waiting for %d)",
-					r.RequestSeq, requestSeq)
-				continue
-			}
-			if !r.Success {
-				return fmt.Errorf("%s: %s", errorPrefix, r.Message)
-			}
-			return nil
-		case dap.EventMessage:
-			continue
-		}
+// readAndValidateResponse consumes only the response matching requestSeq.
+// Other responses and events remain in the client's durable inbox.
+func readAndValidateResponse(ctx context.Context, client *DAPClient, requestSeq int, errorPrefix string) error {
+	msg, err := client.waitResponseContext(ctx, requestSeq)
+	if err != nil {
+		return err
 	}
+	r := msg.(dap.ResponseMessage).GetResponse()
+	if !r.Success {
+		return fmt.Errorf("%s: %s", errorPrefix, r.Message)
+	}
+	return nil
 }
 
-// readTypedResponse reads DAP messages until it receives a response of type T
-// matching requestSeq. Out-of-order responses (different request_seq) and
-// events are skipped. Returns an error if the matched response indicates failure.
+// readTypedResponse consumes only the response matching requestSeq.
 //
 // go-dap decodes all failed responses as *dap.ErrorResponse regardless of
 // command, so we match by request_seq rather than Go type alone.
-func readTypedResponse[T dap.ResponseMessage](client *DAPClient, requestSeq int) (T, error) {
+func readTypedResponse[T dap.ResponseMessage](ctx context.Context, client *DAPClient, requestSeq int) (T, error) {
 	var zero T
-	for {
-		msg, err := client.ReadMessage()
-		if err != nil {
-			return zero, err
-		}
-		switch resp := msg.(type) {
-		case T:
-			r := resp.GetResponse()
-			if r.RequestSeq != requestSeq {
-				log.Printf("readTypedResponse: skipping out-of-order %T (request_seq=%d, waiting for %d)",
-					resp, r.RequestSeq, requestSeq)
-				continue
-			}
-			if !r.Success {
-				return zero, errors.New(r.Message)
-			}
-			return resp, nil
-		case dap.ResponseMessage:
-			r := resp.GetResponse()
-			if r.RequestSeq != requestSeq {
-				log.Printf("readTypedResponse: skipping out-of-order %T (request_seq=%d, waiting for %d)",
-					resp, r.RequestSeq, requestSeq)
-				continue
-			}
-			// Matched request_seq but different Go type (e.g. *dap.ErrorResponse).
-			if !r.Success {
-				return zero, errors.New(r.Message)
-			}
-			return zero, fmt.Errorf("expected %T, got %T (request_seq=%d)", zero, resp, requestSeq)
-		case dap.EventMessage:
-			continue
-		}
+	msg, err := client.waitResponseContext(ctx, requestSeq)
+	if err != nil {
+		return zero, err
 	}
+	r := msg.(dap.ResponseMessage).GetResponse()
+	if !r.Success {
+		return zero, errors.New(r.Message)
+	}
+	resp, ok := msg.(T)
+	if !ok {
+		return zero, fmt.Errorf("expected %T, got %T (request_seq=%d)", zero, msg, requestSeq)
+	}
+	return resp, nil
 }
 
 // ClearBreakpointsParams defines parameters for clearing breakpoints.
@@ -458,15 +499,11 @@ func (ds *debuggerSession) clearBreakpoints(ctx context.Context, _ *mcp.CallTool
 
 	if params.All {
 		// Clear all line breakpoints across all files
-		if err := ds.clearAllLineBreakpoints(); err != nil {
+		if err := ds.clearAllLineBreakpoints(ctx); err != nil {
 			return nil, nil, err
 		}
 		// Clear all function breakpoints
-		seq, err := ds.clearFunctionBreakpoints()
-		if err != nil {
-			return nil, nil, err
-		}
-		if err := readAndValidateResponse(ds.client, seq, "unable to clear breakpoints"); err != nil {
+		if err := ds.clearFunctionBreakpoints(ctx); err != nil {
 			return nil, nil, err
 		}
 		return &mcp.CallToolResult{
@@ -475,17 +512,14 @@ func (ds *debuggerSession) clearBreakpoints(ctx context.Context, _ *mcp.CallTool
 	}
 
 	if params.Function != "" {
-		seq, err := ds.removeFunctionBreakpoint(params.Function)
+		removed, err := ds.removeFunctionBreakpoint(ctx, params.Function)
 		if err != nil {
 			return nil, nil, err
 		}
-		if seq == 0 {
+		if !removed {
 			return &mcp.CallToolResult{
 				Content: []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf("No function breakpoint set on: %s", params.Function)}},
 			}, nil, nil
-		}
-		if err := readAndValidateResponse(ds.client, seq, "unable to clear function breakpoint"); err != nil {
-			return nil, nil, err
 		}
 		return &mcp.CallToolResult{
 			Content: []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf("Cleared function breakpoint: %s", params.Function)}},
@@ -494,27 +528,20 @@ func (ds *debuggerSession) clearBreakpoints(ctx context.Context, _ *mcp.CallTool
 
 	if params.File != "" {
 		if params.Line.Int() > 0 {
-			seq, err := ds.removeLineBreakpoint(params.File, params.Line.Int())
+			removed, err := ds.removeLineBreakpoint(ctx, params.File, params.Line.Int())
 			if err != nil {
 				return nil, nil, err
 			}
-			if seq == 0 {
+			if !removed {
 				return &mcp.CallToolResult{
 					Content: []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf("No breakpoint at %s:%d", params.File, params.Line.Int())}},
 				}, nil, nil
-			}
-			if err := readAndValidateResponse(ds.client, seq, "unable to clear breakpoint"); err != nil {
-				return nil, nil, err
 			}
 			return &mcp.CallToolResult{
 				Content: []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf("Cleared breakpoint at %s:%d", params.File, params.Line.Int())}},
 			}, nil, nil
 		}
-		seq, err := ds.clearLineBreakpoints(params.File)
-		if err != nil {
-			return nil, nil, err
-		}
-		if err := readAndValidateResponse(ds.client, seq, "unable to clear breakpoints"); err != nil {
+		if err := ds.clearLineBreakpoints(ctx, params.File); err != nil {
 			return nil, nil, err
 		}
 		return &mcp.CallToolResult{
@@ -557,41 +584,35 @@ func (ds *debuggerSession) continueExecution(ctx context.Context, _ *mcp.CallToo
 		if to.Function == "" && (to.File == "" || to.Line <= 0) {
 			return nil, nil, fmt.Errorf("run-to-cursor requires 'function' or 'file' with 'line'")
 		}
-		var addSeq int
 		if to.Function != "" {
-			var err error
-			addSeq, err = ds.addFunctionBreakpoint(to.Function)
+			resp, exists, err := ds.addFunctionBreakpoint(ctx, to.Function)
 			if err != nil {
 				return nil, nil, err
 			}
-			if addSeq > 0 {
+			if !exists {
+				if len(resp.Body.Breakpoints) == 0 || (!resp.Body.Breakpoints[len(resp.Body.Breakpoints)-1].Verified && resp.Body.Breakpoints[len(resp.Body.Breakpoints)-1].Reason != "pending") {
+					_, _ = ds.removeFunctionBreakpoint(ctx, to.Function)
+					return nil, nil, fmt.Errorf("run-to-cursor function breakpoint was not verified")
+				}
 				cleanupRunToCursor = func() error {
-					seq, err := ds.removeFunctionBreakpoint(to.Function)
-					if err != nil {
-						return err
-					}
-					return readAndValidateResponse(ds.client, seq, "unable to remove run-to-cursor function breakpoint")
+					_, err := ds.removeFunctionBreakpoint(ctx, to.Function)
+					return err
 				}
 			}
 		} else if to.File != "" && to.Line > 0 {
-			var err error
-			addSeq, err = ds.addLineBreakpoint(to.File, to.Line.Int())
+			resp, exists, err := ds.addLineBreakpoint(ctx, to.File, to.Line.Int())
 			if err != nil {
 				return nil, nil, err
 			}
-			if addSeq > 0 {
-				cleanupRunToCursor = func() error {
-					seq, err := ds.removeLineBreakpoint(to.File, to.Line.Int())
-					if err != nil {
-						return err
-					}
-					return readAndValidateResponse(ds.client, seq, "unable to remove run-to-cursor line breakpoint")
+			if !exists {
+				if len(resp.Body.Breakpoints) == 0 || (!resp.Body.Breakpoints[len(resp.Body.Breakpoints)-1].Verified && resp.Body.Breakpoints[len(resp.Body.Breakpoints)-1].Reason != "pending") {
+					_, _ = ds.removeLineBreakpoint(ctx, to.File, to.Line.Int())
+					return nil, nil, fmt.Errorf("run-to-cursor line breakpoint was not verified")
 				}
-			}
-		}
-		if addSeq > 0 {
-			if err := readAndValidateResponse(ds.client, addSeq, "unable to set run-to-cursor breakpoint"); err != nil {
-				return nil, nil, err
+				cleanupRunToCursor = func() error {
+					_, err := ds.removeLineBreakpoint(ctx, to.File, to.Line.Int())
+					return err
+				}
 			}
 		}
 	}
@@ -605,7 +626,7 @@ func (ds *debuggerSession) continueExecution(ctx context.Context, _ *mcp.CallToo
 		return nil, nil, err
 	}
 
-	result, resultErr := ds.waitForStopOrTermination(continueSeq, params.FullContext, "continue failed")
+	result, resultErr := ds.waitForStopOrTermination(ctx, continueSeq, params.FullContext, "continue failed")
 
 	// Remove the temporary run-to-cursor breakpoint if one was added
 	if cleanupRunToCursor != nil {
@@ -618,25 +639,36 @@ func (ds *debuggerSession) continueExecution(ctx context.Context, _ *mcp.CallToo
 
 // PauseParams defines the parameters for pausing execution.
 type PauseParams struct {
-	ThreadID FlexInt `json:"threadId" jsonschema:"thread ID to pause"`
+	ThreadID FlexInt `json:"threadId,omitempty" jsonschema:"thread ID to pause (default: current thread)"`
 }
 
 // pauseExecution pauses execution of a thread.
 func (ds *debuggerSession) pauseExecution(ctx context.Context, _ *mcp.CallToolRequest, params PauseParams) (*mcp.CallToolResult, any, error) {
-	ds.mu.Lock()
-	defer ds.mu.Unlock()
-	if ds.client == nil {
+	ds.controlMu.RLock()
+	client := ds.controlClient
+	ds.controlMu.RUnlock()
+	if client == nil {
 		return nil, nil, fmt.Errorf("debugger not started")
 	}
 	threadID := params.ThreadID.Int()
 	if threadID == 0 {
-		threadID = ds.defaultThreadID()
+		// Thread 1 is the DAP convention used by Delve when no StoppedEvent is
+		// available. Callers controlling a multi-threaded adapter should pass an
+		// explicit thread ID while the debuggee is running.
+		threadID = 1
 	}
-	seq, err := ds.client.PauseRequest(threadID)
+	seq, err := client.PauseRequest(threadID)
 	if err != nil {
 		return nil, nil, err
 	}
-	if err := readAndValidateResponse(ds.client, seq, "unable to pause execution"); err != nil {
+	msg, err := client.waitResponseContext(ctx, seq)
+	if err != nil {
+		return nil, nil, err
+	}
+	if response := msg.(dap.ResponseMessage).GetResponse(); !response.Success {
+		return nil, nil, fmt.Errorf("unable to pause execution: %s", response.Message)
+	}
+	if err := ctx.Err(); err != nil {
 		return nil, nil, err
 	}
 
@@ -681,6 +713,10 @@ func (ds *debuggerSession) evaluateExpression(ctx context.Context, _ *mcp.CallTo
 	} else if ds.lastFrameID >= 0 {
 		frameID = ds.lastFrameID
 	}
+	if ds.consumeInvalidation() && params.FrameID == nil {
+		ds.lastFrameID = -1
+		return nil, nil, fmt.Errorf("debugger state was invalidated; call context to select a current frame before evaluating")
+	}
 	log.Printf("evaluate: expression=%q frameID=%d context=%q", params.Expression, frameID, evalContext)
 
 	evalSeq, err := ds.client.EvaluateRequest(params.Expression, frameID, evalContext)
@@ -688,51 +724,31 @@ func (ds *debuggerSession) evaluateExpression(ctx context.Context, _ *mcp.CallTo
 		return nil, nil, err
 	}
 
-	for {
-		msg, err := ds.client.ReadMessage()
-		if err != nil {
-			return nil, nil, err
-		}
-		switch resp := msg.(type) {
-		case *dap.EvaluateResponse:
-			if !resp.Success {
-				return nil, nil, fmt.Errorf("unable to evaluate expression: %s", resp.Message)
-			}
-			result := resp.Body.Result
-			if resp.Body.Type != "" {
-				result = fmt.Sprintf("%s (type: %s)", resp.Body.Result, resp.Body.Type)
-			}
-			if resp.Body.VariablesReference > 0 {
-				var expanded strings.Builder
-				expanded.WriteString(result)
-				if !strings.HasSuffix(result, "\n") {
-					expanded.WriteString("\n")
-				}
-				ds.writeVariable(&expanded, dap.Variable{
-					Name:               params.Expression,
-					Value:              resp.Body.Result,
-					Type:               resp.Body.Type,
-					VariablesReference: resp.Body.VariablesReference,
-				}, "  ", params.Expression, maxVariableExpansionDepth)
-				result = expanded.String()
-			}
-			return &mcp.CallToolResult{
-				Content: []mcp.Content{&mcp.TextContent{Text: result}},
-			}, nil, nil
-		case dap.ResponseMessage:
-			r := resp.GetResponse()
-			if r.RequestSeq == evalSeq {
-				if !r.Success {
-					return nil, nil, fmt.Errorf("unable to evaluate expression: %s", r.Message)
-				}
-			}
-			log.Printf("evaluate: skipping out-of-order %T response (request_seq=%d, waiting for %d)",
-				resp, r.RequestSeq, evalSeq)
-			continue
-		case dap.EventMessage:
-			continue
-		}
+	resp, err := readTypedResponse[*dap.EvaluateResponse](ctx, ds.client, evalSeq)
+	if err != nil {
+		return nil, nil, fmt.Errorf("unable to evaluate expression: %w", err)
 	}
+	result := resp.Body.Result
+	if resp.Body.Type != "" {
+		result = fmt.Sprintf("%s (type: %s)", resp.Body.Result, resp.Body.Type)
+	}
+	if resp.Body.VariablesReference > 0 {
+		var expanded strings.Builder
+		expanded.WriteString(result)
+		if !strings.HasSuffix(result, "\n") {
+			expanded.WriteString("\n")
+		}
+		ds.writeVariable(ctx, &expanded, dap.Variable{
+			Name:               params.Expression,
+			Value:              resp.Body.Result,
+			Type:               resp.Body.Type,
+			VariablesReference: resp.Body.VariablesReference,
+		}, "  ", params.Expression, maxVariableExpansionDepth)
+		result = expanded.String()
+	}
+	return &mcp.CallToolResult{
+		Content: []mcp.Content{&mcp.TextContent{Text: result}},
+	}, nil, nil
 }
 
 // replFrameSelection recognizes GDB's "frame N" command. GDB native DAP
@@ -769,7 +785,7 @@ func (ds *debuggerSession) setVariable(ctx context.Context, _ *mcp.CallToolReque
 	if err != nil {
 		return nil, nil, err
 	}
-	if err := readAndValidateResponse(ds.client, seq, "unable to set variable"); err != nil {
+	if err := readAndValidateResponse(ctx, ds.client, seq, "unable to set variable"); err != nil {
 		return nil, nil, err
 	}
 	return &mcp.CallToolResult{
@@ -805,7 +821,7 @@ func (ds *debuggerSession) restartDebugger(ctx context.Context, _ *mcp.CallToolR
 	if err != nil {
 		return nil, nil, err
 	}
-	if err := readAndValidateResponse(ds.client, seq, "unable to restart debugger"); err != nil {
+	if err := readAndValidateResponse(ctx, ds.client, seq, "unable to restart debugger"); err != nil {
 		return nil, nil, err
 	}
 
@@ -844,6 +860,19 @@ func (ds *debuggerSession) info(ctx context.Context, _ *mcp.CallToolRequest, par
 			fmt.Fprintf(&bp, "  function %s\n", fn)
 			hasBP = true
 		}
+		ds.eventMu.Lock()
+		for id, observed := range ds.eventBreakpoints {
+			fmt.Fprintf(&bp, "  adapter breakpoint %d", id)
+			if observed.Source != nil && observed.Source.Path != "" {
+				fmt.Fprintf(&bp, " at %s:%d", observed.Source.Path, observed.Line)
+			}
+			if !observed.Verified {
+				bp.WriteString(" (unverified)")
+			}
+			bp.WriteString("\n")
+			hasBP = true
+		}
+		ds.eventMu.Unlock()
 		if !hasBP {
 			bp.WriteString("  (none)\n")
 		}
@@ -856,7 +885,7 @@ func (ds *debuggerSession) info(ctx context.Context, _ *mcp.CallToolRequest, par
 		if err != nil {
 			return nil, nil, err
 		}
-		resp, err := readTypedResponse[*dap.ThreadsResponse](ds.client, seq)
+		resp, err := readTypedResponse[*dap.ThreadsResponse](ctx, ds.client, seq)
 		if err != nil {
 			return nil, nil, fmt.Errorf("failed to get threads: %w", err)
 		}
@@ -877,7 +906,7 @@ func (ds *debuggerSession) info(ctx context.Context, _ *mcp.CallToolRequest, par
 		if err != nil {
 			return nil, nil, err
 		}
-		resp, err := readTypedResponse[*dap.LoadedSourcesResponse](ds.client, seq)
+		resp, err := readTypedResponse[*dap.LoadedSourcesResponse](ctx, ds.client, seq)
 		if err != nil {
 			return nil, nil, fmt.Errorf("failed to get loaded sources: %w", err)
 		}
@@ -898,7 +927,7 @@ func (ds *debuggerSession) info(ctx context.Context, _ *mcp.CallToolRequest, par
 		if err != nil {
 			return nil, nil, err
 		}
-		resp, err := readTypedResponse[*dap.ModulesResponse](ds.client, seq)
+		resp, err := readTypedResponse[*dap.ModulesResponse](ctx, ds.client, seq)
 		if err != nil {
 			return nil, nil, fmt.Errorf("failed to get modules: %w", err)
 		}
@@ -919,7 +948,7 @@ func (ds *debuggerSession) info(ctx context.Context, _ *mcp.CallToolRequest, par
 		if err != nil {
 			return nil, nil, fmt.Errorf("failed to get scopes: %w", err)
 		}
-		scopesResp, err := readTypedResponse[*dap.ScopesResponse](ds.client, scopesSeq)
+		scopesResp, err := readTypedResponse[*dap.ScopesResponse](ctx, ds.client, scopesSeq)
 		if err != nil {
 			return nil, nil, fmt.Errorf("failed to get scopes: %w", err)
 		}
@@ -936,7 +965,7 @@ func (ds *debuggerSession) info(ctx context.Context, _ *mcp.CallToolRequest, par
 			if err != nil {
 				return nil, nil, fmt.Errorf("failed to get registers: %w", err)
 			}
-			varResp, err := readTypedResponse[*dap.VariablesResponse](ds.client, varSeq)
+			varResp, err := readTypedResponse[*dap.VariablesResponse](ctx, ds.client, varSeq)
 			if err != nil {
 				return nil, nil, fmt.Errorf("failed to get registers: %w", err)
 			}
@@ -975,12 +1004,18 @@ func (ds *debuggerSession) disassembleCode(ctx context.Context, _ *mcp.CallToolR
 	if count == 0 {
 		count = 20
 	}
+	if params.Address == "" {
+		return nil, nil, fmt.Errorf("address is required")
+	}
+	if count < 1 || count > 1000 {
+		return nil, nil, fmt.Errorf("count must be between 1 and 1000")
+	}
 	seq, err := ds.client.DisassembleRequest(params.Address, params.Offset.Int(), count)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	disResp, err := readTypedResponse[*dap.DisassembleResponse](ds.client, seq)
+	disResp, err := readTypedResponse[*dap.DisassembleResponse](ctx, ds.client, seq)
 	if err != nil {
 		return nil, nil, fmt.Errorf("unable to disassemble: %w", err)
 	}
@@ -1003,6 +1038,22 @@ func (ds *debuggerSession) disassembleCode(ctx context.Context, _ *mcp.CallToolR
 // If params.Detach is true, a DAP disconnect request is sent with terminateDebuggee=false
 // so the debuggee keeps running after the adapter disconnects.
 func (ds *debuggerSession) stop(ctx context.Context, _ *mcp.CallToolRequest, params StopParams) (*mcp.CallToolResult, any, error) {
+	if !params.Detach {
+		// Ask the adapter to terminate gracefully before forcing transport
+		// closure. This path intentionally does not take ds.mu so it can
+		// interrupt a pending continue/step call that owns the session lock.
+		ds.controlMu.RLock()
+		client := ds.controlClient
+		ds.controlMu.RUnlock()
+		if client != nil {
+			disconnectCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+			if seq, err := client.DisconnectRequest(true); err == nil {
+				_, _ = client.waitResponseContext(disconnectCtx, seq)
+			}
+			cancel()
+			client.Close()
+		}
+	}
 	ds.mu.Lock()
 	defer ds.mu.Unlock()
 	log.Printf("stop")
@@ -1018,7 +1069,7 @@ func (ds *debuggerSession) stop(ctx context.Context, _ *mcp.CallToolRequest, par
 		if err != nil {
 			log.Printf("stop: disconnect request failed: %v", err)
 		} else {
-			if err := readAndValidateResponse(ds.client, seq, "disconnect"); err != nil {
+			if err := readAndValidateResponse(ctx, ds.client, seq, "disconnect"); err != nil {
 				log.Printf("stop: disconnect response error: %v", err)
 			}
 		}
@@ -1038,6 +1089,9 @@ func (ds *debuggerSession) stop(ctx context.Context, _ *mcp.CallToolRequest, par
 // cleanup kills the DAP adapter process and resets session state.
 // Safe to call multiple times or when no session is active.
 func (ds *debuggerSession) cleanup() {
+	ds.controlMu.Lock()
+	ds.controlClient = nil
+	ds.controlMu.Unlock()
 	if ds.client != nil {
 		ds.client.Close()
 		ds.client = nil
@@ -1059,7 +1113,9 @@ func (ds *debuggerSession) cleanup() {
 
 	// sessionToolNames uses capabilities to identify the optional tools that
 	// were registered for this adapter, so unregister before clearing them.
-	ds.unregisterSessionTools()
+	if ds.server != nil {
+		ds.unregisterSessionTools()
+	}
 	ds.launchMode = ""
 	ds.programPath = ""
 	ds.programArgs = nil
@@ -1069,11 +1125,17 @@ func (ds *debuggerSession) cleanup() {
 	ds.lastFrameID = -1
 	ds.functionBreakpoints = nil
 	ds.lineBreakpoints = nil
+	ds.eventMu.Lock()
+	ds.eventBreakpoints = nil
+	ds.eventThreads = nil
+	ds.progress = nil
+	ds.invalidated = false
+	ds.eventMu.Unlock()
 }
 
 // debug starts a complete debugging session.
 // It starts the debugger, loads the program, sets initial breakpoints, and runs to the first breakpoint.
-func (ds *debuggerSession) debug(ctx context.Context, _ *mcp.CallToolRequest, params DebugParams) (*mcp.CallToolResult, any, error) {
+func (ds *debuggerSession) debug(ctx context.Context, _ *mcp.CallToolRequest, params DebugParams) (result *mcp.CallToolResult, extra any, err error) {
 	ds.mu.Lock()
 	defer ds.mu.Unlock()
 	// Clean up any existing session before starting a new one
@@ -1117,21 +1179,25 @@ func (ds *debuggerSession) debug(ctx context.Context, _ *mcp.CallToolRequest, pa
 	if debugger == "" {
 		debugger = "delve"
 	}
-	switch debugger {
-	case "delve":
-		ds.backend = &delveBackend{}
-	case "gdb":
-		gdbPath := params.GDBPath
-		if gdbPath == "" {
-			var err error
-			gdbPath, err = exec.LookPath("gdb")
-			if err != nil {
-				return nil, nil, fmt.Errorf("GDB not found in PATH. Install GDB 14+ or set the gdbPath parameter")
+	if ds.backendOverride != nil {
+		ds.backend = ds.backendOverride
+	} else {
+		switch debugger {
+		case "delve":
+			ds.backend = &delveBackend{}
+		case "gdb":
+			gdbPath := params.GDBPath
+			if gdbPath == "" {
+				var err error
+				gdbPath, err = exec.LookPath("gdb")
+				if err != nil {
+					return nil, nil, fmt.Errorf("GDB not found in PATH. Install GDB 14+ or set the gdbPath parameter")
+				}
 			}
+			ds.backend = &gdbBackend{gdbPath: gdbPath, toolLogPath: params.ToolLog}
+		default:
+			return nil, nil, fmt.Errorf("unsupported debugger: %s (must be 'delve' or 'gdb')", debugger)
 		}
-		ds.backend = &gdbBackend{gdbPath: gdbPath, toolLogPath: params.ToolLog}
-	default:
-		return nil, nil, fmt.Errorf("unsupported debugger: %s (must be 'delve' or 'gdb')", debugger)
 	}
 
 	if params.ToolLog != "" && debugger == "delve" {
@@ -1157,6 +1223,11 @@ func (ds *debuggerSession) debug(ctx context.Context, _ *mcp.CallToolRequest, pa
 		return nil, nil, err
 	}
 	ds.cmd = cmd
+	defer func() {
+		if err != nil {
+			ds.cleanup()
+		}
+	}()
 
 	// Connect DAP client based on transport mode
 	switch ds.backend.TransportMode() {
@@ -1167,8 +1238,10 @@ func (ds *debuggerSession) debug(ctx context.Context, _ *mcp.CallToolRequest, pa
 		}
 		ds.client = client
 	case "stdio":
-		gdb := ds.backend.(*gdbBackend)
-		stdout, stdin := gdb.StdioPipes()
+		stdout, stdin := ds.backend.StdioPipes()
+		if stdout == nil || stdin == nil {
+			return nil, nil, fmt.Errorf("stdio backend did not provide both protocol pipes")
+		}
 		ds.client = newDAPClientFromRWC(&readWriteCloser{
 			Reader:      stdout,
 			WriteCloser: stdin,
@@ -1176,18 +1249,22 @@ func (ds *debuggerSession) debug(ctx context.Context, _ *mcp.CallToolRequest, pa
 	default:
 		return nil, nil, fmt.Errorf("unsupported transport mode: %s", ds.backend.TransportMode())
 	}
+	ds.controlMu.Lock()
+	ds.controlClient = ds.client
+	ds.controlMu.Unlock()
+	ds.client.SetEventHandler(ds.handleDAPEvent)
 
 	// Protocol-level DAP message logging
 	if params.ProtocolLog != "" {
-		f, err := os.Create(params.ProtocolLog)
+		f, err := openPrivateLog(params.ProtocolLog)
 		if err != nil {
 			return nil, nil, fmt.Errorf("unable to open protocol log file: %w", err)
 		}
 		ds.protocolLogFile = f
-		ds.client.SetProtocolLogger(f)
+		ds.client.SetProtocolLogger(newBoundedLogWriter(f))
 	}
 
-	caps, err := ds.client.InitializeRequest(ds.backend.AdapterID())
+	caps, err := ds.client.InitializeRequestContext(ctx, ds.backend.AdapterID())
 	if err != nil {
 		return nil, nil, err
 	}
@@ -1260,17 +1337,25 @@ func (ds *debuggerSession) debug(ctx context.Context, _ *mcp.CallToolRequest, pa
 	// The launch response may arrive before or after — if it arrives here,
 	// we consume it and check for errors. If it arrives later (GDB's deferred
 	// pattern), it will be checked in subsequent message-reading loops.
+	launchResponseSeen := false
 	for {
-		msg, err := ds.client.ReadMessage()
+		msg, err := ds.client.waitMessageContext(ctx, func(msg dap.Message) bool {
+			if _, ok := msg.(*dap.InitializedEvent); ok {
+				return true
+			}
+			response, ok := msg.(dap.ResponseMessage)
+			return ok && response.GetResponse().RequestSeq == launchSeq
+		})
 		if err != nil {
 			return nil, nil, err
 		}
 		switch resp := msg.(type) {
 		case dap.ResponseMessage:
 			response := resp.GetResponse()
-			if response.RequestSeq == launchSeq && !response.Success {
+			if !response.Success {
 				return nil, nil, fmt.Errorf("unable to start debug session: %s", response.Message)
 			}
+			launchResponseSeen = true
 		case *dap.InitializedEvent:
 			_ = resp
 			goto initialized
@@ -1281,35 +1366,27 @@ initialized:
 	// Set breakpoints
 	for _, bp := range params.Breakpoints {
 		if bp.Function != "" {
-			seq, err := ds.addFunctionBreakpoint(bp.Function)
+			_, _, err := ds.addFunctionBreakpoint(ctx, bp.Function)
 			if err != nil {
 				return nil, nil, err
-			}
-			if seq > 0 {
-				if err := readAndValidateResponse(ds.client, seq, "unable to set function breakpoint"); err != nil {
-					return nil, nil, err
-				}
 			}
 		} else if bp.File != "" && bp.Line.Int() > 0 {
-			seq, err := ds.addLineBreakpoint(bp.File, bp.Line.Int())
+			_, _, err := ds.addLineBreakpoint(ctx, bp.File, bp.Line.Int())
 			if err != nil {
 				return nil, nil, err
-			}
-			if seq > 0 {
-				if err := readAndValidateResponse(ds.client, seq, "unable to set breakpoint"); err != nil {
-					return nil, nil, err
-				}
 			}
 		}
 	}
 
-	// Configuration done
-	configSeq, err := ds.client.ConfigurationDoneRequest()
-	if err != nil {
-		return nil, nil, err
-	}
-	if err := readAndValidateResponse(ds.client, configSeq, "unable to complete configuration"); err != nil {
-		return nil, nil, err
+	// configurationDone is optional and may only be sent when advertised.
+	if ds.capabilities.SupportsConfigurationDoneRequest {
+		configSeq, err := ds.client.ConfigurationDoneRequest()
+		if err != nil {
+			return nil, nil, err
+		}
+		if err := readAndValidateResponse(ctx, ds.client, configSeq, "unable to complete configuration"); err != nil {
+			return nil, nil, err
+		}
 	}
 
 	// Register session-specific tools based on capabilities
@@ -1324,7 +1401,7 @@ initialized:
 	// ResponseMessages to avoid hanging forever waiting for a StoppedEvent
 	// that will never come.
 	if mode == "core" {
-		result, err := ds.waitForStopOrTermination(launchSeq, params.FullContext, "unable to start debug session")
+		result, err := ds.waitForStopOrTermination(ctx, launchSeq, params.FullContext, "unable to start debug session")
 		return result, nil, err
 	}
 
@@ -1340,9 +1417,21 @@ initialized:
 	// We handle both by reading the first StoppedEvent. If it's an entry stop,
 	// we send ContinueRequest and wait for the next stop.
 	if len(params.Breakpoints) > 0 && !params.StopOnEntry {
-		var stoppedThreadID int
+		activeSeq := launchSeq
+		responseSeen := launchResponseSeen
+		var stopped *dap.StoppedEvent
 		for {
-			msg, err := ds.client.ReadMessage()
+			msg, err := ds.client.waitMessageContext(ctx, func(msg dap.Message) bool {
+				if response, ok := msg.(dap.ResponseMessage); ok {
+					return response.GetResponse().RequestSeq == activeSeq
+				}
+				switch msg.(type) {
+				case *dap.StoppedEvent, *dap.TerminatedEvent:
+					return true
+				default:
+					return false
+				}
+			})
 			if err != nil {
 				return nil, nil, err
 			}
@@ -1350,33 +1439,33 @@ initialized:
 			case *dap.StoppedEvent:
 				if ev.Body.Reason == "entry" {
 					// Stopped at entry — send continue to reach the breakpoint
-					if _, err := ds.client.ContinueRequest(ev.Body.ThreadId); err != nil {
+					activeSeq, err = ds.client.ContinueRequest(ev.Body.ThreadId)
+					if err != nil {
 						return nil, nil, err
 					}
+					responseSeen = false
+					stopped = nil
 					continue
 				}
-				stoppedThreadID = ev.Body.ThreadId
-				ds.stoppedThreadID = stoppedThreadID
-				goto stopped
+				ds.stoppedThreadID = ev.Body.ThreadId
+				stopped = ev
 			case *dap.TerminatedEvent:
-				goto stopped
+				ds.cleanup()
+				return &mcp.CallToolResult{
+					Content: []mcp.Content{&mcp.TextContent{Text: "Program terminated before reaching a breakpoint."}},
+				}, nil, nil
 			case dap.ResponseMessage:
 				r := ev.GetResponse()
-				if r.RequestSeq == launchSeq && !r.Success {
+				if !r.Success {
 					return nil, nil, fmt.Errorf("unable to start debug session: %s", r.Message)
 				}
-				// Successful deferred response; keep waiting for StoppedEvent
+				responseSeen = true
+			}
+			if responseSeen && stopped != nil {
+				result, err := ds.getStopContext(ctx, stopped.Body.ThreadId, params.FullContext, stopped.Body.Reason)
+				return result, nil, err
 			}
 		}
-	stopped:
-		if stoppedThreadID == 0 {
-			stoppedThreadID = 1
-		}
-		result, err := ds.getFullContext(stoppedThreadID, -1, 20)
-		if err != nil || params.FullContext {
-			return result, nil, err
-		}
-		return stopSummary(result, "breakpoint"), nil, nil
 	}
 
 	// Stopped on entry, try to populate stoppedThreadID and lastFrameID
@@ -1392,23 +1481,33 @@ initialized:
 	// frames and scopes returns "notStopped", and the late StoppedEvent
 	// can be skipped/lost by subsequent response readers. Wait for it.
 	if _, isGDB := ds.backend.(*gdbBackend); isGDB {
-		result, err := ds.waitForStopOrTermination(launchSeq, params.FullContext, "unable to start debug session")
+		result, err := ds.waitForStopOrTermination(ctx, launchSeq, params.FullContext, "unable to start debug session")
 		return result, nil, err
 	}
 
-	// Delve path: getFullContext may fail at the entry point (e.g. before the
-	// Go runtime is initialized). Fall back to a helpful message in that case.
+	// Delve may send the launch response and entry stop before the
+	// configurationDone response. They were deliberately retained by the
+	// dispatcher, so consume them before accepting later execution events.
+	if !launchResponseSeen {
+		if err := readAndValidateResponse(ctx, ds.client, launchSeq, "unable to start debug session"); err != nil {
+			return nil, nil, err
+		}
+	}
 	ds.stoppedThreadID = 1
-	result, err := ds.getFullContext(ds.stoppedThreadID, -1, 20)
+	if msg, ok := ds.client.takeMessage(func(msg dap.Message) bool {
+		_, stopped := msg.(*dap.StoppedEvent)
+		return stopped
+	}); ok {
+		ds.stoppedThreadID = msg.(*dap.StoppedEvent).Body.ThreadId
+	}
+	// getFullContext may fail before the Go runtime has initialized.
+	result, err = ds.getStopContext(ctx, ds.stoppedThreadID, params.FullContext, "entry")
 	if err != nil {
 		return &mcp.CallToolResult{
 			Content: []mcp.Content{&mcp.TextContent{Text: "Stopped at program entry. Set breakpoints and use 'continue' to reach your code."}},
 		}, nil, nil
 	}
-	if params.FullContext {
-		return result, nil, nil
-	}
-	return stopSummary(result, "entry"), nil, nil
+	return result, nil, nil
 }
 
 // context returns the full debugging context at the current location.
@@ -1423,6 +1522,9 @@ func (ds *debuggerSession) context(ctx context.Context, _ *mcp.CallToolRequest, 
 	if maxFrames == 0 {
 		maxFrames = 20
 	}
+	if maxFrames < 1 || maxFrames > 200 {
+		return nil, nil, fmt.Errorf("maxFrames must be between 1 and 200")
+	}
 	// Frame IDs are non-negative DAP identifiers, including 0 in GDB.
 	// Use -1 internally for an omitted frameId so an explicit frameId: 0
 	// remains distinguishable from the default top-frame selection.
@@ -1430,11 +1532,11 @@ func (ds *debuggerSession) context(ctx context.Context, _ *mcp.CallToolRequest, 
 	if params.FrameID != nil {
 		frameID = params.FrameID.Int()
 	}
-	result, err := ds.getFullContext(threadID, frameID, maxFrames)
+	result, err := ds.getFullContext(ctx, threadID, frameID, maxFrames)
 	if err != nil {
 		// If the thread ID was invalid, try to help by listing available threads
 		if strings.Contains(err.Error(), "threadId") || strings.Contains(err.Error(), "thread") {
-			threadList := ds.getThreadList()
+			threadList := ds.getThreadList(ctx)
 			if threadList != "" {
 				return nil, nil, fmt.Errorf("%w\n\nAvailable threads (use info tool with type 'threads' to refresh):\n%s", err, threadList)
 			}
@@ -1445,7 +1547,7 @@ func (ds *debuggerSession) context(ctx context.Context, _ *mcp.CallToolRequest, 
 }
 
 // getThreadList returns a formatted string of available threads, or empty string on error.
-func (ds *debuggerSession) getThreadList() string {
+func (ds *debuggerSession) getThreadList(ctx context.Context) string {
 	if ds.client == nil {
 		return ""
 	}
@@ -1453,7 +1555,7 @@ func (ds *debuggerSession) getThreadList() string {
 	if err != nil {
 		return ""
 	}
-	resp, err := readTypedResponse[*dap.ThreadsResponse](ds.client, seq)
+	resp, err := readTypedResponse[*dap.ThreadsResponse](ctx, ds.client, seq)
 	if err != nil {
 		return ""
 	}
@@ -1494,12 +1596,12 @@ func (ds *debuggerSession) step(ctx context.Context, _ *mcp.CallToolRequest, par
 		return nil, nil, err
 	}
 
-	result, err := ds.waitForStopOrTermination(requestSeq, params.FullContext, "step failed")
+	result, err := ds.waitForStopOrTermination(ctx, requestSeq, params.FullContext, "step failed")
 	return result, nil, err
 }
 
 // getFullContext returns a complete context dump including location, stack trace, scopes, and variables.
-func (ds *debuggerSession) getFullContext(threadID, frameID, maxFrames int) (*mcp.CallToolResult, error) {
+func (ds *debuggerSession) getFullContext(ctx context.Context, threadID, frameID, maxFrames int) (*mcp.CallToolResult, error) {
 	if ds.client == nil {
 		return nil, fmt.Errorf("debugger not started")
 	}
@@ -1511,11 +1613,16 @@ func (ds *debuggerSession) getFullContext(threadID, frameID, maxFrames int) (*mc
 	if err != nil {
 		return nil, err
 	}
-	stResp, err := readTypedResponse[*dap.StackTraceResponse](ds.client, stSeq)
+	stResp, err := readTypedResponse[*dap.StackTraceResponse](ctx, ds.client, stSeq)
 	if err != nil {
 		return nil, fmt.Errorf("unable to get stack trace: %w", err)
 	}
 	frames := stResp.Body.StackFrames
+	if len(frames) == 0 {
+		return &mcp.CallToolResult{
+			Content: []mcp.Content{&mcp.TextContent{Text: "No stack frames are available for the selected thread."}},
+		}, nil
+	}
 
 	// An omitted frame ID selects the top stack frame. A DAP frame ID of zero
 	// is valid (and is GDB's top frame), so it must not be used as a sentinel.
@@ -1561,45 +1668,91 @@ func (ds *debuggerSession) getFullContext(threadID, frameID, maxFrames int) (*mc
 	ds.lastFrameID = targetFrameID
 
 	// Get scopes and variables
-	ds.writeScopesAndVariables(&result, targetFrameID)
+	ds.writeScopesAndVariables(ctx, &result, targetFrameID)
 
 	return &mcp.CallToolResult{
 		Content: []mcp.Content{&mcp.TextContent{Text: result.String()}},
 	}, nil
 }
 
+// getStopContext avoids eager recursive variable expansion for the default
+// compact stop result.
+func (ds *debuggerSession) getStopContext(ctx context.Context, threadID int, fullContext bool, reason string) (*mcp.CallToolResult, error) {
+	if fullContext {
+		return ds.getFullContext(ctx, threadID, -1, 20)
+	}
+	seq, err := ds.client.StackTraceRequest(threadID, 0, 1)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := readTypedResponse[*dap.StackTraceResponse](ctx, ds.client, seq)
+	if err != nil {
+		return nil, fmt.Errorf("unable to get stopped location: %w", err)
+	}
+	var text strings.Builder
+	if reason != "" {
+		fmt.Fprintf(&text, "Stopped: %s\n", reason)
+	}
+	if len(resp.Body.StackFrames) > 0 {
+		frame := resp.Body.StackFrames[0]
+		ds.lastFrameID = frame.Id
+		fmt.Fprintf(&text, "Function: %s\n", frame.Name)
+		if frame.Source != nil {
+			fmt.Fprintf(&text, "File: %s:%d\n", frame.Source.Path, frame.Line)
+		}
+	}
+	text.WriteString("Call 'context' to inspect stack trace and variables.")
+	return &mcp.CallToolResult{
+		Content: []mcp.Content{&mcp.TextContent{Text: text.String()}},
+	}, nil
+}
+
 // waitForStopOrTermination reads DAP messages until a StoppedEvent or
 // TerminatedEvent is received. It handles response matching (by requestSeq),
 // OutputEvent accumulation, and ExitedEvent capture along the way.
-func (ds *debuggerSession) waitForStopOrTermination(requestSeq int, fullContext bool, errPrefix string) (*mcp.CallToolResult, error) {
+func (ds *debuggerSession) waitForStopOrTermination(ctx context.Context, requestSeq int, fullContext bool, errPrefix string) (*mcp.CallToolResult, error) {
 	var exitCode *int
 	var output strings.Builder
+	var stopped *dap.StoppedEvent
+	responseSeen := false
 	const maxOutput = 4096
 	for {
-		msg, err := ds.client.ReadMessage()
+		msg, err := ds.client.waitMessageContext(ctx, func(msg dap.Message) bool {
+			if response, ok := msg.(dap.ResponseMessage); ok {
+				return response.GetResponse().RequestSeq == requestSeq
+			}
+			switch msg.(type) {
+			case *dap.StoppedEvent, *dap.OutputEvent, *dap.ExitedEvent, *dap.TerminatedEvent:
+				return true
+			default:
+				return false
+			}
+		})
 		if err != nil {
+			if errors.Is(err, context.Canceled) && ds.capabilities.SupportsCancelRequest {
+				if _, cancelErr := ds.client.CancelRequest(requestSeq); cancelErr != nil {
+					log.Printf("%s: DAP cancel request failed: %v", errPrefix, cancelErr)
+				}
+			}
 			return nil, err
 		}
 		switch resp := msg.(type) {
 		case dap.ResponseMessage:
 			r := resp.GetResponse()
-			if r.RequestSeq != requestSeq {
-				log.Printf("%s: skipping out-of-order response (request_seq=%d, waiting for %d)", errPrefix, r.RequestSeq, requestSeq)
-				continue
-			}
 			if !r.Success {
 				return nil, fmt.Errorf("%s: %s", errPrefix, r.Message)
 			}
+			responseSeen = true
 		case *dap.StoppedEvent:
 			ds.stoppedThreadID = resp.Body.ThreadId
-			result, err := ds.getFullContext(resp.Body.ThreadId, -1, 20)
-			if err != nil || fullContext {
-				return result, err
-			}
-			return stopSummary(result, resp.Body.Reason), nil
+			stopped = resp
 		case *dap.OutputEvent:
-			if output.Len() < maxOutput {
-				output.WriteString(resp.Body.Output)
+			if remaining := maxOutput - output.Len(); remaining > 0 {
+				text := resp.Body.Output
+				if len(text) > remaining {
+					text = text[:remaining]
+				}
+				output.WriteString(text)
 			}
 		case *dap.ExitedEvent:
 			code := resp.Body.ExitCode
@@ -1613,6 +1766,9 @@ func (ds *debuggerSession) waitForStopOrTermination(requestSeq int, fullContext 
 			// stop does, rather than leaving a stale session behind.
 			ds.cleanup()
 			return result, nil
+		}
+		if responseSeen && stopped != nil {
+			return ds.getStopContext(ctx, stopped.Body.ThreadId, fullContext, stopped.Body.Reason)
 		}
 	}
 }
@@ -1661,14 +1817,14 @@ func stopSummary(full *mcp.CallToolResult, reason string) *mcp.CallToolResult {
 // writeScopesAndVariables fetches scopes and their variables for the given
 // frame and writes them to the result builder. Errors are written inline
 // rather than propagated, since partial context is better than none.
-func (ds *debuggerSession) writeScopesAndVariables(result *strings.Builder, frameID int) {
+func (ds *debuggerSession) writeScopesAndVariables(ctx context.Context, result *strings.Builder, frameID int) {
 	scopesSeq, err := ds.client.ScopesRequest(frameID)
 	if err != nil {
 		result.WriteString("## Variables\n(unable to retrieve scopes)\n")
 		return
 	}
 
-	scopesResp, err := readTypedResponse[*dap.ScopesResponse](ds.client, scopesSeq)
+	scopesResp, err := readTypedResponse[*dap.ScopesResponse](ctx, ds.client, scopesSeq)
 	if err != nil {
 		result.WriteString("## Variables\n(unable to retrieve scopes)\n")
 		return
@@ -1680,61 +1836,158 @@ func (ds *debuggerSession) writeScopesAndVariables(result *strings.Builder, fram
 	}
 
 	result.WriteString("## Variables\n")
+	budget := newVariableBudget()
 	for _, scope := range scopes {
 		if scope.Name == "Registers" {
 			continue
 		}
-		fmt.Fprintf(result, "### %s\n", scope.Name)
+		fmt.Fprintf(result, "### %s (variablesReference: %d)\n", scope.Name, scope.VariablesReference)
 		if scope.VariablesReference <= 0 {
 			continue
+		}
+		if !budget.takeRequest() {
+			budget.truncate(result, "variable request budget reached")
+			return
 		}
 		varSeq, err := ds.client.VariablesRequest(scope.VariablesReference)
 		if err != nil {
 			result.WriteString("  (unable to retrieve variables)\n")
 			continue
 		}
-		varResp, err := readTypedResponse[*dap.VariablesResponse](ds.client, varSeq)
+		varResp, err := readTypedResponse[*dap.VariablesResponse](ctx, ds.client, varSeq)
 		if err != nil {
 			result.WriteString("  (unable to retrieve variables)\n")
 			continue
 		}
 		for _, v := range varResp.Body.Variables {
-			ds.writeVariable(result, v, "  ", v.Name, maxVariableExpansionDepth)
+			ds.writeVariableBudgeted(ctx, result, v, "  ", v.Name, 0, budget, map[int]bool{})
+			if budget.truncated {
+				return
+			}
 		}
 	}
 }
 
-// maxVariableExpansionDepth bounds the number of child-reference traversals
-// from a top-level variable. Twenty levels accommodate deeply nested debugger
-// data structures while still guaranteeing termination for recursive pointers.
-const maxVariableExpansionDepth = 20
+const (
+	maxVariableExpansionDepth = 20
+	maxExpandedVariables      = 500
+	maxVariableRequests       = 100
+	maxVariableOutputBytes    = 64 << 10
+	maxChildrenPerVariable    = 100
+)
+
+type variableBudget struct {
+	nodes, requests int
+	truncated       bool
+}
+
+func newVariableBudget() *variableBudget {
+	return &variableBudget{}
+}
+
+func (b *variableBudget) takeRequest() bool {
+	if b.requests >= maxVariableRequests {
+		return false
+	}
+	b.requests++
+	return true
+}
+
+func (b *variableBudget) write(result *strings.Builder, text string) bool {
+	if b.truncated {
+		return false
+	}
+	remaining := maxVariableOutputBytes - result.Len()
+	if remaining <= 0 {
+		b.truncate(result, "variable output budget reached")
+		return false
+	}
+	if len(text) > remaining {
+		result.WriteString(text[:remaining])
+		b.truncate(result, "variable output budget reached")
+		return false
+	}
+	result.WriteString(text)
+	return true
+}
+
+func (b *variableBudget) truncate(result *strings.Builder, reason string) {
+	if b.truncated {
+		return
+	}
+	b.truncated = true
+	marker := fmt.Sprintf("  … truncated (%s)\n", reason)
+	if remaining := maxVariableOutputBytes - result.Len(); remaining > 0 {
+		if len(marker) > remaining {
+			marker = marker[:remaining]
+		}
+		result.WriteString(marker)
+	}
+}
 
 // writeVariable writes a variable and up to maxDepth levels of children.
 // GDB represents aggregate values (such as structs) with an empty Value and
 // a VariablesReference, so showing the children is necessary to make those
 // values inspectable through the regular evaluate and context tools.
-func (ds *debuggerSession) writeVariable(result *strings.Builder, variable dap.Variable, indent, name string, maxDepth int) {
-	if variable.Type != "" {
-		fmt.Fprintf(result, "%s%s (%s) = %s\n", indent, name, variable.Type, variable.Value)
-	} else {
-		fmt.Fprintf(result, "%s%s = %s\n", indent, name, variable.Value)
-	}
-	if variable.VariablesReference <= 0 || maxDepth == 0 {
+func (ds *debuggerSession) writeVariable(ctx context.Context, result *strings.Builder, variable dap.Variable, indent, name string, maxDepth int) {
+	budget := newVariableBudget()
+	ds.writeVariableBudgeted(ctx, result, variable, indent, name, maxVariableExpansionDepth-maxDepth, budget, map[int]bool{})
+}
+
+func (ds *debuggerSession) writeVariableBudgeted(ctx context.Context, result *strings.Builder, variable dap.Variable, indent, name string, depth int, budget *variableBudget, path map[int]bool) {
+	if budget.nodes >= maxExpandedVariables {
+		budget.truncate(result, "variable count budget reached")
 		return
 	}
-
+	budget.nodes++
+	var line string
+	if variable.Type != "" {
+		line = fmt.Sprintf("%s%s (%s) = %s", indent, name, variable.Type, variable.Value)
+	} else {
+		line = fmt.Sprintf("%s%s = %s", indent, name, variable.Value)
+	}
+	if variable.VariablesReference > 0 {
+		line += fmt.Sprintf(" [variablesReference: %d]", variable.VariablesReference)
+	}
+	if !budget.write(result, line+"\n") || variable.VariablesReference <= 0 {
+		return
+	}
+	if depth >= maxVariableExpansionDepth {
+		budget.truncate(result, "maximum variable depth reached")
+		return
+	}
+	if path[variable.VariablesReference] {
+		budget.write(result, fmt.Sprintf("%s  … cycle to variablesReference %d\n", indent, variable.VariablesReference))
+		return
+	}
+	if !budget.takeRequest() {
+		budget.truncate(result, "variable request budget reached")
+		return
+	}
 	varSeq, err := ds.client.VariablesRequest(variable.VariablesReference)
 	if err != nil {
-		fmt.Fprintf(result, "%s  (unable to retrieve child variables)\n", indent)
+		budget.write(result, fmt.Sprintf("%s  (unable to retrieve child variables)\n", indent))
 		return
 	}
-	varResp, err := readTypedResponse[*dap.VariablesResponse](ds.client, varSeq)
+	varResp, err := readTypedResponse[*dap.VariablesResponse](ctx, ds.client, varSeq)
 	if err != nil {
-		fmt.Fprintf(result, "%s  (unable to retrieve child variables)\n", indent)
+		budget.write(result, fmt.Sprintf("%s  (unable to retrieve child variables)\n", indent))
 		return
 	}
-	for _, child := range varResp.Body.Variables {
-		ds.writeVariable(result, child, indent+"  ", name+"."+child.Name, maxDepth-1)
+	path[variable.VariablesReference] = true
+	defer delete(path, variable.VariablesReference)
+	children := varResp.Body.Variables
+	if len(children) > maxChildrenPerVariable {
+		children = children[:maxChildrenPerVariable]
+	}
+	for _, child := range children {
+		ds.writeVariableBudgeted(ctx, result, child, indent+"  ", name+"."+child.Name, depth+1, budget, path)
+		if budget.truncated {
+			return
+		}
+	}
+	if len(varResp.Body.Variables) > len(children) {
+		budget.truncate(result, "per-variable child budget reached")
 	}
 }
 
@@ -1747,18 +2000,14 @@ func (ds *debuggerSession) breakpoint(ctx context.Context, _ *mcp.CallToolReques
 	}
 
 	if params.Function != "" {
-		seq, err := ds.addFunctionBreakpoint(params.Function)
+		resp, exists, err := ds.addFunctionBreakpoint(ctx, params.Function)
 		if err != nil {
 			return nil, nil, err
 		}
-		if seq == 0 {
+		if exists {
 			return &mcp.CallToolResult{
 				Content: []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf("Breakpoint already set on function: %s", params.Function)}},
 			}, nil, nil
-		}
-		resp, err := readTypedResponse[*dap.SetFunctionBreakpointsResponse](ds.client, seq)
-		if err != nil {
-			return nil, nil, fmt.Errorf("unable to set function breakpoint: %w", err)
 		}
 		// The response breakpoints array corresponds 1:1 with the request array.
 		// We appended the new function last, so our breakpoint is the last element.
@@ -1779,10 +2028,8 @@ func (ds *debuggerSession) breakpoint(ctx context.Context, _ *mcp.CallToolReques
 				}, nil, nil
 			}
 			// Failed or unknown reason — remove from both our tracking and the adapter.
-			removeSeq, removeErr := ds.removeFunctionBreakpoint(params.Function)
+			_, removeErr := ds.removeFunctionBreakpoint(ctx, params.Function)
 			if removeErr != nil {
-				log.Printf("breakpoint: failed to remove unverified function breakpoint %q: %v", params.Function, removeErr)
-			} else if removeErr = readAndValidateResponse(ds.client, removeSeq, "unable to remove unverified function breakpoint"); removeErr != nil {
 				log.Printf("breakpoint: failed to remove unverified function breakpoint %q: %v", params.Function, removeErr)
 			}
 			return nil, nil, fmt.Errorf("function breakpoint not verified: %s", bp.Message)
@@ -1804,20 +2051,16 @@ func (ds *debuggerSession) breakpoint(ctx context.Context, _ *mcp.CallToolReques
 		return nil, nil, fmt.Errorf("either function or file+line is required")
 	}
 
-	bpSeq, err := ds.addLineBreakpoint(params.File, params.Line.Int())
+	resp, exists, err := ds.addLineBreakpoint(ctx, params.File, params.Line.Int())
 	if err != nil {
 		return nil, nil, err
 	}
-	if bpSeq == 0 {
+	if exists {
 		return &mcp.CallToolResult{
 			Content: []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf("Breakpoint already set at %s:%d", params.File, params.Line.Int())}},
 		}, nil, nil
 	}
 
-	resp, err := readTypedResponse[*dap.SetBreakpointsResponse](ds.client, bpSeq)
-	if err != nil {
-		return nil, nil, fmt.Errorf("unable to set breakpoint: %w", err)
-	}
 	// The response breakpoints array corresponds 1:1 with the request array.
 	// We appended the new line last, so our breakpoint is the last element.
 	if len(resp.Body.Breakpoints) == 0 {
@@ -1837,10 +2080,8 @@ func (ds *debuggerSession) breakpoint(ctx context.Context, _ *mcp.CallToolReques
 			}, nil, nil
 		}
 		// Failed or unknown reason — remove from both our tracking and the adapter.
-		removeSeq, removeErr := ds.removeLineBreakpoint(params.File, params.Line.Int())
+		_, removeErr := ds.removeLineBreakpoint(ctx, params.File, params.Line.Int())
 		if removeErr != nil {
-			log.Printf("breakpoint: failed to remove unverified breakpoint at %s:%d: %v", params.File, params.Line.Int(), removeErr)
-		} else if removeErr = readAndValidateResponse(ds.client, removeSeq, "unable to remove unverified breakpoint"); removeErr != nil {
 			log.Printf("breakpoint: failed to remove unverified breakpoint at %s:%d: %v", params.File, params.Line.Int(), removeErr)
 		}
 		return nil, nil, fmt.Errorf("breakpoint not verified: %s", bp.Message)
