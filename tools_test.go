@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bufio"
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -16,6 +18,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/go-dap"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
@@ -281,6 +284,25 @@ func requireGDBDeps(t *testing.T) {
 	if _, err := exec.LookPath("gdb"); err != nil {
 		t.Skip("gdb not found in PATH")
 	}
+	// Homebrew's current GDB package can inspect Mach-O binaries on Apple
+	// Silicon but cannot launch a native ARM64 inferior. Without this probe,
+	// every GDB integration test waits for a DAP stopped event that will never
+	// arrive. Keep GDB backend unit tests runnable on this host while skipping
+	// only the impossible integration coverage.
+	if runtime.GOOS == "darwin" && runtime.GOARCH == "arm64" {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		output, err := exec.CommandContext(ctx, "gdb", "-q", "-batch", "-ex", "start", "/usr/bin/true").CombinedOutput()
+		if strings.Contains(string(output), "Don't know how to run") {
+			t.Skip("installed GDB cannot launch native ARM64 macOS inferiors")
+		}
+		if ctx.Err() != nil {
+			t.Skip("GDB runnability probe timed out")
+		}
+		if err != nil {
+			t.Logf("GDB runnability probe exited with %v: %s", err, output)
+		}
+	}
 }
 
 func skipIfGDBLacksCoreFileSupport(t *testing.T, errorMsg string) {
@@ -504,6 +526,93 @@ func TestRestart(t *testing.T) {
 
 	// Stop debugger
 	ts.stopDebugger(t)
+}
+
+func TestRestartUsesSavedLaunchArguments(t *testing.T) {
+	serverReader, clientWriter := io.Pipe()
+	clientReader, serverWriter := io.Pipe()
+	client := newDAPClientFromRWC(&readWriteCloser{
+		Reader:      clientReader,
+		WriteCloser: clientWriter,
+	})
+	defer client.Close()
+
+	ds := &debuggerSession{
+		client:      client,
+		backend:     &delveBackend{},
+		launchMode:  "binary",
+		programPath: "/tmp/program",
+	}
+	requestArgs := make(chan map[string]any, 1)
+	serverErr := make(chan error, 1)
+	go func() {
+		msg, err := dap.ReadProtocolMessage(bufio.NewReader(serverReader))
+		if err != nil {
+			serverErr <- err
+			return
+		}
+		req, ok := msg.(*dap.RestartRequest)
+		if !ok {
+			serverErr <- fmt.Errorf("expected RestartRequest, got %T", msg)
+			return
+		}
+		var args map[string]any
+		if err := json.Unmarshal(req.Arguments, &args); err != nil {
+			serverErr <- err
+			return
+		}
+		requestArgs <- args
+		serverErr <- dap.WriteProtocolMessage(serverWriter, &dap.RestartResponse{
+			Response: dap.Response{
+				ProtocolMessage: dap.ProtocolMessage{Seq: 1, Type: "response"},
+				RequestSeq:      req.Seq,
+				Command:         "restart",
+				Success:         true,
+			},
+		})
+	}()
+
+	if _, _, err := ds.restartDebugger(context.Background(), nil, RestartParams{Args: []string{"new-arg"}}); err != nil {
+		t.Fatalf("restartDebugger returned error: %v", err)
+	}
+	if err := <-serverErr; err != nil {
+		t.Fatalf("DAP server returned error: %v", err)
+	}
+	args := <-requestArgs
+	restartArgs, ok := args["arguments"].(map[string]any)
+	if !ok {
+		t.Fatalf("restart request arguments = %T (%v), want object", args["arguments"], args["arguments"])
+	}
+	if got := restartArgs["program"]; got != "/tmp/program" {
+		t.Errorf("restart program = %v, want saved program path", got)
+	}
+	if got := restartArgs["mode"]; got != "exec" {
+		t.Errorf("restart mode = %v, want exec", got)
+	}
+	if got := restartArgs["rebuild"]; got != false {
+		t.Errorf("restart rebuild = %v, want false", got)
+	}
+}
+
+func TestReplFrameSelection(t *testing.T) {
+	tests := []struct {
+		expression string
+		wantFrame  int
+		wantOK     bool
+	}{
+		{expression: "frame 2", wantFrame: 2, wantOK: true},
+		{expression: " frame 0 ", wantFrame: 0, wantOK: true},
+		{expression: "frame -1"},
+		{expression: "f 2"},
+		{expression: "info locals"},
+	}
+	for _, test := range tests {
+		gotFrame, gotOK := replFrameSelection(test.expression)
+		if gotFrame != test.wantFrame || gotOK != test.wantOK {
+			t.Errorf("replFrameSelection(%q) = (%d, %t), want (%d, %t)",
+				test.expression, gotFrame, gotOK, test.wantFrame, test.wantOK)
+		}
+	}
 }
 
 func TestContext(t *testing.T) {
@@ -875,6 +984,12 @@ func TestToolListChangesWithCapabilities(t *testing.T) {
 	if !toolNames["evaluate"] {
 		t.Error("Expected 'evaluate' tool during active session")
 	}
+	if !toolNames["set-variable"] {
+		t.Error("Expected capability-gated 'set-variable' tool during active session")
+	}
+	if !toolNames["disassemble"] {
+		t.Error("Expected capability-gated 'disassemble' tool during active session")
+	}
 
 	// Stop debug session
 	ts.stopDebugger(t)
@@ -890,14 +1005,50 @@ func TestToolListChangesWithCapabilities(t *testing.T) {
 		toolNames[tool.Name] = true
 	}
 
-	if !toolNames["debug"] {
-		t.Error("Expected 'debug' tool after session stop")
+	if len(toolNames) != 1 || !toolNames["debug"] {
+		t.Errorf("Expected only 'debug' after session stop, got %v", toolNames)
 	}
-	if toolNames["stop"] {
-		t.Error("Did not expect 'stop' tool after session stop")
+}
+
+func TestDelveRejectsNonGoBinaryWithDebuggerGuidance(t *testing.T) {
+	ts := setupMCPServerAndClient(t)
+	defer ts.cleanup()
+
+	binaryPath, cleanupBinary := compileTestCProgram(t, ts.cwd, "helloworld")
+	defer cleanupBinary()
+
+	result, err := ts.session.CallTool(ts.ctx, &mcp.CallToolParams{
+		Name: "debug",
+		Arguments: map[string]any{
+			"mode": "binary",
+			"path": binaryPath,
+		},
+	})
+	if err != nil {
+		t.Fatalf("debug call failed: %v", err)
 	}
-	if toolNames["breakpoint"] {
-		t.Error("Did not expect 'breakpoint' tool after session stop")
+	if !result.IsError {
+		t.Fatalf("Expected Delve to reject a non-Go binary, got: %v", result)
+	}
+
+	var errorText strings.Builder
+	for _, content := range result.Content {
+		if text, ok := content.(*mcp.TextContent); ok {
+			errorText.WriteString(text.Text)
+		}
+	}
+	for _, want := range []string{"Delve backend only supports Go programs", `debugger: "gdb"`} {
+		if !strings.Contains(errorText.String(), want) {
+			t.Errorf("Expected error to contain %q, got: %s", want, errorText.String())
+		}
+	}
+
+	toolList, err := ts.session.ListTools(ts.ctx, &mcp.ListToolsParams{})
+	if err != nil {
+		t.Fatalf("Failed to list tools after rejected debug call: %v", err)
+	}
+	if len(toolList.Tools) != 1 || toolList.Tools[0].Name != "debug" {
+		t.Errorf("Expected only 'debug' after rejected debug call, got: %v", toolList.Tools)
 	}
 }
 
@@ -1204,6 +1355,64 @@ func TestGDBEvaluateWatchContext(t *testing.T) {
 			}
 			t.Logf("evaluate %q = %s", tc.expression, text)
 		})
+	}
+
+	ts.stopDebugger(t)
+}
+
+func TestGDBContextSelectsRequestedFrame(t *testing.T) {
+	requireGDBDeps(t)
+
+	ts := setupMCPServerAndClient(t)
+	defer ts.cleanup()
+
+	binaryPath, cleanupBinary := compileTestCProgram(t, ts.cwd, "frames")
+	defer cleanupBinary()
+
+	sourcePath := filepath.Join(ts.cwd, "testdata", "c", "frames", "main.c")
+	text, isError := ts.callTool(t, "debug", map[string]any{
+		"debugger": "gdb",
+		"mode":     "binary",
+		"path":     binaryPath,
+		"breakpoints": []map[string]any{
+			{"file": sourcePath, "line": 14},
+		},
+	})
+	if isError {
+		t.Fatalf("Failed to start GDB session: %s", text)
+	}
+
+	contextText, isError := ts.callTool(t, "context", map[string]any{"frameId": 2})
+	if isError {
+		t.Fatalf("context for frame 2 returned an error: %s", contextText)
+	}
+	if !strings.Contains(contextText, "File: "+sourcePath+":12") {
+		t.Errorf("Expected current location for frame 2, got:\n%s", contextText)
+	}
+	for _, want := range []string{
+		"local (struct point) =",
+		"local.x (int) = 12",
+		"local.y (int) = 18",
+	} {
+		if !strings.Contains(contextText, want) {
+			t.Errorf("Expected frame 2 context to contain %q, got:\n%s", want, contextText)
+		}
+	}
+
+	evalText, isError := ts.callTool(t, "evaluate", map[string]any{"expression": "local.x"})
+	if isError {
+		t.Fatalf("evaluate in selected frame returned an error: %s", evalText)
+	}
+	if !strings.Contains(evalText, "12") {
+		t.Errorf("Expected evaluation in frame 2 to return 12, got: %s", evalText)
+	}
+
+	structText, isError := ts.callTool(t, "evaluate", map[string]any{"expression": "*p"})
+	if isError {
+		t.Fatalf("structured evaluation returned an error: %s", structText)
+	}
+	if !strings.Contains(structText, "*p.x (int) = 10") {
+		t.Errorf("Expected structured evaluation to expand *p members, got: %s", structText)
 	}
 
 	ts.stopDebugger(t)
@@ -2043,6 +2252,9 @@ func TestInfo(t *testing.T) {
 	text, isErr = ts.callTool(t, "info", map[string]any{})
 	if isErr {
 		t.Fatalf("info default returned error: %s", text)
+	}
+	if !strings.Contains(text, "Thread") {
+		t.Errorf("Expected default info to list threads, got: %s", text)
 	}
 	t.Logf("Info default: %s", text)
 

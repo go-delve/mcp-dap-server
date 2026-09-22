@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"debug/buildinfo"
 	"errors"
 	"fmt"
 	"io"
@@ -9,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -315,9 +317,9 @@ func (ds *debuggerSession) unregisterSessionTools() {
 
 // BreakpointSpec specifies a breakpoint location.
 type BreakpointSpec struct {
-	File     string `json:"file,omitempty"`
-	Line     int    `json:"line,omitempty"`
-	Function string `json:"function,omitempty"`
+	File     string  `json:"file,omitempty"`
+	Line     FlexInt `json:"line,omitempty"`
+	Function string  `json:"function,omitempty"`
 }
 
 // DebugParams defines the parameters for starting a complete debug session.
@@ -339,9 +341,9 @@ type DebugParams struct {
 
 // ContextParams defines the parameters for getting debugging context.
 type ContextParams struct {
-	ThreadID  FlexInt `json:"threadId,omitempty" jsonschema:"thread to inspect (default: current thread)"`
-	FrameID   FlexInt `json:"frameId,omitempty" jsonschema:"frame to focus on (default: top frame)"`
-	MaxFrames FlexInt `json:"maxFrames,omitempty" jsonschema:"maximum stack frames (default: 20)"`
+	ThreadID  FlexInt  `json:"threadId,omitempty" jsonschema:"thread to inspect (default: current thread)"`
+	FrameID   *FlexInt `json:"frameId,omitempty" jsonschema:"frame to focus on (default: top frame)"`
+	MaxFrames FlexInt  `json:"maxFrames,omitempty" jsonschema:"maximum stack frames (default: 20)"`
 }
 
 // StepParams defines the parameters for stepping through code.
@@ -573,13 +575,13 @@ func (ds *debuggerSession) continueExecution(ctx context.Context, _ *mcp.CallToo
 			}
 		} else if to.File != "" && to.Line > 0 {
 			var err error
-			addSeq, err = ds.addLineBreakpoint(to.File, to.Line)
+			addSeq, err = ds.addLineBreakpoint(to.File, to.Line.Int())
 			if err != nil {
 				return nil, nil, err
 			}
 			if addSeq > 0 {
 				cleanupRunToCursor = func() error {
-					seq, err := ds.removeLineBreakpoint(to.File, to.Line)
+					seq, err := ds.removeLineBreakpoint(to.File, to.Line.Int())
 					if err != nil {
 						return err
 					}
@@ -588,7 +590,7 @@ func (ds *debuggerSession) continueExecution(ctx context.Context, _ *mcp.CallToo
 			}
 		}
 		if addSeq > 0 {
-			if _, err := ds.client.ReadMessage(); err != nil {
+			if err := readAndValidateResponse(ds.client, addSeq, "unable to set run-to-cursor breakpoint"); err != nil {
 				return nil, nil, err
 			}
 		}
@@ -626,7 +628,11 @@ func (ds *debuggerSession) pauseExecution(ctx context.Context, _ *mcp.CallToolRe
 	if ds.client == nil {
 		return nil, nil, fmt.Errorf("debugger not started")
 	}
-	seq, err := ds.client.PauseRequest(params.ThreadID.Int())
+	threadID := params.ThreadID.Int()
+	if threadID == 0 {
+		threadID = ds.defaultThreadID()
+	}
+	seq, err := ds.client.PauseRequest(threadID)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -658,6 +664,16 @@ func (ds *debuggerSession) evaluateExpression(ctx context.Context, _ *mcp.CallTo
 	if evalContext == "" {
 		evalContext = "watch"
 	}
+	if evalContext == "repl" {
+		if frameID, ok := replFrameSelection(params.Expression); ok {
+			return &mcp.CallToolResult{
+				Content: []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf(
+					"GDB's DAP REPL does not persist `frame %d` selection. Use context with frameId: %d, then evaluate expressions in the default watch context.",
+					frameID, frameID,
+				)}},
+			}, nil, nil
+		}
+	}
 
 	var frameID int
 	if params.FrameID != nil {
@@ -686,6 +702,20 @@ func (ds *debuggerSession) evaluateExpression(ctx context.Context, _ *mcp.CallTo
 			if resp.Body.Type != "" {
 				result = fmt.Sprintf("%s (type: %s)", resp.Body.Result, resp.Body.Type)
 			}
+			if resp.Body.VariablesReference > 0 {
+				var expanded strings.Builder
+				expanded.WriteString(result)
+				if !strings.HasSuffix(result, "\n") {
+					expanded.WriteString("\n")
+				}
+				ds.writeVariable(&expanded, dap.Variable{
+					Name:               params.Expression,
+					Value:              resp.Body.Result,
+					Type:               resp.Body.Type,
+					VariablesReference: resp.Body.VariablesReference,
+				}, "  ", params.Expression, 2)
+				result = expanded.String()
+			}
 			return &mcp.CallToolResult{
 				Content: []mcp.Content{&mcp.TextContent{Text: result}},
 			}, nil, nil
@@ -703,6 +733,22 @@ func (ds *debuggerSession) evaluateExpression(ctx context.Context, _ *mcp.CallTo
 			continue
 		}
 	}
+}
+
+// replFrameSelection recognizes GDB's "frame N" command. GDB native DAP
+// accepts it in a REPL evaluate request but does not retain the selection for
+// later requests, so returning an explicit instruction is less misleading than
+// forwarding a command that appears to succeed but has no useful effect.
+func replFrameSelection(expression string) (int, bool) {
+	fields := strings.Fields(expression)
+	if len(fields) != 2 || fields[0] != "frame" {
+		return 0, false
+	}
+	frameID, err := strconv.Atoi(fields[1])
+	if err != nil || frameID < 0 {
+		return 0, false
+	}
+	return frameID, true
 }
 
 // SetVariableParams defines the parameters for setting a variable.
@@ -743,15 +789,19 @@ func (ds *debuggerSession) restartDebugger(ctx context.Context, _ *mcp.CallToolR
 	if ds.client == nil {
 		return nil, nil, fmt.Errorf("debugger not started")
 	}
-	seq, err := ds.client.RestartRequest(map[string]any{
-		"arguments": map[string]any{
-			"request":     "launch",
-			"mode":        "exec",
-			"stopOnEntry": false,
-			"args":        params.Args,
-			"rebuild":     false,
-		},
-	})
+	if ds.launchMode != "source" && ds.launchMode != "binary" {
+		return nil, nil, fmt.Errorf("restart is only supported for source or binary launch sessions")
+	}
+	restartArgs, err := ds.backend.LaunchArgs(ds.launchMode, ds.programPath, false, params.Args)
+	if err != nil {
+		return nil, nil, fmt.Errorf("unable to build restart arguments: %w", err)
+	}
+	// Delve accepts this optional flag, while other adapters ignore unknown
+	// launch arguments. It preserves the prior no-rebuild restart behavior.
+	if ds.backend.AdapterID() == "go" {
+		restartArgs["rebuild"] = false
+	}
+	seq, err := ds.client.RestartRequest(map[string]any{"arguments": restartArgs})
 	if err != nil {
 		return nil, nil, err
 	}
@@ -774,11 +824,7 @@ func (ds *debuggerSession) info(ctx context.Context, _ *mcp.CallToolRequest, par
 
 	infoType := params.Type
 	if infoType == "" {
-		if ds.capabilities.SupportsLoadedSourcesRequest {
-			infoType = "sources"
-		} else {
-			infoType = "threads"
-		}
+		infoType = "threads"
 	}
 
 	switch infoType {
@@ -1011,6 +1057,9 @@ func (ds *debuggerSession) cleanup() {
 		ds.cmd = nil
 	}
 
+	// sessionToolNames uses capabilities to identify the optional tools that
+	// were registered for this adapter, so unregister before clearing them.
+	ds.unregisterSessionTools()
 	ds.launchMode = ""
 	ds.programPath = ""
 	ds.programArgs = nil
@@ -1020,7 +1069,6 @@ func (ds *debuggerSession) cleanup() {
 	ds.lastFrameID = -1
 	ds.functionBreakpoints = nil
 	ds.lineBreakpoints = nil
-	ds.unregisterSessionTools()
 }
 
 // debug starts a complete debugging session.
@@ -1092,6 +1140,15 @@ func (ds *debuggerSession) debug(ctx context.Context, _ *mcp.CallToolRequest, pa
 
 	if mode == "core" && params.Path == "" && debugger != "gdb" {
 		return nil, nil, fmt.Errorf("path is required for core mode with %s (only GDB can auto-detect the executable from a core file)", debugger)
+	}
+
+	// Delve can sometimes partially launch non-Go executables, leaving callers
+	// with a working-looking session whose stack operations fail. Reject that
+	// mismatch before spawning the adapter and explain how to select GDB.
+	if debugger == "delve" && (mode == "binary" || mode == "core") {
+		if _, err := buildinfo.ReadFile(params.Path); err != nil {
+			return nil, nil, fmt.Errorf("the Delve backend only supports Go programs, but %q is not a Go executable; for C/C++/Rust pass debugger: \"gdb\"", params.Path)
+		}
 	}
 
 	// Spawn DAP server via backend
@@ -1210,8 +1267,9 @@ func (ds *debuggerSession) debug(ctx context.Context, _ *mcp.CallToolRequest, pa
 		}
 		switch resp := msg.(type) {
 		case dap.ResponseMessage:
-			if !resp.GetResponse().Success {
-				return nil, nil, fmt.Errorf("unable to start debug session: %s", resp.GetResponse().Message)
+			response := resp.GetResponse()
+			if response.RequestSeq == launchSeq && !response.Success {
+				return nil, nil, fmt.Errorf("unable to start debug session: %s", response.Message)
 			}
 		case *dap.InitializedEvent:
 			_ = resp
@@ -1232,8 +1290,8 @@ initialized:
 					return nil, nil, err
 				}
 			}
-		} else if bp.File != "" && bp.Line > 0 {
-			seq, err := ds.addLineBreakpoint(bp.File, bp.Line)
+		} else if bp.File != "" && bp.Line.Int() > 0 {
+			seq, err := ds.addLineBreakpoint(bp.File, bp.Line.Int())
 			if err != nil {
 				return nil, nil, err
 			}
@@ -1314,7 +1372,7 @@ initialized:
 		if stoppedThreadID == 0 {
 			stoppedThreadID = 1
 		}
-		result, err := ds.getFullContext(stoppedThreadID, 0, 20)
+		result, err := ds.getFullContext(stoppedThreadID, -1, 20)
 		if err != nil || params.FullContext {
 			return result, nil, err
 		}
@@ -1341,7 +1399,7 @@ initialized:
 	// Delve path: getFullContext may fail at the entry point (e.g. before the
 	// Go runtime is initialized). Fall back to a helpful message in that case.
 	ds.stoppedThreadID = 1
-	result, err := ds.getFullContext(ds.stoppedThreadID, 0, 20)
+	result, err := ds.getFullContext(ds.stoppedThreadID, -1, 20)
 	if err != nil {
 		return &mcp.CallToolResult{
 			Content: []mcp.Content{&mcp.TextContent{Text: "Stopped at program entry. Set breakpoints and use 'continue' to reach your code."}},
@@ -1365,7 +1423,14 @@ func (ds *debuggerSession) context(ctx context.Context, _ *mcp.CallToolRequest, 
 	if maxFrames == 0 {
 		maxFrames = 20
 	}
-	result, err := ds.getFullContext(threadID, params.FrameID.Int(), maxFrames)
+	// Frame IDs are non-negative DAP identifiers, including 0 in GDB.
+	// Use -1 internally for an omitted frameId so an explicit frameId: 0
+	// remains distinguishable from the default top-frame selection.
+	frameID := -1
+	if params.FrameID != nil {
+		frameID = params.FrameID.Int()
+	}
+	result, err := ds.getFullContext(threadID, frameID, maxFrames)
 	if err != nil {
 		// If the thread ID was invalid, try to help by listing available threads
 		if strings.Contains(err.Error(), "threadId") || strings.Contains(err.Error(), "thread") {
@@ -1452,13 +1517,26 @@ func (ds *debuggerSession) getFullContext(threadID, frameID, maxFrames int) (*mc
 	}
 	frames := stResp.Body.StackFrames
 
-	// Current location
+	// An omitted frame ID selects the top stack frame. A DAP frame ID of zero
+	// is valid (and is GDB's top frame), so it must not be used as a sentinel.
+	targetFrameID := frameID
+	if targetFrameID < 0 && len(frames) > 0 {
+		targetFrameID = frames[0].Id
+	}
+
+	// Current location for the selected frame.
 	if len(frames) > 0 {
-		top := frames[0]
+		focus := frames[0]
+		for _, frame := range frames {
+			if frame.Id == targetFrameID {
+				focus = frame
+				break
+			}
+		}
 		result.WriteString("## Current Location\n")
-		fmt.Fprintf(&result, "Function: %s\n", top.Name)
-		if top.Source != nil {
-			fmt.Fprintf(&result, "File: %s:%d\n", top.Source.Path, top.Line)
+		fmt.Fprintf(&result, "Function: %s\n", focus.Name)
+		if focus.Source != nil {
+			fmt.Fprintf(&result, "File: %s:%d\n", focus.Source.Path, focus.Line)
 		}
 		result.WriteString("\n")
 	}
@@ -1480,11 +1558,6 @@ func (ds *debuggerSession) getFullContext(threadID, frameID, maxFrames int) (*mc
 	}
 	result.WriteString("\n")
 
-	// Determine the target frame for scopes/variables
-	targetFrameID := frameID
-	if targetFrameID == 0 && len(frames) > 0 {
-		targetFrameID = frames[0].Id
-	}
 	ds.lastFrameID = targetFrameID
 
 	// Get scopes and variables
@@ -1519,7 +1592,7 @@ func (ds *debuggerSession) waitForStopOrTermination(requestSeq int, fullContext 
 			}
 		case *dap.StoppedEvent:
 			ds.stoppedThreadID = resp.Body.ThreadId
-			result, err := ds.getFullContext(resp.Body.ThreadId, 0, 20)
+			result, err := ds.getFullContext(resp.Body.ThreadId, -1, 20)
 			if err != nil || fullContext {
 				return result, err
 			}
@@ -1621,12 +1694,37 @@ func (ds *debuggerSession) writeScopesAndVariables(result *strings.Builder, fram
 			continue
 		}
 		for _, v := range varResp.Body.Variables {
-			if v.Type != "" {
-				fmt.Fprintf(result, "  %s (%s) = %s\n", v.Name, v.Type, v.Value)
-			} else {
-				fmt.Fprintf(result, "  %s = %s\n", v.Name, v.Value)
-			}
+			ds.writeVariable(result, v, "  ", v.Name, 2)
 		}
+	}
+}
+
+// writeVariable writes a variable and up to maxDepth levels of children.
+// GDB represents aggregate values (such as structs) with an empty Value and
+// a VariablesReference, so showing the children is necessary to make those
+// values inspectable through the regular evaluate and context tools.
+func (ds *debuggerSession) writeVariable(result *strings.Builder, variable dap.Variable, indent, name string, maxDepth int) {
+	if variable.Type != "" {
+		fmt.Fprintf(result, "%s%s (%s) = %s\n", indent, name, variable.Type, variable.Value)
+	} else {
+		fmt.Fprintf(result, "%s%s = %s\n", indent, name, variable.Value)
+	}
+	if variable.VariablesReference <= 0 || maxDepth == 0 {
+		return
+	}
+
+	varSeq, err := ds.client.VariablesRequest(variable.VariablesReference)
+	if err != nil {
+		fmt.Fprintf(result, "%s  (unable to retrieve child variables)\n", indent)
+		return
+	}
+	varResp, err := readTypedResponse[*dap.VariablesResponse](ds.client, varSeq)
+	if err != nil {
+		fmt.Fprintf(result, "%s  (unable to retrieve child variables)\n", indent)
+		return
+	}
+	for _, child := range varResp.Body.Variables {
+		ds.writeVariable(result, child, indent+"  ", name+"."+child.Name, maxDepth-1)
 	}
 }
 

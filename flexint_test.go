@@ -63,3 +63,13 @@ func TestFlexIntInStruct(t *testing.T) {
 		})
 	}
 }
+
+func TestDebugBreakpointAcceptsStringLine(t *testing.T) {
+	var params DebugParams
+	if err := json.Unmarshal([]byte(`{"mode":"binary","path":"/tmp/program","breakpoints":[{"file":"/tmp/main.go","line":"42"}]}`), &params); err != nil {
+		t.Fatalf("Unmarshal debug parameters: %v", err)
+	}
+	if len(params.Breakpoints) != 1 || params.Breakpoints[0].Line.Int() != 42 {
+		t.Errorf("breakpoint line = %d, want 42", params.Breakpoints[0].Line.Int())
+	}
+}
