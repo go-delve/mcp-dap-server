@@ -335,12 +335,12 @@ func promptDebugCoreDump(_ context.Context, req *mcp.GetPromptRequest) (*mcp.Get
 
 	signalGuide := `
 **Signal interpretation:**
-- `+"`"+`SIGSEGV`+"`"+` (segfault) — nil pointer dereference, use-after-free, buffer overflow, stack overflow
-- `+"`"+`SIGABRT`+"`"+` — explicit abort, assertion failure, double-free (C/C++), runtime panic (Go)
-- `+"`"+`SIGFPE`+"`"+` — arithmetic error: division by zero, integer overflow
-- `+"`"+`SIGBUS`+"`"+` — misaligned memory access, unmapped file region
-- `+"`"+`SIGILL`+"`"+` — illegal CPU instruction (often compiler bug or corrupted binary)
-- `+"`"+`SIGPIPE`+"`"+` — write to closed pipe/socket with no signal handler`
+- ` + "`" + `SIGSEGV` + "`" + ` (segfault) — nil pointer dereference, use-after-free, buffer overflow, stack overflow
+- ` + "`" + `SIGABRT` + "`" + ` — explicit abort, assertion failure, double-free (C/C++), runtime panic (Go)
+- ` + "`" + `SIGFPE` + "`" + ` — arithmetic error: division by zero, integer overflow
+- ` + "`" + `SIGBUS` + "`" + ` — misaligned memory access, unmapped file region
+- ` + "`" + `SIGILL` + "`" + ` — illegal CPU instruction (often compiler bug or corrupted binary)
+- ` + "`" + `SIGPIPE` + "`" + ` — write to closed pipe/socket with no signal handler`
 
 	content := fmt.Sprintf(`## Post-Mortem Core Dump Analysis
 
@@ -460,8 +460,8 @@ func promptDebugBinary(_ context.Context, req *mcp.GetPromptRequest) (*mcp.GetPr
 
 	// Infer likely language/debugger from path or note that both are supported
 	debuggerNote := `Use 'delve' for Go binaries, 'gdb' for C/C++/Rust binaries.
-> - Go binary: `+"`"+`debug(mode="binary", path="...", debugger="delve")`+"`"+`
-> - C/C++ binary: `+"`"+`debug(mode="binary", path="...", debugger="gdb")`+"`"+``
+> - Go binary: ` + "`" + `debug(mode="binary", path="...", debugger="delve")` + "`" + `
+> - C/C++ binary: ` + "`" + `debug(mode="binary", path="...", debugger="gdb")` + "`" + ``
 
 	content := fmt.Sprintf(`## Binary / Assembly-Level Debug Session
 

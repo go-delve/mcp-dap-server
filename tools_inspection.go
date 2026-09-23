@@ -368,7 +368,9 @@ func (ds *debuggerSession) disassembleCode(ctx context.Context, _ *mcp.CallToolR
 	}, nil, nil
 }
 
-// context returns the full debugging context at the current location.
+// stop ends the debugging session.
+// If params.Detach is true, a DAP disconnect request is sent with terminateDebuggee=false
+// so the debuggee keeps running after the adapter disconnects.
 func (ds *debuggerSession) context(ctx context.Context, _ *mcp.CallToolRequest, params ContextParams) (*mcp.CallToolResult, any, error) {
 	ds.mu.Lock()
 	defer ds.mu.Unlock()
@@ -424,9 +426,7 @@ func (ds *debuggerSession) getThreadList(ctx context.Context) string {
 	return threads.String()
 }
 
-// writeScopesAndVariables fetches scopes and their variables for the given
-// frame and writes them to the result builder. Errors are written inline
-// rather than propagated, since partial context is better than none.
+// step executes a step command and returns the full context at the new location.
 func (ds *debuggerSession) writeScopesAndVariables(ctx context.Context, result *strings.Builder, frameID int) {
 	scopesSeq, err := ds.client.ScopesRequest(frameID)
 	if err != nil {
@@ -600,3 +600,5 @@ func (ds *debuggerSession) writeVariableBudgeted(ctx context.Context, result *st
 		budget.truncate(result, "per-variable child budget reached")
 	}
 }
+
+// breakpoint sets a breakpoint at the specified location.

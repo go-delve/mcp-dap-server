@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -24,9 +25,7 @@ type readWriteCloser struct {
 func (r *readWriteCloser) Close() error {
 	writeErr := r.WriteCloser.Close()
 	if reader, ok := r.Reader.(io.Closer); ok {
-		if readErr := reader.Close(); writeErr == nil {
-			return readErr
-		}
+		return errors.Join(writeErr, reader.Close())
 	}
 	return writeErr
 }
@@ -42,6 +41,7 @@ type DAPClient struct {
 	sendMu    sync.Mutex
 	handlerMu sync.RWMutex
 	onEvent   func(dap.EventMessage)
+	onEnd     func(*DAPClient, error)
 	inboxMu   sync.Mutex
 	inbox     []dap.Message
 	readErr   error
@@ -51,22 +51,22 @@ type DAPClient struct {
 
 const maxDAPInboxMessages = 4096
 
-// newDAPClient creates a new Client over a TCP connection.
-// Call Close to close the connection.
-func newDAPClient(addr string) (*DAPClient, error) {
+// dialDAPClient creates a client over a TCP connection.
+func dialDAPClient(addr string, onEnd func(*DAPClient, error)) (*DAPClient, error) {
 	conn, err := net.Dial("tcp", addr)
 	if err != nil {
 		return nil, fmt.Errorf("connecting to DAP server at %s: %w", addr, err)
 	}
-	return newDAPClientFromRWC(conn), nil
+	return newDAPClient(conn, onEnd), nil
 }
 
-// newDAPClientFromRWC creates a new Client with the given ReadWriteCloser.
-// Call Close to close the underlying transport.
-func newDAPClientFromRWC(rwc io.ReadWriteCloser) *DAPClient {
+// newDAPClient creates a client over an established transport. The lifecycle
+// callback is fixed before the read loop starts.
+func newDAPClient(rwc io.ReadWriteCloser, onEnd func(*DAPClient, error)) *DAPClient {
 	c := &DAPClient{
 		rwc:    rwc,
 		reader: bufio.NewReader(rwc),
+		onEnd:  onEnd,
 		notify: make(chan struct{}),
 		seq:    1, // match VS Code numbering
 	}
@@ -74,11 +74,40 @@ func newDAPClientFromRWC(rwc io.ReadWriteCloser) *DAPClient {
 	return c
 }
 
-// Close closes the client connection.
+// newDAPClientFromRWC preserves the simple constructor used by protocol tests.
+func newDAPClientFromRWC(rwc io.ReadWriteCloser) *DAPClient {
+	return newDAPClient(rwc, nil)
+}
+
+// Close closes the client connection and synchronously invokes its session
+// lifecycle callback.
 func (c *DAPClient) Close() {
+	c.end()
+}
+
+// shutdown closes the transport during owner-driven cleanup without notifying
+// the owner recursively.
+func (c *DAPClient) shutdown() {
+	c.closeTransport()
+}
+
+func (c *DAPClient) end(causes ...error) {
+	didClose, closeErr := c.closeTransport(causes...)
+	if didClose && c.onEnd != nil {
+		c.onEnd(c, closeErr)
+	}
+}
+
+func (c *DAPClient) closeTransport(causes ...error) (bool, error) {
+	didClose := false
+	var closeErr error
 	c.closeOnce.Do(func() {
-		_ = c.rwc.Close()
+		// sync.Once consumes the close attempt even when the transport reports an
+		// error, so the owner must still observe this lifecycle transition.
+		didClose = true
+		closeErr = errors.Join(append(causes, c.rwc.Close())...)
 	})
+	return didClose, closeErr
 }
 
 // SetProtocolLogger sets a writer for logging all DAP messages sent and received.
@@ -151,26 +180,29 @@ func (c *DAPClient) readLoop() {
 				}
 			}
 		}
+		var terminalErr error
 		c.inboxMu.Lock()
 		if err != nil {
 			c.readErr = err
+			terminalErr = err
 		} else if len(c.inbox) >= maxDAPInboxMessages {
 			c.readErr = fmt.Errorf("DAP adapter exceeded the %d-message inbox limit", maxDAPInboxMessages)
+			terminalErr = c.readErr
 		} else {
 			c.inbox = append(c.inbox, msg)
 		}
 		close(c.notify)
 		c.notify = make(chan struct{})
 		c.inboxMu.Unlock()
-		if err != nil {
+		if terminalErr != nil {
+			c.end(terminalErr)
 			return
 		}
-		c.inboxMu.Lock()
-		overflow := c.readErr != nil
-		c.inboxMu.Unlock()
-		if overflow {
-			c.Close()
-			return
+		if _, terminated := msg.(*dap.TerminatedEvent); terminated && c.onEnd != nil {
+			// The event is already queued, so a tool waiting while holding the
+			// session lock wakes and can release that lock before this synchronous
+			// callback enters session cleanup.
+			c.onEnd(c, nil)
 		}
 	}
 }
@@ -299,9 +331,8 @@ func (c *DAPClient) issueRequest(command string, build func(*dap.Request) dap.Me
 	return request.Seq, dap.WriteProtocolMessage(c.rwc, message)
 }
 
-// newRequest creates a new DAP request with the given command and an
-// auto-incremented sequence number. The caller can read the assigned
-// sequence number from the returned request's Seq field.
+// newRequest creates a new DAP request for compatibility with callers that
+// construct and send a request separately.
 func (c *DAPClient) newRequest(command string) *dap.Request {
 	c.sendMu.Lock()
 	defer c.sendMu.Unlock()

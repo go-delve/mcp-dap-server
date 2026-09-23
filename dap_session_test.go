@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"os/exec"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -24,7 +25,9 @@ func TestPauseInterruptsPendingContinueAndPreservesOrdering(t *testing.T) {
 	client := newDAPClientFromRWC(clientConn)
 	defer client.Close()
 
-	ds := &debuggerSession{client: client, controlClient: client, lastFrameID: -1}
+	ds := &debuggerSession{debugSessionState: debugSessionState{
+		client: client, controlClient: client, lastFrameID: -1,
+	}}
 	type callResult struct {
 		result *mcp.CallToolResult
 		err    error
@@ -109,7 +112,7 @@ func TestVariableExpansionDetectsCyclesAndShowsReferences(t *testing.T) {
 	clientConn, adapterConn := net.Pipe()
 	client := newDAPClientFromRWC(clientConn)
 	defer client.Close()
-	ds := &debuggerSession{client: client}
+	ds := &debuggerSession{debugSessionState: debugSessionState{client: client}}
 
 	adapterDone := make(chan error, 1)
 	go func() {
@@ -190,13 +193,48 @@ func TestSessionProcessesStateChangingEvents(t *testing.T) {
 	}
 }
 
+func TestCleanupReplacesPerDebugSessionState(t *testing.T) {
+	override := &fakeStdioBackend{}
+	ds := &debuggerSession{
+		logWriter:       io.Discard,
+		backendOverride: override,
+		debugSessionState: debugSessionState{
+			eventBreakpoints:    map[int]dap.Breakpoint{1: {Id: 1}},
+			eventThreads:        map[int]bool{2: true},
+			progress:            map[string]dap.ProgressStartEventBody{"build": {ProgressId: "build"}},
+			invalidated:         true,
+			backend:             override,
+			capabilities:        dap.Capabilities{SupportsRestartRequest: true},
+			launchMode:          "binary",
+			programPath:         "/tmp/program",
+			programArgs:         []string{"arg"},
+			coreFilePath:        "/tmp/core",
+			stoppedThreadID:     2,
+			lastFrameID:         7,
+			functionBreakpoints: []string{"main.main"},
+			lineBreakpoints:     map[string][]int{"main.go": {10}},
+		},
+	}
+
+	ds.cleanup()
+
+	if !reflect.DeepEqual(ds.debugSessionState, newDebugSessionState()) {
+		t.Fatalf("session state after cleanup = %#v, want fresh state", ds.debugSessionState)
+	}
+	if ds.logWriter != io.Discard || ds.backendOverride != override {
+		t.Fatal("cleanup changed stable controller configuration")
+	}
+}
+
 func TestBreakpointTransactionCommitsOnlySuccessfulResponses(t *testing.T) {
 	clientConn, adapterConn := net.Pipe()
 	client := newDAPClientFromRWC(clientConn)
 	defer client.Close()
 	ds := &debuggerSession{
-		client:          client,
-		lineBreakpoints: map[string][]int{"/workspace/main.go": {7}},
+		debugSessionState: debugSessionState{
+			client:          client,
+			lineBreakpoints: map[string][]int{"/workspace/main.go": {7}},
+		},
 	}
 
 	adapterDone := make(chan error, 1)
@@ -293,7 +331,9 @@ func TestCancellationRequestAndLateResponseAreDrained(t *testing.T) {
 	clientConn, adapterConn := net.Pipe()
 	client := newDAPClientFromRWC(clientConn)
 	defer client.Close()
-	ds := &debuggerSession{client: client, capabilities: dap.Capabilities{SupportsCancelRequest: true}}
+	ds := &debuggerSession{debugSessionState: debugSessionState{
+		client: client, capabilities: dap.Capabilities{SupportsCancelRequest: true},
+	}}
 	adapterDone := make(chan error, 1)
 	go func() {
 		request, err := dap.ReadProtocolMessage(bufio.NewReader(adapterConn))
@@ -362,7 +402,10 @@ func (b *fakeStdioBackend) AttachArgs(int) (map[string]any, error) {
 func TestDebugStartupEOFRollsBackSession(t *testing.T) {
 	clientConn, adapterConn := net.Pipe()
 	backend := &fakeStdioBackend{stdout: clientConn, stdin: clientConn}
-	ds := &debuggerSession{backendOverride: backend, lastFrameID: -1}
+	ds := &debuggerSession{
+		backendOverride:   backend,
+		debugSessionState: newDebugSessionState(),
+	}
 	go func() {
 		_, _ = dap.ReadProtocolMessage(bufio.NewReader(adapterConn))
 		adapterConn.Close()
@@ -380,7 +423,11 @@ func TestDebugSupportsConfigurationBeforeLaunch(t *testing.T) {
 	clientConn, adapterConn := net.Pipe()
 	backend := &fakeStdioBackend{stdout: clientConn, stdin: clientConn, launchAfter: true}
 	server := mcp.NewServer(&mcp.Implementation{Name: "test", Version: "test"}, nil)
-	ds := &debuggerSession{server: server, backendOverride: backend, lastFrameID: -1}
+	ds := &debuggerSession{
+		server:            server,
+		backendOverride:   backend,
+		debugSessionState: newDebugSessionState(),
+	}
 	defer ds.cleanup()
 
 	adapterDone := make(chan error, 1)

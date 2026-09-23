@@ -274,7 +274,10 @@ func (g *gdbBackend) LaunchArgs(mode, programPath string, stopOnEntry bool, prog
 		return nil, fmt.Errorf("GDB does not support 'source' mode. Compile your program with debug symbols (gcc -g -O0) and use 'binary' mode instead")
 	}
 
-	cwd, _ := os.Getwd()
+	cwd, err := os.Getwd()
+	if err != nil {
+		return nil, fmt.Errorf("getting current working directory: %w", err)
+	}
 	args := map[string]any{
 		"program": programPath,
 		"cwd":     cwd,
