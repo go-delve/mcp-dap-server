@@ -14,20 +14,29 @@ import (
 )
 
 type debuggerSession struct {
-	mu                  sync.Mutex // serializes DAP requests to prevent concurrent read races
-	controlMu           sync.RWMutex
+	mu        sync.Mutex // serializes DAP requests to prevent concurrent read races
+	controlMu sync.RWMutex
+	eventMu   sync.Mutex
+
+	server          *mcp.Server     // MCP server for dynamic tool registration
+	logWriter       io.Writer       // writer for adapter stderr (log file or io.Discard)
+	backendOverride DebuggerBackend // deterministic adapter used by protocol tests
+
+	debugSessionState
+}
+
+// debugSessionState contains everything owned by one active debugger session.
+// debuggerSession is the stable tool controller; cleanup replaces this value so
+// future state fields are reset automatically between sessions.
+type debugSessionState struct {
 	controlClient       *DAPClient // permits pause/stop to interrupt a blocking execution wait
-	eventMu             sync.Mutex
 	eventBreakpoints    map[int]dap.Breakpoint
 	eventThreads        map[int]bool
 	progress            map[string]dap.ProgressStartEventBody
 	invalidated         bool
 	cmd                 *exec.Cmd
 	client              *DAPClient
-	server              *mcp.Server      // MCP server for dynamic tool registration
-	logWriter           io.Writer        // writer for adapter stderr (log file or io.Discard)
-	backend             DebuggerBackend  // debugger-specific backend (delve, gdb, etc.)
-	backendOverride     DebuggerBackend  // deterministic adapter used by protocol tests
+	backend             DebuggerBackend
 	capabilities        dap.Capabilities // capabilities reported by DAP server
 	launchMode          string           // "source", "binary", "core", or "attach"
 	programPath         string           // path to program being debugged
@@ -38,6 +47,17 @@ type debuggerSession struct {
 	protocolLogFile     *os.File         // protocol log file (closed on cleanup)
 	functionBreakpoints []string         // tracked function breakpoints (DAP replaces all on each request)
 	lineBreakpoints     map[string][]int // tracked line breakpoints per file (DAP replaces all on each setBreakpoints call)
+}
+
+func newDebugSessionState() debugSessionState {
+	return debugSessionState{lastFrameID: -1}
+}
+
+// textResult constructs the common single-text MCP tool result.
+func textResult(text string) *mcp.CallToolResult {
+	return &mcp.CallToolResult{
+		Content: []mcp.Content{&mcp.TextContent{Text: text}},
+	}
 }
 
 func (ds *debuggerSession) handleDAPEvent(event dap.EventMessage) {
@@ -122,7 +142,11 @@ func debuggerToolAnnotations(readOnly, destructive, idempotent bool) *mcp.ToolAn
 // registerTools registers the debugger tools with the MCP server.
 // logWriter is used to redirect adapter stderr output; pass io.Discard to suppress.
 func registerTools(server *mcp.Server, logWriter io.Writer) *debuggerSession {
-	ds := &debuggerSession{server: server, logWriter: logWriter, lastFrameID: -1}
+	ds := &debuggerSession{
+		server:            server,
+		logWriter:         logWriter,
+		debugSessionState: newDebugSessionState(),
+	}
 
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "debug",
@@ -382,3 +406,5 @@ type ClearBreakpointsParams struct {
 type StopParams struct {
 	Detach bool `json:"detach,omitempty" jsonschema:"if true, detach from the process without terminating it (leaves the debuggee running); default false terminates the debuggee"`
 }
+
+// clearBreakpoints removes breakpoints.

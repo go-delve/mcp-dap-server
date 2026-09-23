@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"os"
 	"os/exec"
 	"strings"
 	"time"
@@ -134,15 +135,11 @@ func (ds *debuggerSession) pauseExecution(ctx context.Context, _ *mcp.CallToolRe
 		return nil, nil, err
 	}
 
-	return &mcp.CallToolResult{
-		Content: []mcp.Content{&mcp.TextContent{Text: "Paused execution"}},
-	}, nil, nil
+	return textResult("Paused execution"), nil, nil
 }
 
-// stop ends the debugging session.
-// If params.Detach is true, a DAP disconnect request is sent with terminateDebuggee=false
-// so the debuggee keeps running after the adapter disconnects.
 func (ds *debuggerSession) stop(ctx context.Context, _ *mcp.CallToolRequest, params StopParams) (*mcp.CallToolResult, any, error) {
+	hadSession := false
 	if !params.Detach {
 		// Ask the adapter to terminate gracefully before forcing transport
 		// closure. This path intentionally does not take ds.mu so it can
@@ -151,6 +148,7 @@ func (ds *debuggerSession) stop(ctx context.Context, _ *mcp.CallToolRequest, par
 		client := ds.controlClient
 		ds.controlMu.RUnlock()
 		if client != nil {
+			hadSession = true
 			disconnectCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 			if seq, err := client.DisconnectRequest(true); err == nil {
 				_, _ = client.waitResponseContext(disconnectCtx, seq)
@@ -163,6 +161,9 @@ func (ds *debuggerSession) stop(ctx context.Context, _ *mcp.CallToolRequest, par
 	defer ds.mu.Unlock()
 	log.Printf("stop")
 	if ds.cmd == nil && ds.client == nil {
+		if hadSession {
+			return textResult("Debug session stopped"), nil, nil
+		}
 		return &mcp.CallToolResult{
 			Content: []mcp.Content{&mcp.TextContent{Text: "No debug session active"}},
 		}, nil, nil
@@ -178,42 +179,33 @@ func (ds *debuggerSession) stop(ctx context.Context, _ *mcp.CallToolRequest, par
 				log.Printf("stop: disconnect response error: %v", err)
 			}
 		}
-		ds.cleanup()
+		ds.cleanupLocked()
 		return &mcp.CallToolResult{
 			Content: []mcp.Content{&mcp.TextContent{Text: "Detached from process (debuggee still running)"}},
 		}, nil, nil
 	}
 
-	ds.cleanup()
+	ds.cleanupLocked()
 
 	return &mcp.CallToolResult{
 		Content: []mcp.Content{&mcp.TextContent{Text: "Debug session stopped"}},
 	}, nil, nil
 }
 
-// cleanup kills the DAP adapter process and resets session state.
-// Safe to call multiple times or when no session is active.
+// cleanup serializes the common session teardown sequence. It is safe to call
+// multiple times or when no session is active.
 func (ds *debuggerSession) cleanup() {
-	ds.controlMu.Lock()
-	ds.controlClient = nil
-	ds.controlMu.Unlock()
-	if ds.client != nil {
-		ds.client.Close()
-		ds.client = nil
-	}
-	if ds.protocolLogFile != nil {
-		ds.protocolLogFile.Close()
-		ds.protocolLogFile = nil
-	}
+	ds.mu.Lock()
+	defer ds.mu.Unlock()
+	ds.cleanupLocked()
+}
 
-	if ds.cmd != nil && ds.cmd.Process != nil {
-		if err := ds.cmd.Process.Kill(); err != nil {
-			if !strings.Contains(err.Error(), "process already finished") {
-				log.Printf("cleanup: error killing debugger process: %v", err)
-			}
-		}
-		ds.cmd.Wait()
-		ds.cmd = nil
+// cleanupLocked closes the transport and logs, reaps the adapter, restores the
+// pre-session tool set, and clears all session state. The caller must hold ds.mu.
+func (ds *debuggerSession) cleanupLocked() {
+	if ds.client != nil {
+		ds.client.SetEventHandler(nil)
+		ds.client.SetProtocolLogger(nil)
 	}
 
 	// sessionToolNames uses capabilities to identify the optional tools that
@@ -221,21 +213,46 @@ func (ds *debuggerSession) cleanup() {
 	if ds.server != nil {
 		ds.unregisterSessionTools()
 	}
-	ds.launchMode = ""
-	ds.programPath = ""
-	ds.programArgs = nil
-	ds.coreFilePath = ""
-	ds.capabilities = dap.Capabilities{}
-	ds.stoppedThreadID = 0
-	ds.lastFrameID = -1
-	ds.functionBreakpoints = nil
-	ds.lineBreakpoints = nil
+
+	// Prevent control and event paths from observing a mix of old and new state.
+	ds.controlMu.Lock()
 	ds.eventMu.Lock()
-	ds.eventBreakpoints = nil
-	ds.eventThreads = nil
-	ds.progress = nil
-	ds.invalidated = false
+	state := ds.debugSessionState
+	ds.debugSessionState = newDebugSessionState()
 	ds.eventMu.Unlock()
+	ds.controlMu.Unlock()
+
+	if state.client != nil {
+		state.client.shutdown()
+	}
+	if state.protocolLogFile != nil {
+		if err := state.protocolLogFile.Close(); err != nil {
+			log.Printf("cleanup: error closing protocol log: %v", err)
+		}
+	}
+	if state.cmd != nil && state.cmd.Process != nil {
+		if err := state.cmd.Process.Kill(); err != nil {
+			if !errors.Is(err, os.ErrProcessDone) {
+				log.Printf("cleanup: error killing debugger process: %v", err)
+			}
+		}
+		state.cmd.Wait()
+	}
+}
+
+// handleClientEnd runs the shared teardown when a debuggee terminates or the
+// adapter transport closes. The client identity check prevents a delayed
+// callback from tearing down a newer session.
+func (ds *debuggerSession) handleClientEnd(client *DAPClient, err error) {
+	ds.mu.Lock()
+	defer ds.mu.Unlock()
+	if ds.client != client {
+		return
+	}
+	if err != nil {
+		log.Printf("DAP connection closed: %v", err)
+	}
+	ds.cleanupLocked()
 }
 
 // debug starts a complete debugging session.
@@ -244,7 +261,7 @@ func (ds *debuggerSession) debug(ctx context.Context, _ *mcp.CallToolRequest, pa
 	ds.mu.Lock()
 	defer ds.mu.Unlock()
 	// Clean up any existing session before starting a new one
-	ds.cleanup()
+	ds.cleanupLocked()
 
 	// Default port
 	port := params.Port
@@ -330,14 +347,14 @@ func (ds *debuggerSession) debug(ctx context.Context, _ *mcp.CallToolRequest, pa
 	ds.cmd = cmd
 	defer func() {
 		if err != nil {
-			ds.cleanup()
+			ds.cleanupLocked()
 		}
 	}()
 
 	// Connect DAP client based on transport mode
 	switch ds.backend.TransportMode() {
 	case "tcp":
-		client, err := newDAPClient(listenAddr)
+		client, err := dialDAPClient(listenAddr, ds.handleClientEnd)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -347,17 +364,18 @@ func (ds *debuggerSession) debug(ctx context.Context, _ *mcp.CallToolRequest, pa
 		if stdout == nil || stdin == nil {
 			return nil, nil, fmt.Errorf("stdio backend did not provide both protocol pipes")
 		}
-		ds.client = newDAPClientFromRWC(&readWriteCloser{
+		ds.client = newDAPClient(&readWriteCloser{
 			Reader:      stdout,
 			WriteCloser: stdin,
-		})
+		}, ds.handleClientEnd)
 	default:
 		return nil, nil, fmt.Errorf("unsupported transport mode: %s", ds.backend.TransportMode())
 	}
 	ds.controlMu.Lock()
 	ds.controlClient = ds.client
 	ds.controlMu.Unlock()
-	ds.client.SetEventHandler(ds.handleDAPEvent)
+	client := ds.client
+	client.SetEventHandler(ds.handleDAPEvent)
 
 	// Protocol-level DAP message logging
 	if params.ProtocolLog != "" {
@@ -568,7 +586,7 @@ initialized:
 				ds.stoppedThreadID = ev.Body.ThreadId
 				stopped = ev
 			case *dap.TerminatedEvent:
-				ds.cleanup()
+				ds.cleanupLocked()
 				return &mcp.CallToolResult{
 					Content: []mcp.Content{&mcp.TextContent{Text: "Program terminated before reaching a breakpoint."}},
 				}, nil, nil
@@ -628,7 +646,7 @@ initialized:
 	return result, nil, nil
 }
 
-// step executes a step command and returns the full context at the new location.
+// context returns the full debugging context at the current location.
 func (ds *debuggerSession) step(ctx context.Context, _ *mcp.CallToolRequest, params StepParams) (*mcp.CallToolResult, any, error) {
 	ds.mu.Lock()
 	defer ds.mu.Unlock()
@@ -826,7 +844,7 @@ func (ds *debuggerSession) waitForStopOrTermination(ctx context.Context, request
 			// A terminated debuggee cannot service any more session tools. Tear
 			// down the adapter and restore the debug tool just as an explicit
 			// stop does, rather than leaving a stale session behind.
-			ds.cleanup()
+			ds.cleanupLocked()
 			return result, nil
 		}
 		if responseSeen && stopped != nil {
@@ -875,3 +893,7 @@ func stopSummary(full *mcp.CallToolResult, reason string) *mcp.CallToolResult {
 		Content: []mcp.Content{&mcp.TextContent{Text: summary.String()}},
 	}
 }
+
+// writeScopesAndVariables fetches scopes and their variables for the given
+// frame and writes them to the result builder. Errors are written inline
+// rather than propagated, since partial context is better than none.

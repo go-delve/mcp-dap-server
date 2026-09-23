@@ -565,10 +565,12 @@ func TestRestartUsesSavedLaunchArguments(t *testing.T) {
 	defer client.Close()
 
 	ds := &debuggerSession{
-		client:      client,
-		backend:     &delveBackend{},
-		launchMode:  "binary",
-		programPath: "/tmp/program",
+		debugSessionState: debugSessionState{
+			client:      client,
+			backend:     &delveBackend{},
+			launchMode:  "binary",
+			programPath: "/tmp/program",
+		},
 	}
 	requestArgs := make(chan map[string]any, 1)
 	serverErr := make(chan error, 1)

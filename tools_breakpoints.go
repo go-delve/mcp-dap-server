@@ -109,8 +109,6 @@ func (ds *debuggerSession) clearAllLineBreakpoints(ctx context.Context) error {
 	}
 	return nil
 }
-
-// clearBreakpoints removes breakpoints.
 func (ds *debuggerSession) clearBreakpoints(ctx context.Context, _ *mcp.CallToolRequest, params ClearBreakpointsParams) (*mcp.CallToolResult, any, error) {
 	ds.mu.Lock()
 	defer ds.mu.Unlock()
@@ -127,9 +125,7 @@ func (ds *debuggerSession) clearBreakpoints(ctx context.Context, _ *mcp.CallTool
 		if err := ds.clearFunctionBreakpoints(ctx); err != nil {
 			return nil, nil, err
 		}
-		return &mcp.CallToolResult{
-			Content: []mcp.Content{&mcp.TextContent{Text: "Cleared all breakpoints"}},
-		}, nil, nil
+		return textResult("Cleared all breakpoints"), nil, nil
 	}
 
 	if params.Function != "" {
@@ -138,13 +134,9 @@ func (ds *debuggerSession) clearBreakpoints(ctx context.Context, _ *mcp.CallTool
 			return nil, nil, err
 		}
 		if !removed {
-			return &mcp.CallToolResult{
-				Content: []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf("No function breakpoint set on: %s", params.Function)}},
-			}, nil, nil
+			return textResult(fmt.Sprintf("No function breakpoint set on: %s", params.Function)), nil, nil
 		}
-		return &mcp.CallToolResult{
-			Content: []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf("Cleared function breakpoint: %s", params.Function)}},
-		}, nil, nil
+		return textResult(fmt.Sprintf("Cleared function breakpoint: %s", params.Function)), nil, nil
 	}
 
 	if params.File != "" {
@@ -172,8 +164,6 @@ func (ds *debuggerSession) clearBreakpoints(ctx context.Context, _ *mcp.CallTool
 
 	return nil, nil, fmt.Errorf("specify 'file' (optionally with 'line'), 'function', or 'all'")
 }
-
-// breakpoint sets a breakpoint at the specified location.
 func (ds *debuggerSession) breakpoint(ctx context.Context, _ *mcp.CallToolRequest, params BreakpointToolParams) (*mcp.CallToolResult, any, error) {
 	ds.mu.Lock()
 	defer ds.mu.Unlock()
