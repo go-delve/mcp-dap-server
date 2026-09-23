@@ -75,7 +75,14 @@ jobs:
           path: ${{ runner.temp }}/delve-mutation
 
   gdb-integration:
-    runs-on: ubuntu-latest
+    # GDB 15 (24.04) runs launch immediately; GDB 16+ (26.04 ships 17.x) defers
+    # it until configurationDone. Both DAP orderings must keep working.
+    name: gdb-integration (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-26.04]
     steps:
       - uses: actions/checkout@v4
 
@@ -110,5 +117,5 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: gdb-mutation-report
+          name: gdb-mutation-report-${{ matrix.os }}
           path: ${{ runner.temp }}/gdb-mutation
