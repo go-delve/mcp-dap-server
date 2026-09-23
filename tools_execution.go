@@ -394,10 +394,11 @@ func (ds *debuggerSession) debug(ctx context.Context, _ *mcp.CallToolRequest, pa
 			return nil, nil, err
 		}
 		sendLaunch = func() (int, error) {
-			req := ds.client.newRequest("launch")
-			request := &dap.LaunchRequest{Request: *req}
-			request.Arguments = toRawMessage(launchArgs)
-			return req.Seq, ds.client.send(request)
+			return ds.client.issueRequest("launch", func(req *dap.Request) dap.Message {
+				request := &dap.LaunchRequest{Request: *req}
+				request.Arguments = toRawMessage(launchArgs)
+				return request
+			})
 		}
 	case "core":
 		coreArgs, err := ds.backend.CoreArgs(params.Path, params.CoreFilePath)
@@ -410,11 +411,12 @@ func (ds *debuggerSession) debug(ctx context.Context, _ *mcp.CallToolRequest, pa
 			return nil, nil, fmt.Errorf("unsupported core request type: %s", ds.backend.CoreRequestType())
 		}
 		sendLaunch = func() (int, error) {
-			req := ds.client.newRequest(requestType)
-			if requestType == "attach" {
-				return req.Seq, ds.client.send(&dap.AttachRequest{Request: *req, Arguments: rawArgs})
-			}
-			return req.Seq, ds.client.send(&dap.LaunchRequest{Request: *req, Arguments: rawArgs})
+			return ds.client.issueRequest(requestType, func(req *dap.Request) dap.Message {
+				if requestType == "attach" {
+					return &dap.AttachRequest{Request: *req, Arguments: rawArgs}
+				}
+				return &dap.LaunchRequest{Request: *req, Arguments: rawArgs}
+			})
 		}
 	case "attach":
 		attachArgs, err := ds.backend.AttachArgs(params.ProcessID)
@@ -422,10 +424,11 @@ func (ds *debuggerSession) debug(ctx context.Context, _ *mcp.CallToolRequest, pa
 			return nil, nil, err
 		}
 		sendLaunch = func() (int, error) {
-			req := ds.client.newRequest("attach")
-			request := &dap.AttachRequest{Request: *req}
-			request.Arguments = toRawMessage(attachArgs)
-			return req.Seq, ds.client.send(request)
+			return ds.client.issueRequest("attach", func(req *dap.Request) dap.Message {
+				request := &dap.AttachRequest{Request: *req}
+				request.Arguments = toRawMessage(attachArgs)
+				return request
+			})
 		}
 	}
 	launchAfterConfiguration := ds.backend.LaunchAfterConfiguration()
