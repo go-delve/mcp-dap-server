@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -198,6 +199,7 @@ type gdbBackend struct {
 	toolLogPath string // path for GDB's native DAP log file
 	stdin       io.WriteCloser
 	stdout      io.ReadCloser
+	majorVer    int // GDB major version detected in Spawn; 0 if unknown
 }
 
 // Spawn starts GDB in native DAP mode over stdio.
@@ -219,6 +221,7 @@ func (g *gdbBackend) Spawn(port string, stderrWriter io.Writer) (*exec.Cmd, stri
 		}
 		args = append([]string{"-iex", "set debug dap-log-file " + g.toolLogPath}, args...)
 	}
+	g.majorVer = detectGDBMajorVersion(gdbPath)
 	cmd := exec.Command(gdbPath, args...)
 	cmd.Stderr = stderrWriter
 
@@ -262,8 +265,32 @@ func (g *gdbBackend) StdioPipes() (stdout io.ReadCloser, stdin io.WriteCloser) {
 	return g.stdout, g.stdin
 }
 
+// LaunchAfterConfiguration is true only for GDB 14/15, where configurationDone
+// is a no-op and launch runs immediately. GDB 16+ defers launch until
+// configurationDone and rejects it ("launch or attach not specified") unless a
+// launch is already pending, so the order there must be launch first. An
+// unknown version is treated as modern.
 func (g *gdbBackend) LaunchAfterConfiguration() bool {
-	return true
+	return g.majorVer > 0 && g.majorVer < 16
+}
+
+// detectGDBMajorVersion parses the major version from `gdb --version`.
+func detectGDBMajorVersion(gdbPath string) int {
+	out, err := exec.Command(gdbPath, "--version").Output()
+	if err != nil {
+		return 0
+	}
+	line, _, _ := strings.Cut(string(out), "\n")
+	for _, f := range strings.Fields(line) {
+		major, _, ok := strings.Cut(f, ".")
+		if !ok {
+			continue
+		}
+		if n, err := strconv.Atoi(major); err == nil {
+			return n
+		}
+	}
+	return 0
 }
 
 // LaunchArgs builds the GDB native DAP argument map for a DAP LaunchRequest.
