@@ -57,6 +57,18 @@ func (ds *debuggerSession) observeState(event dap.EventMessage) {
 	}
 }
 
+// markRunning records that the adapter accepted a resume/continue. It keeps the
+// published state accurate for adapters that acknowledge a continue but do not
+// emit a ContinuedEvent (Delve is one).
+func (ds *debuggerSession) markRunning() {
+	ds.eventMu.Lock()
+	ds.dbgSeq++
+	ds.dbgState = dbgStateRunning
+	ds.stoppedSince = time.Time{}
+	ds.observedAt = time.Now()
+	ds.eventMu.Unlock()
+}
+
 // debugStateView is the wire shape returned to a supervising client. It carries
 // no memory, expression, variable, environment, or diagnostic content.
 type debugStateView struct {
@@ -159,5 +171,6 @@ func (ds *debuggerSession) resume(ctx context.Context, _ *mcp.CallToolRequest, p
 	if resp := msg.(dap.ResponseMessage).GetResponse(); !resp.Success {
 		return nil, nil, fmt.Errorf("unable to resume: %s", resp.Message)
 	}
+	ds.markRunning()
 	return textResult("Resumed"), nil, nil
 }
