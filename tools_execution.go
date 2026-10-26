@@ -413,6 +413,17 @@ func (ds *debuggerSession) debug(ctx context.Context, _ *mcp.CallToolRequest, pa
 
 	// Store session state
 	ds.launchMode = mode
+	// Start a new debugger generation and reset the published state. The
+	// generation is how a stale event or control request is rejected.
+	ds.eventMu.Lock()
+	ds.generation = int(sessionGeneration.Add(1))
+	ds.dbgMode = mode
+	ds.dbgState = dbgStateUnknown
+	ds.dbgSeq = 0
+	ds.stoppedSince = time.Time{}
+	ds.stopEpisode = 0
+	ds.observedAt = time.Time{}
+	ds.eventMu.Unlock()
 	ds.programPath = params.Path
 	ds.programArgs = params.Args
 	ds.coreFilePath = params.CoreFilePath

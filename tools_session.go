@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"sync"
+	"time"
 
 	"github.com/google/go-dap"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -47,6 +48,20 @@ type debugSessionState struct {
 	protocolLogFile     *os.File         // protocol log file (closed on cleanup)
 	functionBreakpoints []string         // tracked function breakpoints (DAP replaces all on each request)
 	lineBreakpoints     map[string][]int // tracked line breakpoints per file (DAP replaces all on each setBreakpoints call)
+
+	// Debug-state feed, observed from real DAP events by the read loop before
+	// any waiter processes the event. A supervising client polls it and can
+	// issue an independent resume; it never substitutes for the client's policy.
+	generation   int       // changes on every new backend/session
+	dbgMode      string    // "source" | "binary" | "core" | "attach"
+	dbgState     string    // "unknown" | "running" | "stopped" | "ended"
+	dbgSeq       uint64    // ordered, monotonically increasing state sequence
+	stoppedSince time.Time // when the current stop episode began (zero if running)
+	stopEpisode  uint64    // increments on each new stop episode
+	stopReason   string    // whitelisted DAP stop reason (e.g. "breakpoint")
+	stopThread   int
+	stopAll      bool // AllThreadsStopped for the current stop / continue
+	observedAt   time.Time
 }
 
 func newDebugSessionState() debugSessionState {
@@ -63,6 +78,7 @@ func textResult(text string) *mcp.CallToolResult {
 func (ds *debuggerSession) handleDAPEvent(event dap.EventMessage) {
 	ds.eventMu.Lock()
 	defer ds.eventMu.Unlock()
+	ds.observeState(event)
 	switch event := event.(type) {
 	case *dap.BreakpointEvent:
 		if ds.eventBreakpoints == nil {
@@ -169,6 +185,10 @@ func (ds *debuggerSession) sessionToolNames() []string {
 		"context",
 		"evaluate",
 		"info",
+		// Supervisor-only controls. The consumer must withhold these from the
+		// model; they are listed here only so session teardown removes them.
+		"get-debug-state",
+		"resume",
 	}
 
 	// Capability-gated tools
@@ -240,6 +260,20 @@ Modes: 'over' (execute current line, step over function calls), 'in' (step into 
 
 Call with {} (no arguments) to use the current thread and top frame. Only three optional parameters exist: threadId, frameId, maxFrames. Do NOT pass any other parameters. Use 'info' with type 'threads' to discover valid thread IDs.`,
 	}, ds.context)
+
+	// Supervisor-only controls: an authoritative stop-state feed and an
+	// independent resume that does not queue behind ds.mu. The MCP client is
+	// responsible for withholding these from any model it drives.
+	mcp.AddTool(ds.server, &mcp.Tool{
+		Name:        "get-debug-state",
+		Description: "Supervisor-only. Return the authoritative debugger state: generation, ordered sequence, stopped/running/ended/unknown, mode, continuous stopped duration, reason and thread. Not a model tool.",
+		Annotations: debuggerToolAnnotations(true, false, true),
+	}, ds.getDebugState)
+	mcp.AddTool(ds.server, &mcp.Tool{
+		Name:        "resume",
+		Description: "Supervisor-only. Continue a stopped live target independently of ordinary calls; never terminates the debuggee. Pass the generation from get-debug-state to reject stale requests. Not a model tool.",
+		Annotations: debuggerToolAnnotations(false, false, false),
+	}, ds.resume)
 	mcp.AddTool(ds.server, &mcp.Tool{
 		Name:        "evaluate",
 		Annotations: debuggerToolAnnotations(false, true, false),
