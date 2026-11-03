@@ -57,16 +57,31 @@ func (ds *debuggerSession) observeState(event dap.EventMessage) {
 	}
 }
 
-// markRunning records that the adapter accepted a resume/continue. It keeps the
-// published state accurate for adapters that acknowledge a continue but do not
-// emit a ContinuedEvent (Delve is one).
-func (ds *debuggerSession) markRunning() {
+// executionAcknowledgement captures the session and stop episode before an
+// execution request is sent. Its callback runs in the DAP read loop, so an
+// acknowledgement cannot race a later event. A stop that arrives before the
+// response also wins, as does replacement of the session while it is in flight.
+func (ds *debuggerSession) executionAcknowledgement(generation int) func() {
 	ds.eventMu.Lock()
-	ds.dbgSeq++
-	ds.dbgState = dbgStateRunning
-	ds.stoppedSince = time.Time{}
-	ds.observedAt = time.Now()
+	if ds.generation != generation {
+		ds.eventMu.Unlock()
+		return nil
+	}
+	episode := ds.stopEpisode
 	ds.eventMu.Unlock()
+	return func() {
+		ds.eventMu.Lock()
+		defer ds.eventMu.Unlock()
+		if ds.generation != generation || ds.stopEpisode != episode ||
+			ds.dbgState == dbgStateEnded || ds.dbgState == dbgStateRunning {
+			return
+		}
+		ds.dbgSeq++
+		ds.dbgState = dbgStateRunning
+		ds.stoppedSince = time.Time{}
+		ds.stopAll = false
+		ds.observedAt = time.Now()
+	}
 }
 
 // debugStateView is the wire shape returned to a supervising client. It carries
@@ -132,9 +147,15 @@ type ResumeParams struct {
 // while an ordinary tool call is blocked holding that lock. It never terminates
 // the debuggee and refuses core inspection (which has no running target).
 func (ds *debuggerSession) resume(ctx context.Context, _ *mcp.CallToolRequest, params ResumeParams) (*mcp.CallToolResult, any, error) {
+	// Snapshot the control client and its generation together. A replacement
+	// after this point may close this client, but cannot redirect the request
+	// to the replacement session.
+	ds.controlMu.RLock()
 	ds.eventMu.Lock()
 	gen, state, mode, thread := ds.generation, ds.dbgState, ds.dbgMode, ds.stopThread
+	client := ds.controlClient
 	ds.eventMu.Unlock()
+	ds.controlMu.RUnlock()
 
 	if params.Generation != 0 && params.Generation != gen {
 		return nil, nil, fmt.Errorf("stale generation %d: current is %d", params.Generation, gen)
@@ -152,9 +173,6 @@ func (ds *debuggerSession) resume(ctx context.Context, _ *mcp.CallToolRequest, p
 		thread = 1
 	}
 
-	ds.controlMu.RLock()
-	client := ds.controlClient
-	ds.controlMu.RUnlock()
 	if client == nil {
 		return nil, nil, fmt.Errorf("debugger not started")
 	}
@@ -171,6 +189,5 @@ func (ds *debuggerSession) resume(ctx context.Context, _ *mcp.CallToolRequest, p
 	if resp := msg.(dap.ResponseMessage).GetResponse(); !resp.Success {
 		return nil, nil, fmt.Errorf("unable to resume: %s", resp.Message)
 	}
-	ds.markRunning()
 	return textResult("Resumed"), nil, nil
 }

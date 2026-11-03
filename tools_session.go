@@ -78,6 +78,19 @@ func textResult(text string) *mcp.CallToolResult {
 func (ds *debuggerSession) handleDAPEvent(event dap.EventMessage) {
 	ds.eventMu.Lock()
 	defer ds.eventMu.Unlock()
+	ds.handleDAPEventLocked(event)
+}
+
+func (ds *debuggerSession) handleDAPEventForGeneration(generation int, event dap.EventMessage) {
+	ds.eventMu.Lock()
+	defer ds.eventMu.Unlock()
+	if ds.generation != generation {
+		return
+	}
+	ds.handleDAPEventLocked(event)
+}
+
+func (ds *debuggerSession) handleDAPEventLocked(event dap.EventMessage) {
 	ds.observeState(event)
 	switch event := event.(type) {
 	case *dap.BreakpointEvent:

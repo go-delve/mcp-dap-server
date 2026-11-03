@@ -28,13 +28,20 @@ Semantics:
 - `generation` changes on every new backend/session; a stale value is rejected
   by control requests.
 - `seq` is an ordered, monotonically increasing state sequence.
-- The state is folded from **real DAP events** by the client's single read loop,
-  *before* the event is queued for waiters, so stop state is published before
-  any expensive stack/variable/context gathering.
+- The state is folded from **real DAP events and successful execution
+  acknowledgements** by the client's single read loop, *before* the message is
+  queued for waiters, so stop state is published before any expensive
+  stack/variable/context gathering.
 - `StoppedEvent` -> stopped (records `stopped_since`, `stop_episode`, reason,
   thread, all-threads flag); `ContinuedEvent` -> running; `TerminatedEvent` ->
   ended. A `ThreadEvent` never changes the aggregate state, so a single thread
   event cannot falsely mark the whole process running.
+- Successful `continue`, `next`, `stepIn`, and `stepOut` responses also publish
+  running, including ordinary tool calls and startup continues. This covers
+  adapters such as Delve that do not emit `ContinuedEvent`. An acknowledgement
+  is bound to the generation and stop episode at request dispatch: it never
+  overwrites a newer stop, termination, or replacement session. Events from an
+  old generation are also ignored.
 - `stopped_ms` is the continuous stopped duration from the MCP server's own
   clock; it is a same-process duration, not a cross-host wall-clock comparison.
 - The payload never carries memory, expressions, variable values, environment,
@@ -53,8 +60,7 @@ Supervisor-only. Continues a stopped live target:
   response by `request_seq`).
 - Rejects a stale `generation`; rejects core mode (no running target); rejects a
   target that is not stopped.
-- Never terminates the debuggee. Detach remains `stop {detach:true}`, which also
-  runs without the ordinary mutex.
+- Never terminates the debuggee. Detach remains `stop {detach:true}`.
 
 ## Consumer responsibility
 

@@ -644,4 +644,26 @@ func TestDebugAttachStopsOnEntryWithoutBreakpoints(t *testing.T) {
 	if got := textContent(result); !strings.HasPrefix(got, "Stopped: entry\nFunction: main.main\n") {
 		t.Fatalf("startup result = %q", got)
 	}
+
+	// Exercise the observers installed by debug, not just a manually wired
+	// client: Delve's continue acknowledgement must publish running without
+	// waiting for a ContinuedEvent or for the ordinary tool to return.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		_, _, err := ds.continueExecution(ctx, nil, ContinueParams{})
+		done <- err
+	}()
+	req := readControlTestRequest(t, adapterConn, "continue")
+	writeControlTestMessages(t, adapterConn, &dap.ContinueResponse{Response: dap.Response{
+		ProtocolMessage: protocolMessage(7, "response"), RequestSeq: req.Seq, Success: true, Command: "continue",
+	}})
+	waitControlTestBarrier(t, ds.client, adapterConn)
+	state := ds.debugStateSnapshot()
+	cancel()
+	<-done
+	if state.State != dbgStateRunning || state.StoppedMs != 0 {
+		t.Fatalf("ordinary continue after debug: %+v, want running", state)
+	}
 }

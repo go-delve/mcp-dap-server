@@ -41,12 +41,17 @@ type DAPClient struct {
 	sendMu    sync.Mutex
 	handlerMu sync.RWMutex
 	onEvent   func(dap.EventMessage)
-	onEnd     func(*DAPClient, error)
-	inboxMu   sync.Mutex
-	inbox     []dap.Message
-	readErr   error
-	notify    chan struct{}
-	seq       int
+	// onExecution captures session state before an execution request is sent
+	// and returns a callback for its successful acknowledgement. The read loop
+	// invokes that callback before publishing the response to any waiter.
+	onExecution   func() func()
+	onEnd         func(*DAPClient, error)
+	inboxMu       sync.Mutex
+	inbox         []dap.Message
+	executionAcks map[int]func() // protected by inboxMu
+	readErr       error
+	notify        chan struct{}
+	seq           int
 }
 
 const maxDAPInboxMessages = 4096
@@ -123,6 +128,12 @@ func (c *DAPClient) SetEventHandler(handler func(dap.EventMessage)) {
 	c.onEvent = handler
 }
 
+func (c *DAPClient) SetExecutionObserver(observer func() func()) {
+	c.handlerMu.Lock()
+	defer c.handlerMu.Unlock()
+	c.onExecution = observer
+}
+
 // InitializeRequest sends an 'initialize' request and returns the server's capabilities.
 func (c *DAPClient) InitializeRequest(adapterID string) (dap.Capabilities, error) {
 	return c.InitializeRequestContext(context.Background(), adapterID)
@@ -171,6 +182,16 @@ func (c *DAPClient) readLoop() {
 				}
 			}
 			c.sendMu.Unlock()
+			if response, ok := msg.(dap.ResponseMessage); ok {
+				r := response.GetResponse()
+				c.inboxMu.Lock()
+				ack := c.executionAcks[r.RequestSeq]
+				delete(c.executionAcks, r.RequestSeq)
+				c.inboxMu.Unlock()
+				if r.Success && ack != nil {
+					ack()
+				}
+			}
 			if event, ok := msg.(dap.EventMessage); ok {
 				c.handlerMu.RLock()
 				handler := c.onEvent
@@ -323,12 +344,34 @@ func (c *DAPClient) issueRequest(command string, build func(*dap.Request) dap.Me
 	request := &dap.Request{ProtocolMessage: dap.ProtocolMessage{Seq: c.seq, Type: "request"}, Command: command}
 	c.seq++
 	message := build(request)
+	switch command {
+	case "continue", "next", "stepIn", "stepOut":
+		c.handlerMu.RLock()
+		observer := c.onExecution
+		c.handlerMu.RUnlock()
+		if observer != nil {
+			if ack := observer(); ack != nil {
+				c.inboxMu.Lock()
+				if c.executionAcks == nil {
+					c.executionAcks = make(map[int]func())
+				}
+				c.executionAcks[request.Seq] = ack
+				c.inboxMu.Unlock()
+			}
+		}
+	}
 	if c.logWriter != nil {
 		if data, err := json.Marshal(message); err == nil {
 			fmt.Fprintf(c.logWriter, "SENT: <<<%s>>>\n", data)
 		}
 	}
-	return request.Seq, dap.WriteProtocolMessage(c.rwc, message)
+	err := dap.WriteProtocolMessage(c.rwc, message)
+	if err != nil {
+		c.inboxMu.Lock()
+		delete(c.executionAcks, request.Seq)
+		c.inboxMu.Unlock()
+	}
+	return request.Seq, err
 }
 
 // newRequest creates a new DAP request for compatibility with callers that

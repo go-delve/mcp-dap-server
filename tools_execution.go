@@ -206,6 +206,7 @@ func (ds *debuggerSession) cleanup() {
 func (ds *debuggerSession) cleanupLocked() {
 	if ds.client != nil {
 		ds.client.SetEventHandler(nil)
+		ds.client.SetExecutionObserver(nil)
 		ds.client.SetProtocolLogger(nil)
 	}
 
@@ -393,7 +394,20 @@ func (ds *debuggerSession) debug(ctx context.Context, _ *mcp.CallToolRequest, pa
 	ds.controlClient = ds.client
 	ds.controlMu.Unlock()
 	client := ds.client
-	client.SetEventHandler(ds.handleDAPEvent)
+	// Bind both event and acknowledgement observations to this generation
+	// before the adapter can start the target.
+	ds.eventMu.Lock()
+	ds.generation = int(sessionGeneration.Add(1))
+	generation := ds.generation
+	ds.dbgMode = mode
+	ds.dbgState = dbgStateUnknown
+	ds.eventMu.Unlock()
+	client.SetEventHandler(func(event dap.EventMessage) {
+		ds.handleDAPEventForGeneration(generation, event)
+	})
+	client.SetExecutionObserver(func() func() {
+		return ds.executionAcknowledgement(generation)
+	})
 
 	// Protocol-level DAP message logging
 	if params.ProtocolLog != "" {
@@ -413,17 +427,6 @@ func (ds *debuggerSession) debug(ctx context.Context, _ *mcp.CallToolRequest, pa
 
 	// Store session state
 	ds.launchMode = mode
-	// Start a new debugger generation and reset the published state. The
-	// generation is how a stale event or control request is rejected.
-	ds.eventMu.Lock()
-	ds.generation = int(sessionGeneration.Add(1))
-	ds.dbgMode = mode
-	ds.dbgState = dbgStateUnknown
-	ds.dbgSeq = 0
-	ds.stoppedSince = time.Time{}
-	ds.stopEpisode = 0
-	ds.observedAt = time.Time{}
-	ds.eventMu.Unlock()
 	ds.programPath = params.Path
 	ds.programArgs = params.Args
 	ds.coreFilePath = params.CoreFilePath
