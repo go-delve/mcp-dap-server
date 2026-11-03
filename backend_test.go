@@ -1,8 +1,10 @@
 package main
 
 import (
+	"fmt"
 	"io"
 	"os/exec"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -103,15 +105,40 @@ func TestDelveBackendCoreArgs(t *testing.T) {
 
 func TestDelveBackendAttachArgs(t *testing.T) {
 	backend := &delveBackend{}
-	args, err := backend.AttachArgs(12345)
+	for _, stopOnEntry := range []bool{true, false} {
+		t.Run(fmt.Sprintf("stopOnEntry=%t", stopOnEntry), func(t *testing.T) {
+			args, err := backend.AttachArgs(12345, "", stopOnEntry)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			want := map[string]any{
+				"request":     "attach",
+				"mode":        "local",
+				"processId":   12345,
+				"stopOnEntry": stopOnEntry,
+			}
+			if !reflect.DeepEqual(args, want) {
+				t.Errorf("unexpected attach args: got %#v, want %#v", args, want)
+			}
+		})
+	}
+}
+
+func TestDelveBackendAttachArgsWithProgramPath(t *testing.T) {
+	backend := &delveBackend{}
+	args, err := backend.AttachArgs(12345, "/proc/12345/exe", true)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if args["mode"] != "local" {
-		t.Errorf("expected mode 'local', got: %v", args["mode"])
+	want := map[string]any{
+		"request":     "attach",
+		"mode":        "local",
+		"processId":   12345,
+		"stopOnEntry": true,
+		"program":     "/proc/12345/exe",
 	}
-	if args["processId"] != 12345 {
-		t.Errorf("expected processId 12345, got: %v", args["processId"])
+	if !reflect.DeepEqual(args, want) {
+		t.Errorf("unexpected attach args: got %#v, want %#v", args, want)
 	}
 }
 
@@ -194,12 +221,65 @@ func TestGDBBackendCoreArgs(t *testing.T) {
 
 func TestGDBBackendAttachArgs(t *testing.T) {
 	backend := &gdbBackend{gdbPath: "gdb"}
-	args, err := backend.AttachArgs(12345)
+	// GDB always stops an attached inferior, so stopOnEntry is not sent.
+	args, err := backend.AttachArgs(12345, "", false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if args["pid"] != 12345 {
-		t.Errorf("expected pid 12345, got: %v", args["pid"])
+	want := map[string]any{"pid": 12345}
+	if !reflect.DeepEqual(args, want) {
+		t.Errorf("unexpected attach args: got %#v, want %#v", args, want)
+	}
+}
+
+func TestGDBBackendAttachArgsWithProgramPath(t *testing.T) {
+	backend := &gdbBackend{gdbPath: "gdb"}
+	args, err := backend.AttachArgs(12345, "/proc/12345/exe", false)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want := map[string]any{"pid": 12345, "program": "/proc/12345/exe"}
+	if !reflect.DeepEqual(args, want) {
+		t.Errorf("unexpected attach args: got %#v, want %#v", args, want)
+	}
+}
+
+func TestGDBStartupArgsWithSysroot(t *testing.T) {
+	got := gdbStartupArgs("/proc/12345/root")
+	want := []string{"-iex", "set sysroot /proc/12345/root", "-nx", "-iex", "set auto-load off", "-i", "dap"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("unexpected startup args: got %#v, want %#v", got, want)
+	}
+}
+
+func TestGDBStartupArgsWithoutSysroot(t *testing.T) {
+	got := gdbStartupArgs("")
+	want := []string{"-nx", "-iex", "set auto-load off", "-i", "dap"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("unexpected startup args: got %#v, want %#v", got, want)
+	}
+}
+
+func TestGDBTargetSysroot(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		goos      string
+		mode      string
+		processID int
+		want      string
+	}{
+		{name: "linux attach", goos: "linux", mode: "attach", processID: 12345, want: "/proc/12345/root"},
+		{name: "linux launch", goos: "linux", mode: "binary", processID: 0, want: ""},
+		{name: "linux core with pid", goos: "linux", mode: "core", processID: 12345, want: "/proc/12345/root"},
+		{name: "linux core without pid", goos: "linux", mode: "core", processID: 0, want: ""},
+		{name: "linux attach without pid", goos: "linux", mode: "attach", processID: 0, want: ""},
+		{name: "darwin attach", goos: "darwin", mode: "attach", processID: 12345, want: ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := gdbTargetSysroot(tc.goos, tc.mode, tc.processID); got != tc.want {
+				t.Errorf("gdbTargetSysroot(%q, %q, %d) = %q, want %q", tc.goos, tc.mode, tc.processID, got, tc.want)
+			}
+		})
 	}
 }
 

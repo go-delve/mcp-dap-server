@@ -319,10 +319,10 @@ type BreakpointSpec struct {
 // DebugParams defines the parameters for starting a complete debug session.
 type DebugParams struct {
 	Mode         string           `json:"mode" jsonschema:"'source' (compile & debug), 'binary' (debug executable), 'core' (debug core dump), or 'attach' (connect to process)"`
-	Path         string           `json:"path,omitempty" jsonschema:"program path (required for source/binary modes; optional for core mode with GDB, which can auto-detect it)"`
+	Path         string           `json:"path,omitempty" jsonschema:"program path (required for source/binary modes; optional for core mode with GDB, which can auto-detect it; optional for attach mode, where it names the process executable)"`
 	Args         []string         `json:"args,omitempty" jsonschema:"command line arguments for the program"`
 	CoreFilePath string           `json:"coreFilePath,omitempty" jsonschema:"path to core dump file (required for core mode)"`
-	ProcessID    int              `json:"processId,omitempty" jsonschema:"process ID (required for attach mode)"`
+	ProcessID    int              `json:"processId,omitempty" jsonschema:"process ID (required for attach mode; optional for core mode with GDB: the live process the core was taken from, whose filesystem provides shared libraries)"`
 	Breakpoints  []BreakpointSpec `json:"breakpoints,omitempty" jsonschema:"initial breakpoints"`
 	StopOnEntry  bool             `json:"stopOnEntry,omitempty" jsonschema:"stop at program entry (main function) instead of running to first breakpoint"`
 	Port         string           `json:"port,omitempty" jsonschema:"port for DAP server (default: auto-assigned)"`

@@ -2671,3 +2671,433 @@ func TestStopOnEntry(t *testing.T) {
 
 	ts.stopDebugger(t)
 }
+
+// requireAttachPermission skips attach tests on hosts where the test process
+// cannot let a sibling dlv process ptrace the target it started.
+func requireAttachPermission(t *testing.T) {
+	t.Helper()
+	if runtime.GOOS != "linux" {
+		// macOS requires developer-mode authorization to attach to a
+		// non-child process, which cannot be granted non-interactively.
+		t.Skipf("attach integration tests are only supported on linux, not %s", runtime.GOOS)
+	}
+	data, err := os.ReadFile("/proc/sys/kernel/yama/ptrace_scope")
+	if err != nil {
+		// Yama is not enabled; classic ptrace permission checks apply.
+		return
+	}
+	scope := strings.TrimSpace(string(data))
+	if scope == "0" || (scope == "1" && os.Geteuid() == 0) {
+		return
+	}
+	t.Skipf("kernel.yama.ptrace_scope=%s prevents dlv from attaching to a non-descendant process; run 'sudo sysctl -w kernel.yama.ptrace_scope=0' to enable this test", scope)
+}
+
+// startAttachTarget starts the loop test program and returns its PID and
+// source file. See startAttachTargetBinary for cleanup.
+func startAttachTarget(t *testing.T, ts *testSetup) (pid int, sourceFile string) {
+	t.Helper()
+	binaryPath, cleanupBinary := compileTestProgram(t, ts.cwd, "loop")
+	t.Cleanup(cleanupBinary)
+	return startAttachTargetBinary(t, ts, binaryPath), filepath.Join(ts.cwd, "testdata", "go", "loop", "main.go")
+}
+
+// startAttachTargetBinary starts binaryPath and returns its PID. When the
+// test ends, any debug session still attached is stopped before the process
+// is killed: a dlv that still traces the target would block cmd.Wait. ts
+// must be closed by a cleanup registered earlier, not by defer.
+func startAttachTargetBinary(t *testing.T, ts *testSetup, binaryPath string) int {
+	t.Helper()
+	cmd := exec.Command(binaryPath)
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("failed to start attach target: %v", err)
+	}
+	t.Cleanup(func() {
+		// Fails harmlessly when the test already stopped the session.
+		_, _ = ts.session.CallTool(ts.ctx, &mcp.CallToolParams{Name: "stop", Arguments: map[string]any{}})
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+	})
+	return cmd.Process.Pid
+}
+
+func TestAttachWithoutBreakpointsStopsOnEntry(t *testing.T) {
+	requireAttachPermission(t)
+	ts := setupMCPServerAndClient(t)
+	t.Cleanup(ts.cleanup)
+	pid, _ := startAttachTarget(t, ts)
+
+	args := map[string]any{"mode": "attach", "processId": pid}
+	maps.Copy(args, dapLogArgs(t))
+	text, isErr := ts.callTool(t, "debug", args)
+	if isErr {
+		dumpDAPLogs(t)
+		t.Fatalf("attach returned error: %s", text)
+	}
+	if !strings.HasPrefix(text, "Stopped: entry\n") {
+		dumpDAPLogs(t)
+		t.Fatalf("expected attach to report an entry stop, got: %s", text)
+	}
+
+	ts.stopDebugger(t)
+}
+
+func TestAttachWithBreakpointRunsToBreakpoint(t *testing.T) {
+	requireAttachPermission(t)
+	ts := setupMCPServerAndClient(t)
+	t.Cleanup(ts.cleanup)
+	pid, sourceFile := startAttachTarget(t, ts)
+
+	args := map[string]any{
+		"mode":        "attach",
+		"processId":   pid,
+		"breakpoints": []map[string]any{{"file": sourceFile, "line": 8}},
+	}
+	maps.Copy(args, dapLogArgs(t))
+	text, isErr := ts.callTool(t, "debug", args)
+	if isErr {
+		dumpDAPLogs(t)
+		t.Fatalf("attach returned error: %s", text)
+	}
+	if !strings.HasPrefix(text, "Stopped: breakpoint\n") || !strings.Contains(text, sourceFile+":8\n") {
+		dumpDAPLogs(t)
+		t.Fatalf("expected attach to stop at %s:8, got: %s", sourceFile, text)
+	}
+
+	ts.stopDebugger(t)
+}
+
+func TestAttachStopOnEntryWithBreakpointStopsAtEntry(t *testing.T) {
+	requireAttachPermission(t)
+	ts := setupMCPServerAndClient(t)
+	t.Cleanup(ts.cleanup)
+	pid, sourceFile := startAttachTarget(t, ts)
+
+	args := map[string]any{
+		"mode":        "attach",
+		"processId":   pid,
+		"stopOnEntry": true,
+		"breakpoints": []map[string]any{{"file": sourceFile, "line": 8}},
+	}
+	maps.Copy(args, dapLogArgs(t))
+	text, isErr := ts.callTool(t, "debug", args)
+	if isErr {
+		dumpDAPLogs(t)
+		t.Fatalf("attach returned error: %s", text)
+	}
+	if !strings.HasPrefix(text, "Stopped: entry\n") {
+		dumpDAPLogs(t)
+		t.Fatalf("expected attach to report an entry stop, got: %s", text)
+	}
+
+	// The breakpoint must still be installed for the next continue.
+	text, isErr = ts.callTool(t, "continue", map[string]any{})
+	if isErr {
+		t.Fatalf("continue returned error: %s", text)
+	}
+	if !strings.Contains(text, sourceFile+":8") {
+		t.Fatalf("expected continue to stop at %s:8, got: %s", sourceFile, text)
+	}
+
+	ts.stopDebugger(t)
+}
+
+func TestValidateDelveProgram(t *testing.T) {
+	goExecutable, err := os.Executable()
+	if err != nil {
+		t.Fatalf("failed to find test executable: %v", err)
+	}
+	notExecutable := filepath.Join(t.TempDir(), "not-an-executable")
+	if err := os.WriteFile(notExecutable, []byte("not an executable"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name    string
+		mode    string
+		path    string
+		wantErr bool
+	}{
+		{name: "attach without path", mode: "attach", path: "", wantErr: false},
+		{name: "attach with Go executable", mode: "attach", path: goExecutable, wantErr: false},
+		{name: "attach with non-Go file", mode: "attach", path: notExecutable, wantErr: true},
+		{name: "binary with non-Go file", mode: "binary", path: notExecutable, wantErr: true},
+		{name: "core with non-Go file", mode: "core", path: notExecutable, wantErr: true},
+		{name: "source is compiled by Delve", mode: "source", path: notExecutable, wantErr: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateDelveProgram(tc.mode, tc.path)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("validateDelveProgram(%q, %q) error = %v, wantErr %t", tc.mode, tc.path, err, tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestDelveAttachRejectsNonGoProgramPath(t *testing.T) {
+	ts := setupMCPServerAndClient(t)
+	defer ts.cleanup()
+	notExecutable := filepath.Join(t.TempDir(), "not-an-executable")
+	if err := os.WriteFile(notExecutable, []byte("not an executable"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Validation happens before dlv is spawned, so the PID is never used.
+	text, isErr := ts.callTool(t, "debug", map[string]any{
+		"mode":      "attach",
+		"processId": 12345,
+		"path":      notExecutable,
+	})
+	if !isErr {
+		t.Fatalf("expected Delve attach to reject a non-Go program path, got: %s", text)
+	}
+	if !strings.Contains(text, "Delve backend only supports Go programs") {
+		t.Errorf("expected Go-only guidance, got: %s", text)
+	}
+}
+
+func TestAttachWithProgramPathRunsToBreakpoint(t *testing.T) {
+	requireAttachPermission(t)
+	for _, tc := range []struct {
+		name string
+		path func(binaryPath string, pid int) string
+	}{
+		{name: "executable path", path: func(binaryPath string, _ int) string { return binaryPath }},
+		// A sidecar or toolbox container that shares the target's PID
+		// namespace can often reach the executable only through /proc.
+		{name: "proc exe", path: func(_ string, pid int) string { return fmt.Sprintf("/proc/%d/exe", pid) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ts := setupMCPServerAndClient(t)
+			t.Cleanup(ts.cleanup)
+			binaryPath, _ := compileTestProgram(t, ts.cwd, "loop")
+			pid := startAttachTargetBinary(t, ts, binaryPath)
+			sourceFile := filepath.Join(ts.cwd, "testdata", "go", "loop", "main.go")
+
+			// Delve releases without attach program support ignore the
+			// field, so this scenario must work with any dlv.
+			args := map[string]any{
+				"mode":        "attach",
+				"processId":   pid,
+				"path":        tc.path(binaryPath, pid),
+				"breakpoints": []map[string]any{{"file": sourceFile, "line": 8}},
+			}
+			maps.Copy(args, dapLogArgs(t))
+			text, isErr := ts.callTool(t, "debug", args)
+			if isErr {
+				dumpDAPLogs(t)
+				t.Fatalf("attach returned error: %s", text)
+			}
+			if !strings.HasPrefix(text, "Stopped: breakpoint\n") || !strings.Contains(text, sourceFile+":8\n") {
+				dumpDAPLogs(t)
+				t.Fatalf("expected attach to stop at %s:8, got: %s", sourceFile, text)
+			}
+
+			ts.stopDebugger(t)
+		})
+	}
+}
+
+// TestAttachWithProgramPathReadsDebugInfoFromPath attaches to a process
+// running a copy of the program without DWARF, passing the original program
+// as path. Only a dlv that honors the attach "program" field can resolve the
+// breakpoint, because the running executable has no debug info.
+func TestAttachWithProgramPathReadsDebugInfoFromPath(t *testing.T) {
+	if os.Getenv("MCP_DAP_DLV_ATTACH_PROGRAM") != "1" {
+		t.Skip("set MCP_DAP_DLV_ATTACH_PROGRAM=1 when the dlv in PATH supports the attach program field")
+	}
+	requireAttachPermission(t)
+	objcopy, err := exec.LookPath("objcopy")
+	if err != nil {
+		t.Skip("objcopy not found in PATH")
+	}
+	ts := setupMCPServerAndClient(t)
+	t.Cleanup(ts.cleanup)
+	binaryPath, _ := compileTestProgram(t, ts.cwd, "loop")
+	strippedPath := filepath.Join(t.TempDir(), "stripped")
+	if output, err := exec.Command(objcopy, "--strip-debug", binaryPath, strippedPath).CombinedOutput(); err != nil {
+		t.Fatalf("failed to strip debug info: %v\n%s", err, output)
+	}
+	pid := startAttachTargetBinary(t, ts, strippedPath)
+	sourceFile := filepath.Join(ts.cwd, "testdata", "go", "loop", "main.go")
+
+	// Stop on entry and set the breakpoint afterwards: the breakpoint tool
+	// fails fast when the breakpoint cannot be resolved, whereas an initial
+	// breakpoint that never resolves leaves debug waiting for a stop.
+	args := map[string]any{"mode": "attach", "processId": pid, "path": binaryPath}
+	maps.Copy(args, dapLogArgs(t))
+	text, isErr := ts.callTool(t, "debug", args)
+	if isErr {
+		dumpDAPLogs(t)
+		t.Fatalf("attach returned error: %s", text)
+	}
+	if !strings.HasPrefix(text, "Stopped: entry\n") {
+		dumpDAPLogs(t)
+		t.Fatalf("expected attach to report an entry stop, got: %s", text)
+	}
+	text, isErr = ts.callTool(t, "breakpoint", map[string]any{"file": sourceFile, "line": 8})
+	if isErr {
+		dumpDAPLogs(t)
+		t.Fatalf("breakpoint was not resolved from the program path's debug info: %s", text)
+	}
+	text, isErr = ts.callTool(t, "continue", map[string]any{})
+	if isErr || !strings.Contains(text, sourceFile+":8") {
+		dumpDAPLogs(t)
+		t.Fatalf("expected continue to stop at %s:8, got: %s", sourceFile, text)
+	}
+
+	ts.stopDebugger(t)
+}
+
+// startGDBAttachTarget starts the C loop test program and returns its PID,
+// binary path, and source file. See startAttachTargetBinary for cleanup.
+func startGDBAttachTarget(t *testing.T, ts *testSetup) (pid int, binaryPath, sourceFile string) {
+	t.Helper()
+	binaryPath, cleanupBinary := compileTestCProgram(t, ts.cwd, "loop")
+	t.Cleanup(cleanupBinary)
+	pid = startAttachTargetBinary(t, ts, binaryPath)
+	return pid, binaryPath, filepath.Join(ts.cwd, "testdata", "c", "loop", "main.c")
+}
+
+func TestGDBAttachLoadsLibrariesThroughProcRoot(t *testing.T) {
+	requireGDBDeps(t)
+	requireAttachPermission(t)
+	ts := setupMCPServerAndClient(t)
+	t.Cleanup(ts.cleanup)
+	pid, _, _ := startGDBAttachTarget(t, ts)
+
+	args := map[string]any{"debugger": "gdb", "mode": "attach", "processId": pid}
+	maps.Copy(args, dapLogArgs(t))
+	text, isErr := ts.callTool(t, "debug", args)
+	if isErr {
+		dumpDAPLogs(t)
+		t.Fatalf("GDB attach returned error: %s", text)
+	}
+	t.Logf("GDB attach result: %s", text)
+
+	// A sidecar debugger without CAP_SYS_ADMIN cannot enter the target's
+	// mount namespace, so GDB must read libraries through /proc/PID/root.
+	text, isErr = ts.callTool(t, "evaluate", map[string]any{"expression": "info sharedlibrary", "context": "repl"})
+	if isErr {
+		t.Fatalf("info sharedlibrary returned error: %s", text)
+	}
+	if want := fmt.Sprintf("/proc/%d/root/", pid); !strings.Contains(text, want) {
+		t.Fatalf("expected shared libraries loaded through %s, got: %s", want, text)
+	}
+
+	ts.stopDebugger(t)
+}
+
+// TestGDBAttachWithProgramPathReadsDebugInfoFromPath attaches to a copy of
+// the program without debug info, passing the original program as path. The
+// source breakpoint only resolves if GDB loaded symbols from path.
+func TestGDBAttachWithProgramPathReadsDebugInfoFromPath(t *testing.T) {
+	requireGDBDeps(t)
+	requireAttachPermission(t)
+	objcopy, err := exec.LookPath("objcopy")
+	if err != nil {
+		t.Skip("objcopy not found in PATH")
+	}
+	ts := setupMCPServerAndClient(t)
+	t.Cleanup(ts.cleanup)
+	binaryPath, cleanupBinary := compileTestCProgram(t, ts.cwd, "loop")
+	t.Cleanup(cleanupBinary)
+	strippedPath := filepath.Join(t.TempDir(), "stripped")
+	if output, err := exec.Command(objcopy, "--strip-debug", binaryPath, strippedPath).CombinedOutput(); err != nil {
+		t.Fatalf("failed to strip debug info: %v\n%s", err, output)
+	}
+	pid := startAttachTargetBinary(t, ts, strippedPath)
+	sourceFile := filepath.Join(ts.cwd, "testdata", "c", "loop", "main.c")
+
+	args := map[string]any{"debugger": "gdb", "mode": "attach", "processId": pid, "path": binaryPath}
+	maps.Copy(args, dapLogArgs(t))
+	text, isErr := ts.callTool(t, "debug", args)
+	if isErr {
+		dumpDAPLogs(t)
+		t.Fatalf("GDB attach returned error: %s", text)
+	}
+	// GDB reports an unresolvable source breakpoint as pending, which would
+	// leave continue waiting forever; require a resolved breakpoint first.
+	text, isErr = ts.callTool(t, "breakpoint", map[string]any{"file": sourceFile, "line": 6})
+	if isErr || strings.Contains(text, "pending") {
+		dumpDAPLogs(t)
+		t.Fatalf("breakpoint was not resolved from the program path's debug info: %s", text)
+	}
+	text, isErr = ts.callTool(t, "continue", map[string]any{})
+	if isErr || !strings.Contains(text, "main.c:6") {
+		dumpDAPLogs(t)
+		t.Fatalf("expected continue to stop at main.c:6, got: %s", text)
+	}
+
+	ts.stopDebugger(t)
+}
+
+func TestGDBAttachWithBreakpointRunsToBreakpoint(t *testing.T) {
+	requireGDBDeps(t)
+	requireAttachPermission(t)
+	ts := setupMCPServerAndClient(t)
+	t.Cleanup(ts.cleanup)
+	pid, _, sourceFile := startGDBAttachTarget(t, ts)
+
+	args := map[string]any{
+		"debugger":    "gdb",
+		"mode":        "attach",
+		"processId":   pid,
+		"breakpoints": []map[string]any{{"file": sourceFile, "line": 6}},
+	}
+	maps.Copy(args, dapLogArgs(t))
+	text, isErr := ts.callTool(t, "debug", args)
+	if isErr {
+		dumpDAPLogs(t)
+		t.Fatalf("GDB attach returned error: %s", text)
+	}
+	if !strings.HasPrefix(text, "Stopped: breakpoint\n") || !strings.Contains(text, "main.c:6\n") {
+		dumpDAPLogs(t)
+		t.Fatalf("expected attach to stop at main.c:6, got: %s", text)
+	}
+
+	ts.stopDebugger(t)
+}
+
+// TestGDBCoreWithProcessIDLoadsLibrariesThroughProcRoot opens a snapshot core
+// of a live process, passing that process's PID so GDB reads the core's
+// shared libraries from the process's own filesystem.
+func TestGDBCoreWithProcessIDLoadsLibrariesThroughProcRoot(t *testing.T) {
+	requireGDBDeps(t)
+	requireAttachPermission(t)
+	gcore, err := exec.LookPath("gcore")
+	if err != nil {
+		t.Skip("gcore not found in PATH")
+	}
+	ts := setupMCPServerAndClient(t)
+	t.Cleanup(ts.cleanup)
+	pid, binaryPath, _ := startGDBAttachTarget(t, ts)
+	corePrefix := filepath.Join(t.TempDir(), "core")
+	if output, err := exec.Command(gcore, "-o", corePrefix, strconv.Itoa(pid)).CombinedOutput(); err != nil {
+		t.Fatalf("gcore failed: %v\n%s", err, output)
+	}
+	corePath := fmt.Sprintf("%s.%d", corePrefix, pid)
+
+	args := map[string]any{
+		"debugger":     "gdb",
+		"mode":         "core",
+		"processId":    pid,
+		"path":         binaryPath,
+		"coreFilePath": corePath,
+	}
+	maps.Copy(args, dapLogArgs(t))
+	text, isErr := ts.callTool(t, "debug", args)
+	if isErr {
+		skipIfGDBLacksCoreFileSupport(t, text)
+		dumpDAPLogs(t)
+		t.Fatalf("GDB core session returned error: %s", text)
+	}
+	text, isErr = ts.callTool(t, "evaluate", map[string]any{"expression": "info sharedlibrary", "context": "repl"})
+	if isErr {
+		t.Fatalf("info sharedlibrary returned error: %s", text)
+	}
+	if want := fmt.Sprintf("/proc/%d/root/", pid); !strings.Contains(text, want) {
+		t.Fatalf("expected shared libraries loaded through %s, got: %s", want, text)
+	}
+
+	ts.stopDebugger(t)
+}

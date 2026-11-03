@@ -377,6 +377,8 @@ type fakeStdioBackend struct {
 	stdout      io.ReadCloser
 	stdin       io.WriteCloser
 	launchAfter bool
+	// attachStopOnEntry records the stopOnEntry values passed to AttachArgs.
+	attachStopOnEntry []bool
 }
 
 func (b *fakeStdioBackend) Spawn(string, io.Writer) (*exec.Cmd, string, error) {
@@ -395,7 +397,8 @@ func (b *fakeStdioBackend) CoreArgs(string, string) (map[string]any, error) {
 	return map[string]any{}, nil
 }
 func (b *fakeStdioBackend) CoreRequestType() string { return "launch" }
-func (b *fakeStdioBackend) AttachArgs(int) (map[string]any, error) {
+func (b *fakeStdioBackend) AttachArgs(_ int, _ string, stopOnEntry bool) (map[string]any, error) {
+	b.attachStopOnEntry = append(b.attachStopOnEntry, stopOnEntry)
 	return map[string]any{}, nil
 }
 
@@ -522,5 +525,123 @@ func TestDebugSupportsConfigurationBeforeLaunch(t *testing.T) {
 	}
 	if err := <-adapterDone; err != nil {
 		t.Fatal(err)
+	}
+}
+
+// TestDebugAttachStopsOnEntryWithoutBreakpoints uses Delve's attach ordering:
+// initialized follows the attach response, and the entry stop precedes the
+// configurationDone response.
+func TestDebugAttachStopsOnEntryWithoutBreakpoints(t *testing.T) {
+	clientConn, adapterConn := net.Pipe()
+	backend := &fakeStdioBackend{stdout: clientConn, stdin: clientConn}
+	server := mcp.NewServer(&mcp.Implementation{Name: "test", Version: "test"}, nil)
+	ds := &debuggerSession{
+		server:            server,
+		backendOverride:   backend,
+		debugSessionState: newDebugSessionState(),
+	}
+	defer ds.cleanup()
+
+	adapterDone := make(chan error, 1)
+	go func() {
+		reader := bufio.NewReader(adapterConn)
+		read := func(command string) (dap.RequestMessage, error) {
+			message, err := dap.ReadProtocolMessage(reader)
+			if err != nil {
+				return nil, err
+			}
+			request, ok := message.(dap.RequestMessage)
+			if !ok {
+				return nil, fmt.Errorf("got %T, want %q request", message, command)
+			}
+			if request.GetRequest().Command != command {
+				return nil, fmt.Errorf("got command %q, want %q", request.GetRequest().Command, command)
+			}
+			return request, nil
+		}
+		write := func(messages ...dap.Message) error {
+			for _, message := range messages {
+				if err := dap.WriteProtocolMessage(adapterConn, message); err != nil {
+					return err
+				}
+			}
+			return nil
+		}
+		initialize, err := read("initialize")
+		if err != nil {
+			adapterDone <- err
+			return
+		}
+		if err := write(&dap.InitializeResponse{
+			Response: dap.Response{
+				ProtocolMessage: protocolMessage(1, "response"), RequestSeq: initialize.GetRequest().Seq,
+				Success: true, Command: "initialize",
+			},
+			Body: dap.Capabilities{SupportsConfigurationDoneRequest: true},
+		}); err != nil {
+			adapterDone <- err
+			return
+		}
+		attach, err := read("attach")
+		if err != nil {
+			adapterDone <- err
+			return
+		}
+		if err := write(
+			&dap.AttachResponse{Response: dap.Response{
+				ProtocolMessage: protocolMessage(2, "response"), RequestSeq: attach.GetRequest().Seq,
+				Success: true, Command: "attach",
+			}},
+			&dap.InitializedEvent{
+				Event: dap.Event{ProtocolMessage: protocolMessage(3, "event"), Event: "initialized"},
+			},
+		); err != nil {
+			adapterDone <- err
+			return
+		}
+		config, err := read("configurationDone")
+		if err != nil {
+			adapterDone <- err
+			return
+		}
+		if err := write(
+			&dap.StoppedEvent{
+				Event: dap.Event{ProtocolMessage: protocolMessage(4, "event"), Event: "stopped"},
+				Body:  dap.StoppedEventBody{Reason: "entry", ThreadId: 1},
+			},
+			&dap.ConfigurationDoneResponse{Response: dap.Response{
+				ProtocolMessage: protocolMessage(5, "response"), RequestSeq: config.GetRequest().Seq,
+				Success: true, Command: "configurationDone",
+			}},
+		); err != nil {
+			adapterDone <- err
+			return
+		}
+		stack, err := read("stackTrace")
+		if err != nil {
+			adapterDone <- err
+			return
+		}
+		adapterDone <- write(&dap.StackTraceResponse{
+			Response: dap.Response{
+				ProtocolMessage: protocolMessage(6, "response"), RequestSeq: stack.GetRequest().Seq,
+				Success: true, Command: "stackTrace",
+			},
+			Body: dap.StackTraceResponseBody{StackFrames: []dap.StackFrame{{Id: 0, Name: "main.main", Line: 1}}},
+		})
+	}()
+
+	result, _, err := ds.debug(context.Background(), nil, DebugParams{Mode: "attach", ProcessID: 12345})
+	if err != nil {
+		t.Fatalf("attach startup failed: %v", err)
+	}
+	if err := <-adapterDone; err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(backend.attachStopOnEntry, []bool{true}) {
+		t.Fatalf("AttachArgs stopOnEntry calls = %v, want [true]", backend.attachStopOnEntry)
+	}
+	if got := textContent(result); !strings.HasPrefix(got, "Stopped: entry\nFunction: main.main\n") {
+		t.Fatalf("startup result = %q", got)
 	}
 }

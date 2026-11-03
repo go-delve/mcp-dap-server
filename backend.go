@@ -45,7 +45,11 @@ type DebuggerBackend interface {
 	CoreRequestType() string
 
 	// AttachArgs builds the debugger-specific arguments map for attaching to a process.
-	AttachArgs(processID int) (map[string]any, error)
+	// programPath optionally names the process's executable; when empty the
+	// debugger discovers it from the process. stopOnEntry reports whether the
+	// process should remain stopped after configurationDone; callers compute it
+	// the same way as for LaunchArgs.
+	AttachArgs(processID int, programPath string, stopOnEntry bool) (map[string]any, error)
 }
 
 // delveBackend implements DebuggerBackend for the Delve debugger (Go).
@@ -184,12 +188,20 @@ func (b *delveBackend) CoreArgs(programPath, coreFilePath string) (map[string]an
 }
 
 // AttachArgs builds the Delve-specific argument map for attaching to a process.
-func (b *delveBackend) AttachArgs(processID int) (map[string]any, error) {
-	return map[string]any{
-		"request":   "attach",
-		"mode":      "local",
-		"processId": processID,
-	}, nil
+// Delve resumes an attached process after configurationDone unless
+// stopOnEntry is set. programPath is sent as "program" only when set; Delve
+// releases without attach program support ignore the field.
+func (b *delveBackend) AttachArgs(processID int, programPath string, stopOnEntry bool) (map[string]any, error) {
+	args := map[string]any{
+		"request":     "attach",
+		"mode":        "local",
+		"processId":   processID,
+		"stopOnEntry": stopOnEntry,
+	}
+	if programPath != "" {
+		args["program"] = programPath
+	}
+	return args, nil
 }
 
 // gdbBackend implements DebuggerBackend for GDB's native DAP server.
@@ -197,6 +209,7 @@ func (b *delveBackend) AttachArgs(processID int) (map[string]any, error) {
 type gdbBackend struct {
 	gdbPath     string // path to gdb binary (default: "gdb")
 	toolLogPath string // path for GDB's native DAP log file
+	sysroot     string // GDB sysroot for shared library lookup; empty keeps GDB's default
 	stdin       io.WriteCloser
 	stdout      io.ReadCloser
 	majorVer    int // GDB major version detected in Spawn; 0 if unknown
@@ -210,9 +223,7 @@ func (g *gdbBackend) Spawn(port string, stderrWriter io.Writer) (*exec.Cmd, stri
 	if gdbPath == "" {
 		gdbPath = "gdb"
 	}
-	// Ignore user/project init files and target-supplied auto-load scripts.
-	// Explicit debugger commands remain available; this is not a sandbox.
-	args := []string{"-nx", "-iex", "set auto-load off", "-i", "dap"}
+	args := gdbStartupArgs(g.sysroot)
 	// Disable terminal styling — ANSI escapes have no place in DAP JSON responses.
 	args = append([]string{"-iex", "set style enabled off"}, args...)
 	if g.toolLogPath != "" {
@@ -246,6 +257,37 @@ func (g *gdbBackend) Spawn(port string, stderrWriter io.Writer) (*exec.Cmd, stri
 
 	// stdio transport — no listen address
 	return cmd, "", nil
+}
+
+// gdbStartupArgs returns GDB's fixed startup arguments, preceded by a sysroot
+// command when sysroot is set. Each argument is passed to GDB directly, with
+// no shell involved.
+func gdbStartupArgs(sysroot string) []string {
+	// Ignore user/project init files and target-supplied auto-load scripts.
+	// Explicit debugger commands remain available; this is not a sandbox.
+	args := []string{"-nx", "-iex", "set auto-load off", "-i", "dap"}
+	if sysroot != "" {
+		args = append([]string{"-iex", "set sysroot " + sysroot}, args...)
+	}
+	return args
+}
+
+// gdbTargetSysroot returns the sysroot GDB should use, or "" for GDB's default.
+//
+// On Linux, when attaching to a process, or opening a core with the PID of
+// the live process it was taken from, it returns /proc/PID/root: that
+// process's root directory as seen from its own mount namespace. GDB resolves
+// the executable and shared library paths the target reports by prefixing
+// the sysroot, so it reads the target's own files even from a sidecar or
+// toolbox container. GDB's default "target:" sysroot reaches another mount
+// namespace only by entering it with setns, which needs CAP_SYS_ADMIN;
+// /proc/PID/root needs only ptrace read access to the process. For a process
+// in the debugger's own mount namespace, /proc/PID/root is the same root.
+func gdbTargetSysroot(goos, mode string, processID int) string {
+	if goos != "linux" || (mode != "attach" && mode != "core") || processID <= 0 {
+		return ""
+	}
+	return fmt.Sprintf("/proc/%d/root", processID)
 }
 
 // TransportMode returns "stdio" because GDB's native DAP server communicates
@@ -338,8 +380,16 @@ func (g *gdbBackend) CoreArgs(programPath, coreFilePath string) (map[string]any,
 }
 
 // AttachArgs builds the GDB native DAP argument map for attaching to a process.
-func (g *gdbBackend) AttachArgs(processID int) (map[string]any, error) {
-	return map[string]any{
+// programPath is sent as "program" only when set; GDB then loads symbols from
+// that file instead of discovering the executable from the process. GDB stops
+// an attached inferior regardless of stopOnEntry, so the flag is accepted for
+// a uniform backend contract and intentionally ignored.
+func (g *gdbBackend) AttachArgs(processID int, programPath string, _ bool) (map[string]any, error) {
+	args := map[string]any{
 		"pid": processID,
-	}, nil
+	}
+	if programPath != "" {
+		args["program"] = programPath
+	}
+	return args, nil
 }

@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"runtime"
 	"strings"
 	"time"
 
@@ -255,6 +256,22 @@ func (ds *debuggerSession) handleClientEnd(client *DAPClient, err error) {
 	ds.cleanupLocked()
 }
 
+// validateDelveProgram rejects a non-Go executable before Delve is spawned.
+// Delve can sometimes partially load non-Go executables, leaving callers with
+// a working-looking session whose stack operations fail. Attach is checked
+// only when a program path is given; pathless attach lets Delve discover the
+// executable from the process.
+func validateDelveProgram(mode, programPath string) error {
+	needsProgram := mode == "binary" || mode == "core" || (mode == "attach" && programPath != "")
+	if !needsProgram {
+		return nil
+	}
+	if _, err := buildinfo.ReadFile(programPath); err != nil {
+		return fmt.Errorf("the Delve backend only supports Go programs, but %q is not a Go executable; for C/C++/Rust pass debugger: \"gdb\"", programPath)
+	}
+	return nil
+}
+
 // debug starts a complete debugging session.
 // It starts the debugger, loads the program, sets initial breakpoints, and runs to the first breakpoint.
 func (ds *debuggerSession) debug(ctx context.Context, _ *mcp.CallToolRequest, params DebugParams) (result *mcp.CallToolResult, extra any, err error) {
@@ -316,7 +333,11 @@ func (ds *debuggerSession) debug(ctx context.Context, _ *mcp.CallToolRequest, pa
 					return nil, nil, fmt.Errorf("GDB not found in PATH. Install GDB 14+ or set the gdbPath parameter")
 				}
 			}
-			ds.backend = &gdbBackend{gdbPath: gdbPath, toolLogPath: params.ToolLog}
+			ds.backend = &gdbBackend{
+				gdbPath:     gdbPath,
+				toolLogPath: params.ToolLog,
+				sysroot:     gdbTargetSysroot(runtime.GOOS, mode, params.ProcessID),
+			}
 		default:
 			return nil, nil, fmt.Errorf("unsupported debugger: %s (must be 'delve' or 'gdb')", debugger)
 		}
@@ -330,12 +351,9 @@ func (ds *debuggerSession) debug(ctx context.Context, _ *mcp.CallToolRequest, pa
 		return nil, nil, fmt.Errorf("path is required for core mode with %s (only GDB can auto-detect the executable from a core file)", debugger)
 	}
 
-	// Delve can sometimes partially launch non-Go executables, leaving callers
-	// with a working-looking session whose stack operations fail. Reject that
-	// mismatch before spawning the adapter and explain how to select GDB.
-	if debugger == "delve" && (mode == "binary" || mode == "core") {
-		if _, err := buildinfo.ReadFile(params.Path); err != nil {
-			return nil, nil, fmt.Errorf("the Delve backend only supports Go programs, but %q is not a Go executable; for C/C++/Rust pass debugger: \"gdb\"", params.Path)
+	if debugger == "delve" {
+		if err := validateDelveProgram(mode, params.Path); err != nil {
+			return nil, nil, err
 		}
 	}
 
@@ -437,7 +455,7 @@ func (ds *debuggerSession) debug(ctx context.Context, _ *mcp.CallToolRequest, pa
 			})
 		}
 	case "attach":
-		attachArgs, err := ds.backend.AttachArgs(params.ProcessID)
+		attachArgs, err := ds.backend.AttachArgs(params.ProcessID, params.Path, stopOnEntry)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -548,10 +566,11 @@ initialized:
 	// ContinueRequest to proceed to the breakpoint.
 	//
 	// GDB native DAP: with stopAtBeginningOfMainSubprogram=false, may run directly to breakpoint
-	// without stopping at entry first.
+	// without stopping at entry first. When attaching, GDB always stops the
+	// process first with reason="attach".
 	//
-	// We handle both by reading the first StoppedEvent. If it's an entry stop,
-	// we send ContinueRequest and wait for the next stop.
+	// We handle both by reading the first StoppedEvent. If it's an entry or
+	// attach stop, we send ContinueRequest and wait for the next stop.
 	if len(params.Breakpoints) > 0 && !params.StopOnEntry {
 		activeSeq := launchSeq
 		responseSeen := launchResponseSeen
@@ -573,8 +592,8 @@ initialized:
 			}
 			switch ev := msg.(type) {
 			case *dap.StoppedEvent:
-				if ev.Body.Reason == "entry" {
-					// Stopped at entry — send continue to reach the breakpoint
+				if ev.Body.Reason == "entry" || (mode == "attach" && ev.Body.Reason == "attach") {
+					// Stopped at entry or attach — send continue to reach the breakpoint
 					activeSeq, err = ds.client.ContinueRequest(ev.Body.ThreadId)
 					if err != nil {
 						return nil, nil, err
@@ -607,9 +626,9 @@ initialized:
 	// Stopped on entry, try to populate stoppedThreadID and lastFrameID
 	// so that evaluate, context, etc. work immediately.
 	//
-	// Delve does NOT send a StoppedEvent for stopOnEntry — the program is
-	// already stopped after configurationDone, so we call getFullContext
-	// directly.
+	// Delve sends its stopOnEntry StoppedEvent (reason "entry") before the
+	// configurationDone response, so the event has already been retained by
+	// the dispatcher once that response is read; take it without blocking.
 	//
 	// GDB DOES send a StoppedEvent asynchronously after configurationDone,
 	// once the inferior actually reaches the entry point. Calling

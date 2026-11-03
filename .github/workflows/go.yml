@@ -51,10 +51,15 @@ jobs:
       - name: Verify Delve installation
         run: dlv version
 
+      # Ubuntu's default kernel.yama.ptrace_scope=1 only allows tracing
+      # descendants; attach tests need dlv to trace a sibling process.
+      - name: Allow ptrace attach to non-descendant processes
+        run: sudo sysctl -w kernel.yama.ptrace_scope=0
+
       - name: Run required Delve DAP scenarios
         run: >-
           go test -count=1 -v
-          -run '^Test(Basic|Restart|RestartUsesSavedLaunchArguments|ReplFrameSelection|Context|Variables|Step|ToolListChangesWithCapabilities|ClearBreakpoints|InfoBreakpoints|LineBreakpointTracking|ClearSpecificLineBreakpoint|MultipleFilesLineBreakpoints|ClearAllBreakpointsAcrossFiles|DuplicateLineBreakpoint|RunToCursorCleansUpBreakpoint|ContinueWithEmptyTo|ContinueWithPartialTo|Info|Disassemble|SetVariable|Pause|StepIn|StepOut|TerminationMessage|StopOnEntry)$'
+          -run '^Test(Basic|Restart|RestartUsesSavedLaunchArguments|ReplFrameSelection|Context|Variables|Step|ToolListChangesWithCapabilities|ClearBreakpoints|InfoBreakpoints|LineBreakpointTracking|ClearSpecificLineBreakpoint|MultipleFilesLineBreakpoints|ClearAllBreakpointsAcrossFiles|DuplicateLineBreakpoint|RunToCursorCleansUpBreakpoint|ContinueWithEmptyTo|ContinueWithPartialTo|Info|Disassemble|SetVariable|Pause|StepIn|StepOut|TerminationMessage|StopOnEntry|AttachWithoutBreakpointsStopsOnEntry|AttachWithBreakpointRunsToBreakpoint|AttachStopOnEntryWithBreakpointStopsAtEntry|AttachWithProgramPathRunsToBreakpoint)$'
           .
 
       - name: Mutation-test Delve scenarios
@@ -64,7 +69,7 @@ jobs:
           go run scripts/mutation-audit.go
           -helper scripts/goaudit-ci.sh
           -output "${RUNNER_TEMP}/delve-mutation"
-          -run '^Test(Basic|Restart|RestartUsesSavedLaunchArguments|ReplFrameSelection|Context|Variables|Step|ToolListChangesWithCapabilities|ClearBreakpoints|InfoBreakpoints|LineBreakpointTracking|ClearSpecificLineBreakpoint|MultipleFilesLineBreakpoints|ClearAllBreakpointsAcrossFiles|DuplicateLineBreakpoint|RunToCursorCleansUpBreakpoint|ContinueWithEmptyTo|ContinueWithPartialTo|Info|Disassemble|SetVariable|Pause|StepIn|StepOut|TerminationMessage|StopOnEntry)$'
+          -run '^Test(Basic|Restart|RestartUsesSavedLaunchArguments|ReplFrameSelection|Context|Variables|Step|ToolListChangesWithCapabilities|ClearBreakpoints|InfoBreakpoints|LineBreakpointTracking|ClearSpecificLineBreakpoint|MultipleFilesLineBreakpoints|ClearAllBreakpointsAcrossFiles|DuplicateLineBreakpoint|RunToCursorCleansUpBreakpoint|ContinueWithEmptyTo|ContinueWithPartialTo|Info|Disassemble|SetVariable|Pause|StepIn|StepOut|TerminationMessage|StopOnEntry|AttachWithoutBreakpointsStopsOnEntry|AttachWithBreakpointRunsToBreakpoint|AttachStopOnEntryWithBreakpointStopsAtEntry|AttachWithProgramPathRunsToBreakpoint)$'
           -max 5
 
       - name: Upload Delve mutation report
@@ -94,12 +99,16 @@ jobs:
       - name: Install GDB and C compiler
         run: sudo apt-get update && sudo apt-get install -y gdb gcc
 
+      # GDB attach tests need gdb to trace a sibling process; see the Delve job.
+      - name: Allow ptrace attach to non-descendant processes
+        run: sudo sysctl -w kernel.yama.ptrace_scope=0
+
       - name: Run required GDB DAP scenarios
         env:
           MCP_DAP_REQUIRE_GDB: '1'
         run: >-
           go test -count=1 -v
-          -run '^TestGDB(Basic|StopOnEntry|Step|Evaluate|EvaluateWatchContext|ContextSelectsRequestedFrame|FullFlow)$'
+          -run '^TestGDB(Basic|StopOnEntry|Step|Evaluate|EvaluateWatchContext|ContextSelectsRequestedFrame|FullFlow|AttachLoadsLibrariesThroughProcRoot|AttachWithProgramPathReadsDebugInfoFromPath|AttachWithBreakpointRunsToBreakpoint|CoreWithProcessIDLoadsLibrariesThroughProcRoot)$'
           .
 
       - name: Mutation-test GDB scenarios
@@ -110,7 +119,7 @@ jobs:
           go run scripts/mutation-audit.go
           -helper scripts/goaudit-ci.sh
           -output "${RUNNER_TEMP}/gdb-mutation"
-          -run '^TestGDB(Basic|StopOnEntry|Step|Evaluate|EvaluateWatchContext|ContextSelectsRequestedFrame|FullFlow)$'
+          -run '^TestGDB(Basic|StopOnEntry|Step|Evaluate|EvaluateWatchContext|ContextSelectsRequestedFrame|FullFlow|AttachLoadsLibrariesThroughProcRoot|AttachWithProgramPathReadsDebugInfoFromPath|AttachWithBreakpointRunsToBreakpoint|CoreWithProcessIDLoadsLibrariesThroughProcRoot)$'
           -max 5
 
       - name: Upload GDB mutation report

@@ -100,11 +100,24 @@ Start a debugging session. Supports four modes:
 **Parameters**:
 - `mode` (string, required): One of 'source', 'binary', 'core', or 'attach'
 - `path` (string): Path to source file or binary (required for source/binary modes; optional for core mode with GDB, which can auto-detect it)
+  In attach mode, `path` optionally names the target's executable, as seen
+  from the debugger (for example `/proc/PID/exe`, or an unstripped copy of a
+  stripped binary); without it the debugger discovers the executable from the
+  process. With Delve, `path` must be a Go executable, and is used only by
+  Delve versions that support the attach `program` field
+  ([go-delve/delve#4462](https://github.com/go-delve/delve/pull/4462));
+  older releases ignore it.
 - `args` (array): Arguments to pass to the program
 - `coreFilePath` (string): Path to core dump file (required for core mode)
-- `processId` (number): Process ID (required for attach mode)
+- `processId` (number): Process ID (required for attach mode). In core mode
+  with GDB, optionally the PID of the live process the core was taken from.
+  On Linux, GDB then reads the target's executable and shared libraries
+  through `/proc/PID/root`, so a sidecar or toolbox container that shares the
+  target's PID namespace finds the target's own files.
 - `breakpoints` (array): Breakpoints to set before running (file:line or function name)
-- `stopOnEntry` (boolean): Stop at program entry point
+- `stopOnEntry` (boolean): Stop at program entry point. In attach mode, keep the
+  process stopped where it was attached instead of resuming it. Defaults to
+  `true` when no `breakpoints` are given, for every mode.
 - `port` (number): optional numeric Delve port (`0` chooses an ephemeral
   loopback port; external bind addresses are not accepted)
 
